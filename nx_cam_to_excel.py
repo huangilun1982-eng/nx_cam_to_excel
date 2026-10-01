@@ -1723,87 +1723,118 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
 
 # ==================== 分頁排版核心模組 (Pagination Engine) ====================
 
-def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE):
+def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="paginate"):
     """
-    核心分頁演算法：
-    1. 保持群組完整性 (Keep Group Together)
-    2. 群組間若在同頁自動插入 1 行 Spacer 空行
-    3. 遇到 -P 或 -p 後綴群組或不同工段執行強制分頁 (Force Page Break)
-    4. 超過每頁行數限制自動分頁
-    回傳：[{"stage": stage_key, "rows": page_rows}, ...]
+    核心分頁演算法 (支援工段優先分頁與超過 15 格單頁延伸/截圖下一頁模式)：
+    1. 工段優先決定分頁 (跨工段絕對強制分頁，各工段版面獨立)
+    2. 標準分頁模式 (pagination_mode == "paginate")：
+       - 每頁上限為 rows_per_page (預設 10 列)
+       - 每頁皆於 A18:J36 嵌入加工示圖
+    3. 單頁延伸模式 (pagination_mode == "extend")：
+       - 若該工段工步數 <= 15：維持標準分頁
+       - 若 15 < 總工步數 <= 20：第一頁刀具向下延伸，下方示圖縮小置於 Row (8+N) ~ 36
+       - 若 總工步數 > 20：刀具延伸填滿第一頁 (最多30格)，截圖放不下則自動顯示於下一頁 (專屬大示圖頁 A7:J36)
+    回傳：[{"stage": stage_key, "rows": page_rows, "show_image": bool, "image_top_row": int, "image_bottom_row": int, "is_appendix_image_page": bool}, ...]
     """
     pages = []
-    current_page = []
-    current_page_stage = None
 
+    # 1. 依工段 (Stage) 先行聚合 Chunks，確保工段優先決定分頁
+    stage_groups = {}
+    stage_order = []
     for chunk in chunks:
         grp_name = chunk["group_name"]
-        ops = chunk["operations"]
-        if not ops:
+        stg = chunk.get("stage") or extract_stage_key(grp_name) or "通用工段"
+        if stg not in stage_groups:
+            stage_groups[stg] = []
+            stage_order.append(stg)
+        stage_groups[stg].append(chunk)
+
+    for stg in stage_order:
+        chunks_in_stage = stage_groups[stg]
+        all_ops = []
+        for c in chunks_in_stage:
+            for op_item in c.get("operations", []):
+                all_ops.append(op_item)
+
+        total_ops = len(all_ops)
+        if total_ops == 0:
             continue
 
-        chunk_stage = chunk.get("stage") or extract_stage_key(grp_name) or "通用工段"
+        if pagination_mode == "extend" and total_ops > 15:
+            # === 單頁延伸模式 (工步 > 15) ===
+            if total_ops <= 20:
+                # 狀況 A：16 ~ 20 步，下方空間足夠，截圖縮小放於同頁下方
+                page_rows = [{"type": "op", "data": op} for op in all_ops]
+                img_top = 8 + total_ops
+                pages.append({
+                    "stage": stg,
+                    "rows": page_rows,
+                    "show_image": True,
+                    "image_top_row": img_top,
+                    "image_bottom_row": 36,
+                    "is_appendix_image_page": False
+                })
+            else:
+                # 狀況 B：超過 20 步，影響到截圖顯示，截圖移至下一頁！
+                # 第 1 頁：刀具延伸頁 (最多 30 格)
+                first_page_ops = all_ops[:30]
+                pages.append({
+                    "stage": stg,
+                    "rows": [{"type": "op", "data": op} for op in first_page_ops],
+                    "show_image": False,
+                    "image_top_row": None,
+                    "image_bottom_row": None,
+                    "is_appendix_image_page": False
+                })
 
-        # 檢查是否帶有強制分頁後綴 (-M, -m, -P, -p)
-        force_break = False
-        for sfx in FORCE_PAGE_SUFFIXES:
-            if grp_name.endswith(sfx):
-                force_break = True
-                break
+                # 若超過 30 步 (極少見)，續頁放刀具
+                rem_ops = all_ops[30:]
+                while rem_ops:
+                    chunk_ops = rem_ops[:30]
+                    rem_ops = rem_ops[30:]
+                    pages.append({
+                        "stage": stg,
+                        "rows": [{"type": "op", "data": op} for op in chunk_ops],
+                        "show_image": False,
+                        "image_top_row": None,
+                        "image_bottom_row": None,
+                        "is_appendix_image_page": False
+                    })
 
-        # 若切換了工段 (例如 M1 -> M2)，強制換新頁
-        is_stage_changed = (current_page_stage is not None and chunk_stage != current_page_stage)
-        if is_stage_changed and current_page:
-            pages.append({"stage": current_page_stage, "rows": current_page})
+                # 專屬示圖頁：表頭相同，中間為清晰大示圖 (A7:J36)
+                pages.append({
+                    "stage": stg,
+                    "rows": [],  # 刀具列留空
+                    "show_image": True,
+                    "image_top_row": 7,
+                    "image_bottom_row": 36,
+                    "is_appendix_image_page": True
+                })
+        else:
+            # === 標準分頁模式 (每頁 10 格，每頁含示圖) ===
             current_page = []
-            current_page_stage = None
-
-        if current_page_stage is None:
-            current_page_stage = chunk_stage
-
-        chunk_size = len(ops)
-        space_left = rows_per_page - len(current_page)
-
-        # 相同工段的刀具工步緊密排列，不須插入空白列 (空格)
-        if chunk_size <= space_left:
-            # 空間足夠：直接放入目前頁
-            for op_item in ops:
+            for op_item in all_ops:
+                if len(current_page) >= rows_per_page:
+                    pages.append({
+                        "stage": stg,
+                        "rows": current_page,
+                        "show_image": True,
+                        "image_top_row": 18,
+                        "image_bottom_row": 36,
+                        "is_appendix_image_page": False
+                    })
+                    current_page = []
                 current_page.append({"type": "op", "data": op_item})
 
-            if force_break:
-                pages.append({"stage": current_page_stage, "rows": current_page})
-                current_page = []
-                current_page_stage = None
-        else:
-            # 空間不足：目前頁結案換新頁
             if current_page:
-                pages.append({"stage": current_page_stage, "rows": current_page})
-                current_page = []
-
-            current_page_stage = chunk_stage
-
-            # 若該群組本身大於單頁上限，必須逐筆拆頁
-            if chunk_size > rows_per_page:
-                for op_item in ops:
-                    if len(current_page) >= rows_per_page:
-                        pages.append({"stage": current_page_stage, "rows": current_page})
-                        current_page = []
-                    current_page.append({"type": "op", "data": op_item})
-                if force_break and current_page:
-                    pages.append({"stage": current_page_stage, "rows": current_page})
-                    current_page = []
-                    current_page_stage = None
-            else:
-                # 放在全新一頁的開頭
-                for op_item in ops:
-                    current_page.append({"type": "op", "data": op_item})
-                if force_break:
-                    pages.append({"stage": current_page_stage, "rows": current_page})
-                    current_page = []
-                    current_page_stage = None
-
-    if current_page:
-        pages.append({"stage": current_page_stage if current_page_stage else "通用工段", "rows": current_page})
+                pages.append({
+                    "stage": stg,
+                    "rows": current_page,
+                    "show_image": True,
+                    "image_top_row": 18,
+                    "image_bottom_row": 36,
+                    "is_appendix_image_page": False
+                })
 
     return pages
 
@@ -1871,9 +1902,17 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         if isinstance(page_item, dict):
             page_rows = page_item.get("rows", [])
             page_stage = page_item.get("stage", "通用工段")
+            show_image = page_item.get("show_image", True)
+            image_top_row = page_item.get("image_top_row", 18)
+            image_bottom_row = page_item.get("image_bottom_row", 36)
+            is_appendix = page_item.get("is_appendix_image_page", False)
         else:
             page_rows = page_item
             page_stage = "通用工段"
+            show_image = True
+            image_top_row = 18
+            image_bottom_row = 36
+            is_appendix = False
 
         # 複製母版工作表至尾端
         vbs_lines.extend([
@@ -1895,53 +1934,74 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
 
         start_row = 7
         page_seq = 1  # 每頁有效工步流水號，從 1 開始計算 (空行不計)
-        for row_offset in range(ROWS_PER_PAGE):
-            curr_r = start_row + row_offset
-            if row_offset < len(page_rows):
-                item = page_rows[row_offset]
-                if item["type"] == "spacer":
-                    # 空行分隔：清空此列資料 (不計序號)
+        num_rows = len(page_rows)
+
+        if is_appendix:
+            # 專屬示圖頁：清空 Row 7 ~ Row 16 預設欄位與邊框，讓上方乾淨開闊
+            vbs_lines.extend([
+                'ws.Range("A7:J16").ClearContents',
+                'ws.Range("A7:J16").Borders.LineStyle = -4142'
+            ])
+        else:
+            # 若刀具列超過 10 列 (單頁延伸模式)，向下複製 Row 16 格式與合併格
+            if num_rows > ROWS_PER_PAGE:
+                vbs_lines.extend([
+                    f'For r = 17 To {start_row + num_rows - 1}',
+                    '    ws.Rows(16).Copy',
+                    '    ws.Rows(r).PasteSpecial -4122',
+                    'Next'
+                ])
+
+            loop_rows = max(ROWS_PER_PAGE, num_rows)
+            for row_offset in range(loop_rows):
+                curr_r = start_row + row_offset
+                if row_offset < num_rows:
+                    item = page_rows[row_offset]
+                    if item["type"] == "spacer":
+                        # 空行分隔：清空此列資料 (不計序號)
+                        for col_i in range(1, 9):
+                            vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
+                    else:
+                        d = item["data"]
+                        safe_seq = str(page_seq)
+                        safe_op_name = escape_vbs_str(d.get("op_name", ""))
+                        safe_tool_num = escape_vbs_str(d.get("tool_number", ""))
+                        spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
+                        safe_tool_dia = escape_vbs_str(spec_str)
+                        safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
+                        safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
+                        safe_time = escape_vbs_str(d.get("time", ""))
+                        safe_note = escape_vbs_str(d.get("note", ""))
+
+                        vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 3).Value = "{safe_tool_num}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 4).Value = "{safe_tool_dia}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 5).Value = "{safe_flute_len}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
+                        vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
+                        page_seq += 1
+                else:
+                    # 未填滿的列位：清空範本預設的工站數字，保持頁面乾淨
                     for col_i in range(1, 9):
                         vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
-                else:
-                    d = item["data"]
-                    safe_seq = str(page_seq)
-                    safe_op_name = escape_vbs_str(d.get("op_name", ""))
-                    safe_tool_num = escape_vbs_str(d.get("tool_number", ""))
-                    spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
-                    safe_tool_dia = escape_vbs_str(spec_str)
-                    safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
-                    safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
-                    safe_time = escape_vbs_str(d.get("time", ""))
-                    safe_note = escape_vbs_str(d.get("note", ""))
 
-                    vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 3).Value = "{safe_tool_num}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 4).Value = "{safe_tool_dia}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 5).Value = "{safe_flute_len}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
-                    vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
-                    page_seq += 1
-            else:
-                # 未填滿的列位：清空範本預設的工站數字，保持頁面乾淨
-                for col_i in range(1, 9):
-                    vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
-
-        # 插入該工段對應之加工示圖 (等比例居中置放於 A18:J36 區域)
+        # 插入該工段對應之加工示圖 (等比例居中置放)
         img_path = stage_images.get(page_stage)
         if not img_path:
             img_path = stage_images.get("通用工段")
         if not img_path and len(stage_images) == 1:
             img_path = list(stage_images.values())[0]
 
-        if img_path and os.path.exists(img_path):
+        if show_image and img_path and os.path.exists(img_path):
             safe_img = os.path.abspath(img_path).replace('"', '""')
+            top_cell_str = f"A{image_top_row}"
+            bottom_cell_str = f"J{image_bottom_row}"
             vbs_lines.extend([
                 f'If fso.FileExists("{safe_img}") Then',
-                '    Set topCell = ws.Range("A18")',
-                '    Set bottomCell = ws.Range("J36")',
+                f'    Set topCell = ws.Range("{top_cell_str}")',
+                f'    Set bottomCell = ws.Range("{bottom_cell_str}")',
                 '    boxL = topCell.Left + 5',
                 '    boxT = topCell.Top + 5',
                 '    boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
@@ -2179,6 +2239,87 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
                     pass
 
     return result
+
+def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
+    """
+    啟動獨立進程之工段分頁決策提示對話視窗 (pagination_prompt_dialog.py)
+    回傳: "paginate" (分頁顯示) 或 "extend" (單頁延伸顯示)
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
+    dialog_script = os.path.join(current_dir, "pagination_prompt_dialog.py")
+    if not os.path.exists(dialog_script):
+        dialog_script = r"C:\NX_Standard\Template\pagination_prompt_dialog.py"
+
+    valid_pythonw, clean_env = get_clean_subprocess_env()
+
+    if not valid_pythonw or not os.path.exists(dialog_script):
+        if listing:
+            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設採用標準分頁模式。")
+        return "paginate"
+
+    temp_dir = tempfile.gettempdir()
+    pid = os.getpid()
+    timestamp = datetime.datetime.now().strftime("%H%M%S%f")
+    cfg_file = os.path.join(temp_dir, f"_p_cfg_{pid}_{timestamp}.json")
+    res_file = os.path.join(temp_dir, f"_p_res_{pid}_{timestamp}.json")
+
+    config_payload = {
+        "stage_stats": over_15_stages
+    }
+
+    try:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(config_payload, f, ensure_ascii=False, indent=2)
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [錯誤] 無法寫入分頁設定暫存檔：{str(ex)}")
+        return "paginate"
+
+    cmd = [
+        valid_pythonw,
+        dialog_script,
+        "--cfg-file", cfg_file,
+        "--res-file", res_file
+    ]
+
+    mode_result = "paginate"
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import time
+
+        user32 = ctypes.windll.user32
+        msg = wintypes.MSG()
+        PM_REMOVE = 0x0001
+
+        proc = subprocess.Popen(cmd, env=clean_env)
+
+        start_wait = time.time()
+        while proc.poll() is None:
+            while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            time.sleep(0.02)
+            if time.time() - start_wait > 300:  # 5分鐘保護
+                proc.kill()
+                break
+
+        if os.path.exists(res_file):
+            with open(res_file, "r", encoding="utf-8") as f:
+                res_data = json.load(f)
+                mode_result = res_data.get("mode", "paginate")
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [分頁對話框例外] {str(ex)}，預設採用標準分頁。")
+    finally:
+        for tmp_f in [cfg_file, res_file]:
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
+
+    return mode_result
 
 def execute_nc_postprocessing(cam_setup, nc_tasks, post_config, listing=None):
     """
@@ -2505,8 +2646,29 @@ def main():
         f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
     )
 
-    # 3. 執行智慧分頁 (相同工段刀具緊密排列不留空格、跨工段強制分頁、單頁上限自動換頁)
-    pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE)
+    # 3. 統計各工段工步數量，若超過 15 格則彈窗讓使用者決定是否分頁顯示
+    stage_op_counts = {}
+    for chunk in processed_chunks:
+        stg = chunk.get("stage", "通用工段")
+        stage_op_counts[stg] = stage_op_counts.get(stg, 0) + len(chunk.get("operations", []))
+
+    over_15_stages = [{"stage": stg, "count": cnt} for stg, cnt in stage_op_counts.items() if cnt > 15]
+    pagination_mode = "paginate"
+
+    if over_15_stages:
+        the_session.ListingWindow.WriteLine("----------------------------------------")
+        stages_info_str = ", ".join([f"【{s['stage']}】({s['count']}格)" for s in over_15_stages])
+        the_session.ListingWindow.WriteLine(
+            f"檢測到工段工步數超過 15 格：{stages_info_str}，正在啟動排版設定對話框..."
+        )
+        pagination_mode = invoke_pagination_prompt_dialog(over_15_stages, listing=the_session.ListingWindow)
+        if pagination_mode == "extend":
+            the_session.ListingWindow.WriteLine("使用者選擇【📑 單頁延伸顯示】(刀具向下延伸，截圖縮小或移至下一頁)。")
+        else:
+            the_session.ListingWindow.WriteLine("使用者選擇【📋 自動分頁顯示】(依標準 10 格/頁分頁)。")
+
+    # 執行智慧分頁 (支援工段優先分頁與超過 15 格單頁延伸/截圖下一頁模式)
+    pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode=pagination_mode)
     the_session.ListingWindow.WriteLine(f"分頁計算完成：共分配為 {len(pages)} 頁。")
 
     # 4. 分析所有群組歸納獨立工段清單

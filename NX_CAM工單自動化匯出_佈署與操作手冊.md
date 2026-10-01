@@ -68,6 +68,7 @@
 請確保下列檔案位於指定路徑：
 - Python 主程式：`C:\NX_Standard\Template\nx_cam_to_excel.py`
 - NC 後處理對話框組件：`C:\NX_Standard\Template\nc_post_dialog.py`
+- 超過 15 格分頁提示組件：`C:\NX_Standard\Template\pagination_prompt_dialog.py`
 - 拍照輔助小精靈組件：`C:\NX_Standard\Template\capture_assistant_gui.py`
 - Excel 工單範本：`C:\NX_Standard\Template\ShopDoc_Template.xlsx`
 
