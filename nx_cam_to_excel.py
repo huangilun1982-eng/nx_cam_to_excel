@@ -1866,6 +1866,73 @@ def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="pa
 
     return pages
 
+def preview_pagination_plan(processed_chunks, rows_per_page=ROWS_PER_PAGE):
+    """
+    預先分析各工段工步數量，並精確計算「單頁延伸」與「自動分頁」模式下的各工段頁數與總頁數。
+    回傳：(stage_stats, total_extend_pages, total_paginate_pages, has_choice)
+    """
+    stage_groups = {}
+    stage_order = []
+    for chunk in processed_chunks:
+        grp_name = chunk["group_name"]
+        stg = chunk.get("stage") or extract_stage_key(grp_name) or "通用工段"
+        if stg not in stage_groups:
+            stage_groups[stg] = []
+            stage_order.append(stg)
+        stage_groups[stg].append(chunk)
+
+    stage_stats = []
+    total_extend_pages = 0
+    total_paginate_pages = 0
+    has_choice = False
+
+    for stg in stage_order:
+        chunks_in_stage = stage_groups[stg]
+        all_ops = []
+        for c in chunks_in_stage:
+            all_ops.extend(c.get("operations", []))
+        cnt = len(all_ops)
+
+        # 1. 計算單頁延伸模式頁數
+        if cnt <= 20:
+            ext_p = 1
+            if cnt <= 10:
+                ext_desc = "第1頁 (標準10格版面，含完整示圖)"
+            elif cnt <= 15:
+                ext_desc = f"第1頁 (自動增加至 {cnt} 格，同頁微縮示圖)"
+            else:
+                ext_desc = f"第1頁 (向下延伸至 {cnt} 格，同頁微縮示圖)"
+        else:
+            # > 20 刀：放不下示圖，刀具延伸整頁 (最多30刀/頁) + 專屬大示圖 1 頁
+            tool_pages = max(1, (cnt + 29) // 30)
+            ext_p = tool_pages + 1
+            ext_desc = f"共 {ext_p} 頁 (第1頁延伸 {min(30, cnt)} 刀，第 {ext_p} 頁專屬大示圖)"
+
+        # 2. 計算自動分頁模式頁數
+        pag_p = max(1, (cnt + rows_per_page - 1) // rows_per_page)
+        if pag_p == 1:
+            pag_desc = "第1頁 (標準10格版面，含完整示圖)"
+        else:
+            rem = cnt % rows_per_page or rows_per_page
+            pag_desc = f"共 {pag_p} 頁 (每頁 {rows_per_page} 刀，末頁 {rem} 刀，每頁皆含示圖)"
+
+        if cnt > 10:
+            has_choice = True
+
+        stage_stats.append({
+            "stage": stg,
+            "count": cnt,
+            "extend_pages": ext_p,
+            "paginate_pages": pag_p,
+            "extend_desc": ext_desc,
+            "paginate_desc": pag_desc
+        })
+
+        total_extend_pages += ext_p
+        total_paginate_pages += pag_p
+
+    return stage_stats, total_extend_pages, total_paginate_pages, has_choice
+
 # ==================== VBS 多頁動態生成與匯出模組 ====================
 
 def escape_vbs_str(val):
@@ -2271,10 +2338,10 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
 
     return result
 
-def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
+def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_paginate_pages, listing=None):
     """
-    啟動獨立進程之工段分頁決策提示對話視窗 (pagination_prompt_dialog.py)
-    回傳: "paginate" (分頁顯示) 或 "extend" (單頁延伸顯示)
+    啟動獨立進程之工單分頁預覽與排版決策對話視窗 (pagination_prompt_dialog.py)
+    回傳: "extend" (單頁延伸顯示), "paginate" (自動分頁顯示) 或 "cancel" (取消操作)
     """
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
     dialog_script = os.path.join(current_dir, "pagination_prompt_dialog.py")
@@ -2285,8 +2352,8 @@ def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
 
     if not valid_pythonw or not os.path.exists(dialog_script):
         if listing:
-            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設採用標準分頁模式。")
-        return "paginate"
+            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設採用單頁延伸排版模式。")
+        return "extend"
 
     temp_dir = tempfile.gettempdir()
     pid = os.getpid()
@@ -2295,7 +2362,9 @@ def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
     res_file = os.path.join(temp_dir, f"_p_res_{pid}_{timestamp}.json")
 
     config_payload = {
-        "stage_stats": over_15_stages
+        "stage_stats": stage_stats,
+        "total_extend_pages": total_extend_pages,
+        "total_paginate_pages": total_paginate_pages
     }
 
     try:
@@ -2304,7 +2373,7 @@ def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
     except Exception as ex:
         if listing:
             listing.WriteLine(f"  [錯誤] 無法寫入分頁設定暫存檔：{str(ex)}")
-        return "paginate"
+        return "extend"
 
     cmd = [
         valid_pythonw,
@@ -2313,7 +2382,7 @@ def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
         "--res-file", res_file
     ]
 
-    mode_result = "paginate"
+    mode_result = "extend"
     try:
         import ctypes
         from ctypes import wintypes
@@ -2338,10 +2407,10 @@ def invoke_pagination_prompt_dialog(over_15_stages, listing=None):
         if os.path.exists(res_file):
             with open(res_file, "r", encoding="utf-8") as f:
                 res_data = json.load(f)
-                mode_result = res_data.get("mode", "paginate")
+                mode_result = res_data.get("mode", "extend")
     except Exception as ex:
         if listing:
-            listing.WriteLine(f"  [分頁對話框例外] {str(ex)}，預設採用標準分頁。")
+            listing.WriteLine(f"  [分頁對話框例外] {str(ex)}，預設採用單頁延伸排版。")
     finally:
         for tmp_f in [cfg_file, res_file]:
             if os.path.exists(tmp_f):
@@ -2674,30 +2743,50 @@ def main():
         f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
     )
 
-    # 3. 統計各工段工步數量，若超過 15 格則彈窗讓使用者決定是否分頁顯示
-    stage_op_counts = {}
-    for chunk in processed_chunks:
-        stg = chunk.get("stage", "通用工段")
-        stage_op_counts[stg] = stage_op_counts.get(stg, 0) + len(chunk.get("operations", []))
+    # 3. 預先分析各工段工步數量與各模式下之預計頁數 (供使用者預覽與決策)
+    stage_stats, total_extend_pages, total_paginate_pages, has_choice = preview_pagination_plan(
+        processed_chunks, rows_per_page=ROWS_PER_PAGE
+    )
 
-    over_15_stages = [{"stage": stg, "count": cnt} for stg, cnt in stage_op_counts.items() if cnt > 15]
-    pagination_mode = "paginate"
+    pagination_mode = "extend"  # 預設模式：單頁延伸
 
-    if over_15_stages:
+    if has_choice:
         the_session.ListingWindow.WriteLine("----------------------------------------")
-        stages_info_str = ", ".join([f"【{s['stage']}】({s['count']}格)" for s in over_15_stages])
+        the_session.ListingWindow.WriteLine("【工單分頁預覽】：")
+        for s in stage_stats:
+            the_session.ListingWindow.WriteLine(
+                f"  - 工段【{s['stage']}】({s['count']}刀)：單頁延伸規劃 ➔ {s['extend_desc']} | 自動分頁規劃 ➔ {s['paginate_desc']}"
+            )
         the_session.ListingWindow.WriteLine(
-            f"檢測到工段工步數超過 15 格：{stages_info_str}，正在啟動排版設定對話框..."
+            f"預計工單總頁數對比：單頁延伸模式為【共 {total_extend_pages} 頁】，自動分頁模式為【共 {total_paginate_pages} 頁】。"
         )
-        pagination_mode = invoke_pagination_prompt_dialog(over_15_stages, listing=the_session.ListingWindow)
-        if pagination_mode == "extend":
-            the_session.ListingWindow.WriteLine("使用者選擇【📑 單頁延伸顯示】(刀具向下延伸，截圖縮小或移至下一頁)。")
-        else:
-            the_session.ListingWindow.WriteLine("使用者選擇【📋 自動分頁顯示】(依標準 10 格/頁分頁)。")
+        the_session.ListingWindow.WriteLine("正在啟動【工單分頁預覽與排版決策視窗】供使用者選擇...")
 
-    # 執行智慧分頁 (支援工段優先分頁與超過 15 格單頁延伸/截圖下一頁模式)
+        user_choice = invoke_pagination_prompt_dialog(
+            stage_stats, total_extend_pages, total_paginate_pages, listing=the_session.ListingWindow
+        )
+
+        if user_choice == "cancel":
+            the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消排版操作，流程中止。")
+            return
+        elif user_choice == "paginate":
+            pagination_mode = "paginate"
+            the_session.ListingWindow.WriteLine(
+                f"使用者選擇【📋 自動分頁顯示】(依標準 10 格/頁分頁，預計總共 {total_paginate_pages} 頁)。"
+            )
+        else:
+            pagination_mode = "extend"
+            the_session.ListingWindow.WriteLine(
+                f"使用者選擇【📑 單頁延伸顯示】(刀具向下增加格數，預計總共 {total_extend_pages} 頁)。"
+            )
+    else:
+        the_session.ListingWindow.WriteLine(
+            f"各工段刀具數皆在 10 格以內，預先計算工單總頁數為：共 {total_extend_pages} 頁。"
+        )
+
+    # 執行智慧分頁 (支援工段優先分頁與動態增加格數/單頁延伸/截圖下一頁模式)
     pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode=pagination_mode)
-    the_session.ListingWindow.WriteLine(f"分頁計算完成：共分配為 {len(pages)} 頁。")
+    the_session.ListingWindow.WriteLine(f"分頁排版完成：最終產出為 {len(pages)} 頁。")
 
     # 4. 分析所有群組歸納獨立工段清單
     distinct_stages = get_distinct_stages(processed_chunks)
