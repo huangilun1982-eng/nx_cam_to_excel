@@ -722,6 +722,8 @@ def merge_consecutive_tools(raw_ops, group_name=""):
     2. 狀況 B (連續刀號同規格)：相鄰工步刀號連續 (t_curr == t_prev + 1)，
        且刀名去後綴、直徑、刃長、夾長一致時，合併為範圍字串 (如 T01~T02)，加工時間加總，長度取最大值防護
     3. 備註欄位串接合併，保留轉速進給資訊
+    4. 特殊防護 (單獨點選工序)：若前一工步或當前工步為「直接單獨選取之工序」(is_direct_op == True)，
+       代表工程師指定獨立轉出與呈現該工序，絕不參與同刀號/連續刀具合併，每道工序各自獨立成列並顯示其工序名稱！
     """
     if not raw_ops:
         return []
@@ -731,6 +733,17 @@ def merge_consecutive_tools(raw_ops, group_name=""):
 
     for op in raw_ops:
         if temp_op is None:
+            temp_op = dict(op)
+            t_int = parse_tool_int(temp_op.get("tool_number"))
+            temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
+            temp_op["_last_tool_int"] = t_int
+            continue
+
+        # 0. 若前一個工步或當前工步為使用者「直接點選之單獨工序」，禁止合併，各自獨立成列
+        is_direct_curr = op.get("is_direct_op", False)
+        is_direct_prev = temp_op.get("is_direct_op", False)
+        if is_direct_curr or is_direct_prev:
+            merged_ops.append(temp_op)
             temp_op = dict(op)
             t_int = parse_tool_int(temp_op.get("tool_number"))
             temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
@@ -819,14 +832,18 @@ def merge_consecutive_tools(raw_ops, group_name=""):
     if temp_op is not None:
         merged_ops.append(temp_op)
 
-    # 重新編排群組工站序號 (seq)、程式檔名填寫規則 (同群組首行填寫，後續留空) 與規格統一格式化
+    # 重新編排群組工站序號 (seq)、程式檔名填寫規則 (直接選取顯示工序名，資料夾展開首行填寫後續留空) 與規格統一格式化
     final_ops = []
     for idx, mop in enumerate(merged_ops):
         seq_num = idx + 1
-        if idx == 0:
-            prog_file_name = clean_program_name(group_name) if (group_name and group_name != "DEFAULT") else mop.get("clean_op_name", "")
+        is_direct = mop.get("is_direct_op", False)
+        if is_direct:
+            prog_file_name = mop.get("clean_op_name", "")
         else:
-            prog_file_name = ""
+            if idx == 0:
+                prog_file_name = clean_program_name(group_name) if (group_name and group_name != "DEFAULT") else mop.get("clean_op_name", "")
+            else:
+                prog_file_name = ""
 
         mop["seq"] = seq_num
         mop["op_name"] = prog_file_name
@@ -2554,7 +2571,7 @@ def main():
     processed_chunks = []
     total_op_count = 0
     total_merged_step_count = 0
-    last_boundary_seen = None
+    last_folder_boundary_seen = None
 
     for chunk in raw_chunks:
         grp_name = chunk["group_name"]
@@ -2606,24 +2623,21 @@ def main():
             })
             total_op_count += 1
 
-        # 執行子群組內部刀號與工步智慧合併 (各子資料夾獨立合併，絕不跨子資料夾合併)
+        # 執行子群組內部刀號與工步智慧合併 (各子資料夾獨立合併，直接點選工序絕不合併)
         merged_ops = merge_consecutive_tools(raw_ops, group_name=grp_name)
 
         # 程式檔名規範：
-        # 1. 若該工步為「直接點選之工序」：程式檔名填寫該工序自身名稱，每道工序皆各自顯示
+        # 1. 若該工步為「直接點選之工序」：程式檔名填寫該工序自身名稱，每道工序皆各自獨立成列顯示
         # 2. 若該工步為「資料夾展開」：以母工段/父資料夾為邊界，僅首道工步填寫父資料夾名稱，後續所有工步全部留空
-        current_boundary = (chunk_stage, parent_prog)
-        is_first_step_of_stage = (current_boundary != last_boundary_seen)
-        if is_first_step_of_stage:
-            last_boundary_seen = current_boundary
-
-        for idx, mop in enumerate(merged_ops):
+        for mop in merged_ops:
             is_direct = mop.get("is_direct_op", False)
             if is_direct:
                 mop["op_name"] = mop.get("clean_op_name", "")
             else:
-                if is_first_step_of_stage and idx == 0:
+                folder_boundary = (chunk_stage, parent_prog)
+                if folder_boundary != last_folder_boundary_seen:
                     mop["op_name"] = clean_program_name(parent_prog)
+                    last_folder_boundary_seen = folder_boundary
                 else:
                     mop["op_name"] = ""
 
