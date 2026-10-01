@@ -1757,64 +1757,87 @@ def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="pa
                 all_ops.append(op_item)
 
         total_ops = len(all_ops)
-        if total_ops == 0:
-            continue
-
-        if pagination_mode == "extend" and total_ops > 15:
-            # === 單頁延伸模式 (工步 > 15) ===
-            if total_ops <= 20:
-                # 狀況 A：16 ~ 20 步，下方空間足夠，截圖縮小放於同頁下方
-                page_rows = [{"type": "op", "data": op} for op in all_ops]
-                img_top = 8 + total_ops
-                pages.append({
-                    "stage": stg,
-                    "rows": page_rows,
-                    "show_image": True,
-                    "image_top_row": img_top,
-                    "image_bottom_row": 36,
-                    "is_appendix_image_page": False
-                })
-            else:
-                # 狀況 B：超過 20 步，影響到截圖顯示，截圖移至下一頁！
-                # 第 1 頁：刀具延伸頁 (最多 30 格)
-                first_page_ops = all_ops[:30]
-                pages.append({
-                    "stage": stg,
-                    "rows": [{"type": "op", "data": op} for op in first_page_ops],
-                    "show_image": False,
-                    "image_top_row": None,
-                    "image_bottom_row": None,
-                    "is_appendix_image_page": False
-                })
-
-                # 若超過 30 步 (極少見)，續頁放刀具
-                rem_ops = all_ops[30:]
-                while rem_ops:
-                    chunk_ops = rem_ops[:30]
-                    rem_ops = rem_ops[30:]
+        if total_ops <= 15:
+            # === 工步數在 1 ~ 15 格以內：單頁自動增加格數容納，絕不切頁！ ===
+            page_rows = [{"type": "op", "data": op} for op in all_ops]
+            img_top = 18 if total_ops <= 10 else (8 + total_ops)
+            pages.append({
+                "stage": stg,
+                "rows": page_rows,
+                "show_image": True,
+                "image_top_row": img_top,
+                "image_bottom_row": 36,
+                "is_appendix_image_page": False
+            })
+        else:
+            # === 工步數超過 15 格：依使用者選擇決定 ===
+            if pagination_mode == "extend":
+                # 單頁延伸模式
+                if total_ops <= 20:
+                    # 狀況 A：16 ~ 20 步，下方空間足夠，截圖縮小放於同頁下方
+                    page_rows = [{"type": "op", "data": op} for op in all_ops]
+                    img_top = 8 + total_ops
                     pages.append({
                         "stage": stg,
-                        "rows": [{"type": "op", "data": op} for op in chunk_ops],
+                        "rows": page_rows,
+                        "show_image": True,
+                        "image_top_row": img_top,
+                        "image_bottom_row": 36,
+                        "is_appendix_image_page": False
+                    })
+                else:
+                    # 狀況 B：超過 20 步，影響到截圖顯示，截圖移至下一頁！
+                    # 第 1 頁：刀具延伸頁 (最多 30 格)
+                    first_page_ops = all_ops[:30]
+                    pages.append({
+                        "stage": stg,
+                        "rows": [{"type": "op", "data": op} for op in first_page_ops],
                         "show_image": False,
                         "image_top_row": None,
                         "image_bottom_row": None,
                         "is_appendix_image_page": False
                     })
 
-                # 專屬示圖頁：表頭相同，中間為清晰大示圖 (A7:J36)
-                pages.append({
-                    "stage": stg,
-                    "rows": [],  # 刀具列留空
-                    "show_image": True,
-                    "image_top_row": 7,
-                    "image_bottom_row": 36,
-                    "is_appendix_image_page": True
-                })
-        else:
-            # === 標準分頁模式 (每頁 10 格，每頁含示圖) ===
-            current_page = []
-            for op_item in all_ops:
-                if len(current_page) >= rows_per_page:
+                    # 若超過 30 步 (極少見)，續頁放刀具
+                    rem_ops = all_ops[30:]
+                    while rem_ops:
+                        chunk_ops = rem_ops[:30]
+                        rem_ops = rem_ops[30:]
+                        pages.append({
+                            "stage": stg,
+                            "rows": [{"type": "op", "data": op} for op in chunk_ops],
+                            "show_image": False,
+                            "image_top_row": None,
+                            "image_bottom_row": None,
+                            "is_appendix_image_page": False
+                        })
+
+                    # 專屬示圖頁：表頭相同，中間為清晰大示圖 (A7:J36)
+                    pages.append({
+                        "stage": stg,
+                        "rows": [],  # 刀具列留空
+                        "show_image": True,
+                        "image_top_row": 7,
+                        "image_bottom_row": 36,
+                        "is_appendix_image_page": True
+                    })
+            else:
+                # === 標準分頁模式 (使用者選擇分頁：每頁 10 格，每頁含示圖) ===
+                current_page = []
+                for op_item in all_ops:
+                    if len(current_page) >= rows_per_page:
+                        pages.append({
+                            "stage": stg,
+                            "rows": current_page,
+                            "show_image": True,
+                            "image_top_row": 18,
+                            "image_bottom_row": 36,
+                            "is_appendix_image_page": False
+                        })
+                        current_page = []
+                    current_page.append({"type": "op", "data": op_item})
+
+                if current_page:
                     pages.append({
                         "stage": stg,
                         "rows": current_page,
@@ -1823,18 +1846,6 @@ def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="pa
                         "image_bottom_row": 36,
                         "is_appendix_image_page": False
                     })
-                    current_page = []
-                current_page.append({"type": "op", "data": op_item})
-
-            if current_page:
-                pages.append({
-                    "stage": stg,
-                    "rows": current_page,
-                    "show_image": True,
-                    "image_top_row": 18,
-                    "image_bottom_row": 36,
-                    "is_appendix_image_page": False
-                })
 
     return pages
 
@@ -1943,13 +1954,16 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                 'ws.Range("A7:J16").Borders.LineStyle = -4142'
             ])
         else:
-            # 若刀具列超過 10 列 (單頁延伸模式)，向下複製 Row 16 格式與合併格
+            # 若刀具列超過 10 列 (自動增加格數 / 單頁延伸模式)，向下精確複製 A16:J16 格式與合併格
             if num_rows > ROWS_PER_PAGE:
+                last_op_row = start_row + num_rows - 1
                 vbs_lines.extend([
-                    f'For r = 17 To {start_row + num_rows - 1}',
-                    '    ws.Rows(16).Copy',
-                    '    ws.Rows(r).PasteSpecial -4122',
-                    'Next'
+                    f'For r = 17 To {last_op_row}',
+                    '    ws.Range("A16:J16").Copy',
+                    '    ws.Range("A" & r & ":J" & r).PasteSpecial -4122',
+                    'Next',
+                    'objExcel.CutCopyMode = False',
+                    f'ws.Range("A{last_op_row}:J{last_op_row}").Borders(4).Weight = 3'  # 4 = xlEdgeBottom, 3 = xlMedium 封底線
                 ])
 
             loop_rows = max(ROWS_PER_PAGE, num_rows)
