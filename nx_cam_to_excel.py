@@ -16,6 +16,7 @@ Siemens NX CAM 加工工序單自動化匯出工具 (工業級分頁與智慧辨
 import os
 import sys
 import re
+import json
 import datetime
 import subprocess
 import tempfile
@@ -1459,6 +1460,68 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
 
     return orient_success
 
+def get_clean_subprocess_env():
+    """
+    構建深度純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
+    並尋找合適的外部 pythonw.exe 直譯器路徑
+    回傳: (valid_pythonw, clean_env)
+    """
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONHOME", None)
+    clean_env.pop("PYTHONPATH", None)
+    clean_env.pop("PYTHONSTARTUP", None)
+    clean_env.pop("PYTHONEXECUTABLE", None)
+
+    pythonw_candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python310\pythonw.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), r"Python313\pythonw.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), r"Python310\pythonw.exe"),
+        "pythonw.exe",
+        "pythonw"
+    ]
+
+    valid_pythonw = None
+    for cand in pythonw_candidates:
+        try:
+            if os.path.isabs(cand) and os.path.exists(cand):
+                valid_pythonw = cand
+                break
+        except Exception:
+            continue
+
+    if valid_pythonw and os.path.isabs(valid_pythonw):
+        py_dir = os.path.dirname(valid_pythonw)
+        py_dlls = os.path.join(py_dir, "DLLs")
+        py_scripts = os.path.join(py_dir, "Scripts")
+        tcl_lib = os.path.join(py_dir, r"tcl\tcl8.6")
+        tk_lib = os.path.join(py_dir, r"tcl\tk8.6")
+
+        if os.path.exists(tcl_lib):
+            clean_env["TCL_LIBRARY"] = tcl_lib
+        else:
+            clean_env.pop("TCL_LIBRARY", None)
+
+        if os.path.exists(tk_lib):
+            clean_env["TK_LIBRARY"] = tk_lib
+        else:
+            clean_env.pop("TK_LIBRARY", None)
+
+        filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
+        clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
+
+    if not valid_pythonw:
+        for cand in ["pythonw", "pyw"]:
+            try:
+                t_res = subprocess.run([cand, "-c", "import tkinter"], capture_output=True, timeout=3, env=clean_env)
+                if t_res.returncode == 0:
+                    valid_pythonw = cand
+                    break
+            except Exception:
+                continue
+
+    return valid_pythonw, clean_env
+
 def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, listing=None, work_part=None):
     """
     方案二：【無黑窗精緻置頂拍照精靈 + NX 視圖流暢旋轉 + 原生 F8 視角擺正】
@@ -1493,64 +1556,8 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
     if not os.path.exists(assistant_script):
         assistant_script = r"C:\NX_Standard\Template\capture_assistant_gui.py"
 
-    # 2. 構建深度純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
-    clean_env = os.environ.copy()
-    clean_env.pop("PYTHONHOME", None)
-    clean_env.pop("PYTHONPATH", None)
-    clean_env.pop("PYTHONSTARTUP", None)
-    clean_env.pop("PYTHONEXECUTABLE", None)
-
-    # 尋找外部 pythonw.exe (原生 Windows GUI 子系統，天然零黑窗)
-    pythonw_candidates = [
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python310\pythonw.exe"),
-        os.path.join(os.environ.get("ProgramFiles", ""), r"Python313\pythonw.exe"),
-        os.path.join(os.environ.get("ProgramFiles", ""), r"Python310\pythonw.exe"),
-        "pythonw.exe",
-        "pythonw"
-    ]
-
-    valid_pythonw = None
-    for cand in pythonw_candidates:
-        try:
-            if os.path.isabs(cand) and os.path.exists(cand):
-                valid_pythonw = cand
-                break
-        except Exception:
-            continue
-
-    # 針對選定的 python 直譯器，設定正確的 DLLs 與 Tcl/Tk 函式庫路徑，防止加載 NX 的舊版 tcl86t.dll
-    if valid_pythonw and os.path.isabs(valid_pythonw):
-        py_dir = os.path.dirname(valid_pythonw)
-        py_dlls = os.path.join(py_dir, "DLLs")
-        py_scripts = os.path.join(py_dir, "Scripts")
-        tcl_lib = os.path.join(py_dir, r"tcl\tcl8.6")
-        tk_lib = os.path.join(py_dir, r"tcl\tk8.6")
-
-        if os.path.exists(tcl_lib):
-            clean_env["TCL_LIBRARY"] = tcl_lib
-        else:
-            clean_env.pop("TCL_LIBRARY", None)
-
-        if os.path.exists(tk_lib):
-            clean_env["TK_LIBRARY"] = tk_lib
-        else:
-            clean_env.pop("TK_LIBRARY", None)
-
-        # 將 Python 自身目錄與 DLLs 置於 PATH 最前端，並濾除 NX 的 python 目錄干擾
-        filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
-        clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
-
-    # 若無絕對路徑，在純淨環境下以命令測試
-    if not valid_pythonw:
-        for cand in ["pythonw", "pyw"]:
-            try:
-                t_res = subprocess.run([cand, "-c", "import tkinter"], capture_output=True, timeout=3, env=clean_env)
-                if t_res.returncode == 0:
-                    valid_pythonw = cand
-                    break
-            except Exception:
-                continue
+    # 2. 取得純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
+    valid_pythonw, clean_env = get_clean_subprocess_env()
 
     gui_success = False
 
@@ -1987,6 +1994,266 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
             except Exception:
                 pass
 
+# ==================== NX CAM 後處理與 NC 轉出模組 ====================
+
+def build_nc_tasks_from_selection(selected_objects):
+    """
+    依照使用者在 CAM 導覽器選取之物件構建 NC 轉出任務列表：
+    1. 若選取為父資料夾：將該資料夾內所有底層工序彙整為一個 NC 任務，檔名為資料夾名稱 (如 MK-1-M1.nc)。
+    2. 若祖先已被選取：該子資料夾或子工序自動略過（由最頂層選取統一轉出，避免重疊重複產出）。
+    3. 若單獨選取工序：該工序獨立為一個 NC 任務，檔名為該工序名稱。
+    4. 保證 100% 遵守選取之工藝順序與去重原則。
+    """
+    tasks = []
+    covered_op_tags = set()
+    selected_set = set(selected_objects)
+
+    def _has_selected_ancestor(node):
+        curr = node
+        while curr is not None:
+            try:
+                curr = curr.GetParent(NXOpen.CAM.CAMSetup.View.ProgramOrder)
+            except Exception:
+                curr = None
+            if curr and curr in selected_set:
+                return True
+        return False
+
+    def _collect_ops_in_group(grp):
+        ops = []
+        name = getattr(grp, "Name", "").strip()
+        if is_excluded_group_name(name) or check_and_extract_info(name, {}):
+            return ops
+        try:
+            for member in grp.GetMembers():
+                if isinstance(member, NXOpen.CAM.Operation):
+                    ops.append(member)
+                elif isinstance(member, NXOpen.CAM.NCGroup):
+                    ops.extend(_collect_ops_in_group(member))
+        except Exception:
+            pass
+        return ops
+
+    for obj in selected_objects:
+        obj_name = getattr(obj, "Name", "").strip()
+        is_grp = isinstance(obj, NXOpen.CAM.NCGroup)
+
+        # 檢查是否已有祖先被選取，若有則此節點已被納入祖先任務，略過
+        if _has_selected_ancestor(obj):
+            continue
+
+        if is_grp:
+            if is_excluded_group_name(obj_name) or check_and_extract_info(obj_name, {}):
+                continue
+            group_ops = _collect_ops_in_group(obj)
+            # 濾除已涵蓋之工序
+            remaining_ops = [op for op in group_ops if getattr(op, "Tag", None) not in covered_op_tags]
+            if remaining_ops:
+                clean_name = clean_program_name(obj_name)
+                clean_name = re.sub(r'[\\/:*?"<>|]', '_', clean_name)
+                tasks.append({
+                    "program_name": clean_name,
+                    "operations": remaining_ops,
+                    "op_names": [getattr(op, "Name", "") for op in remaining_ops],
+                    "op_count": len(remaining_ops),
+                    "source_type": "group"
+                })
+                for op in remaining_ops:
+                    t = getattr(op, "Tag", None)
+                    if t:
+                        covered_op_tags.add(t)
+        elif isinstance(obj, NXOpen.CAM.Operation):
+            # 單獨工序
+            op_tag = getattr(obj, "Tag", None)
+            if op_tag not in covered_op_tags:
+                clean_name = clean_program_name(obj_name)
+                clean_name = re.sub(r'[\\/:*?"<>|]', '_', clean_name)
+                tasks.append({
+                    "program_name": clean_name,
+                    "operations": [obj],
+                    "op_names": [obj_name],
+                    "op_count": 1,
+                    "source_type": "operation"
+                })
+                if op_tag:
+                    covered_op_tags.add(op_tag)
+
+    return tasks
+
+def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", listing=None):
+    """
+    啟動獨立進程之後處理確認視窗 (nc_post_dialog.py)
+    回傳 post_config 字典：
+      {
+         "action": "post_and_export" | "export_only" | "cancel",
+         "postprocessor_name": "Fanuc_2026",
+         "custom_post_path": "",
+         "output_dir": r"...",
+         "extension": ".nc"
+      }
+    """
+    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
+    dialog_script = os.path.join(current_dir, "nc_post_dialog.py")
+    if not os.path.exists(dialog_script):
+        dialog_script = r"C:\NX_Standard\Template\nc_post_dialog.py"
+
+    valid_pythonw, clean_env = get_clean_subprocess_env()
+
+    if not valid_pythonw or not os.path.exists(dialog_script):
+        if listing:
+            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設僅匯出工單。")
+        return {"action": "export_only"}
+
+    temp_dir = tempfile.gettempdir()
+    pid = os.getpid()
+    timestamp = datetime.datetime.now().strftime("%H%M%S%f")
+    cfg_file = os.path.join(temp_dir, f"_nc_post_cfg_{pid}_{timestamp}.json")
+    res_file = os.path.join(temp_dir, f"_nc_post_res_{pid}_{timestamp}.json")
+
+    # 序列化任務資料 (過濾 NX 原生物件)
+    tasks_summary = []
+    for t in nc_tasks:
+        tasks_summary.append({
+            "program_name": t.get("program_name", ""),
+            "op_count": t.get("op_count", 0),
+            "op_names": t.get("op_names", []),
+            "source_type": t.get("source_type", "")
+        })
+
+    config_payload = {
+        "output_dir": default_dir,
+        "default_post": default_post,
+        "nc_tasks": tasks_summary
+    }
+
+    try:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(config_payload, f, ensure_ascii=False, indent=2)
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [錯誤] 無法寫入後處理設定暫存檔：{str(ex)}")
+        return {"action": "export_only"}
+
+    cmd = [
+        valid_pythonw,
+        dialog_script,
+        "--cfg-file", cfg_file,
+        "--res-file", res_file
+    ]
+
+    result = {"action": "export_only"}
+    try:
+        import ctypes
+        from ctypes import wintypes
+        import time
+
+        user32 = ctypes.windll.user32
+        msg = wintypes.MSG()
+        PM_REMOVE = 0x0001
+
+        proc = subprocess.Popen(cmd, env=clean_env)
+
+        # 訊息泵循環，確保 NX 主視窗維持響應
+        start_wait = time.time()
+        while proc.poll() is None:
+            while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+            time.sleep(0.02)
+            if time.time() - start_wait > 600: # 10 分鐘超時保護
+                proc.kill()
+                break
+
+        if os.path.exists(res_file):
+            with open(res_file, "r", encoding="utf-8") as f:
+                result = json.load(f)
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [後處理對話框例外] {str(ex)}，預設僅匯出工單。")
+    finally:
+        for tmp_f in [cfg_file, res_file]:
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
+
+    return result
+
+def execute_nc_postprocessing(cam_setup, nc_tasks, post_config, listing=None):
+    """
+    依據使用者設定，逐一對 nc_tasks 執行 NX CAM 原生後處理轉出 NC 碼
+    """
+    if not nc_tasks or not cam_setup:
+        return
+
+    post_name = post_config.get("postprocessor_name", "").strip()
+    custom_post = post_config.get("custom_post_path", "").strip()
+    output_dir = post_config.get("output_dir", "").strip()
+    extension = post_config.get("extension", ".nc").strip()
+
+    if not extension.startswith("."):
+        extension = "." + extension
+
+    # 若為自訂後處理器檔案路徑
+    actual_post = custom_post if (custom_post and os.path.exists(custom_post)) else post_name
+    if actual_post.startswith("[自訂]"):
+        actual_post = actual_post.replace("[自訂]", "").strip()
+
+    if not output_dir:
+        output_dir = os.getcwd()
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 決定後處理單位 (PostDefined 優先，回退 Metric)
+    units = getattr(NXOpen.CAM.CAMSetup.OutputUnits, "PostDefined", None)
+    if units is None:
+        units = getattr(NXOpen.CAM.CAMSetup.OutputUnits, "Metric", 0)
+
+    if listing:
+        listing.WriteLine("----------------------------------------")
+        listing.WriteLine("【開始轉出 NC 碼】")
+        listing.WriteLine(f"  - 後處理器：{actual_post}")
+        listing.WriteLine(f"  - 輸出目錄：{output_dir}")
+        listing.WriteLine(f"  - 程式副檔名：{extension}")
+        listing.WriteLine(f"  - 待處理檔案數：{len(nc_tasks)} 個")
+
+    success_count = 0
+    fail_count = 0
+
+    for idx, task in enumerate(nc_tasks, start=1):
+        p_name = task.get("program_name", f"PROG_{idx}")
+        ops = task.get("operations", [])
+        out_file = os.path.join(output_dir, f"{p_name}{extension}")
+
+        if not ops:
+            if listing:
+                listing.WriteLine(f"  [{idx:02d}/{len(nc_tasks):02d}] 略過 {p_name} (無有效工序)")
+            continue
+
+        try:
+            if listing:
+                listing.WriteLine(f"  [{idx:02d}/{len(nc_tasks):02d}] 正在後處理 {p_name}{extension} (共 {len(ops)} 道工序)...")
+
+            # 調用 NX Open CAM 原生後處理 API
+            cam_setup.Postprocess(ops, actual_post, out_file, units)
+
+            if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                success_count += 1
+                if listing:
+                    listing.WriteLine(f"      ✔ 成功轉出：{out_file} ({os.path.getsize(out_file)} 位元組)")
+            else:
+                success_count += 1
+                if listing:
+                    listing.WriteLine(f"      ✔ 完成調用：{out_file}")
+        except Exception as ex:
+            fail_count += 1
+            if listing:
+                listing.WriteLine(f"      ✖ 後處理失敗 [{p_name}]：{str(ex)}")
+
+    if listing:
+        listing.WriteLine(f"NC 碼轉出完畢：成功 {success_count} 筆，失敗 {fail_count} 筆。")
+        listing.WriteLine("----------------------------------------")
+
 # ==================== 主執行流程 ====================
 
 def main():
@@ -2104,6 +2371,29 @@ def main():
     # 若有提取到資訊關鍵字，印出提示
     if extracted_info:
         the_session.ListingWindow.WriteLine(f"已自動識別表頭資訊：{extracted_info}")
+
+    # 2. 建構 NC 轉出任務清單 (符合分組分檔、父資料夾包含子工序、單獨工序各自轉出、自動去重規則)
+    nc_tasks = build_nc_tasks_from_selection(selected_objects)
+
+    # 3. 彈出互動確認視窗：讓使用者決定是否依表單轉出 NC 碼、選擇機台後處理器與輸出路徑
+    the_session.ListingWindow.WriteLine("----------------------------------------")
+    the_session.ListingWindow.WriteLine("正在啟動後處理轉出與工單設定視窗...")
+    post_config = invoke_nc_post_dialog(
+        nc_tasks, target_folder, default_post="Fanuc_2026", listing=the_session.ListingWindow
+    )
+
+    action = post_config.get("action", "export_only")
+    if action == "cancel":
+        the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消操作，流程中止。")
+        return
+    elif action == "post_and_export":
+        the_session.ListingWindow.WriteLine("使用者選擇【轉出 NC 碼並匯出工單】。")
+        try:
+            execute_nc_postprocessing(cam_setup, nc_tasks, post_config, listing=the_session.ListingWindow)
+        except Exception as ex:
+            the_session.ListingWindow.WriteLine(f"執行後處理轉出時發生例外：{str(ex)}")
+    else:
+        the_session.ListingWindow.WriteLine("使用者選擇【僅匯出工單 (不轉 NC 碼)】。")
 
     # 2. 逐一萃取工序資訊並執行群組內刀具合併 (各子資料夾獨立合併，不跨子資料夾合併！)
     processed_chunks = []
