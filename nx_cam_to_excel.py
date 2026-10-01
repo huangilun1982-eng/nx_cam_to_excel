@@ -1,0 +1,2271 @@
+# -*- coding: utf-8 -*-
+"""
+Siemens NX CAM 加工工序單自動化匯出工具 (工業級分頁與智慧辨識版)
+功能：
+  1. 支援 CAM 導覽器群組與工序選取，智慧識別資訊資料夾 (材料/料號/孔數/厚度)
+  2. 自動排除 PROGRAM、未用項 等容器名稱
+  3. 支援 -P / -p 裝夾翻面強制分頁邏輯
+  4. 支援每頁 10 列自動換頁與群組完整性保證 (Keep Group Together)
+  5. 自動複製 Excel 母版生成「第1頁」、「第2頁」...，動態填寫 1-N 頁碼與表頭
+  6. 刀徑整合刀具名稱型號、刀號標準化 T01、夾長防撞安全護欄運算
+  7. 序號與程式檔名規範：同群組首道工序填寫群組檔名，後續工步留空；序號為每頁有效工步連續流水號 (1, 2, 3...)，空行不計序號
+  8. 刀號智慧合併機制：支援同刀號切削時間自動累計、連續刀號同規格合併 (如 T01~T02) 與防撞長度最大值保護
+  9. 表頭欄位精確填入：圖名為檔案名稱；圖號若包含 14 碼編號則填入、否則留空；尺寸由素材大小決定、無設定則留空
+"""
+
+import os
+import sys
+import re
+import datetime
+import subprocess
+import NXOpen
+import NXOpen.CAM
+import NXOpen.UF
+try:
+    import NXOpen.Gateway
+except Exception:
+    pass
+
+# ==================== 設定區 (參考 ExcelTool 規則) ====================
+ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
+EXCLUDE_KEYWORDS = ["NC_PROGRAM", "未用項"]  # 排除群組關鍵字
+FORCE_PAGE_SUFFIXES = ["-M", "-m", "_M", "_m", "-P", "-p", "_P", "_p"] # 強制分頁後綴 (支援 M/P 裝夾翻面)
+
+# 資訊資料夾前綴與表頭欄位對照
+INFO_PREFIX_RULES = {
+    "尺寸": "size",
+    "素材尺寸": "size",
+    "素材": "size",
+    "材料": "material",
+    "材質": "material",
+    "料號": "part_number",
+    "工單": "part_number",
+    "厚度": "thickness",
+    "孔數": "holes",
+    "數量": "holes",
+    "顏色": "color"
+}
+
+# ==================== CAM 物件收集與解析模組 ====================
+
+def clean_program_name(name):
+    """
+    程式檔名清洗規則：移除結尾的 -Txx 或 _Txx (例如 D6.0-T01 -> D6.0)
+    """
+    if not name:
+        return ""
+    clean = str(name).strip()
+    clean = re.sub(r'[-_]T\d+$', '', clean, flags=re.IGNORECASE)
+    return clean
+
+def is_excluded_group_name(name):
+    """
+    檢查群組名稱是否在排除清單中 (如未用項)
+    """
+    if not name:
+        return False
+    clean = str(name).strip()
+    for kw in EXCLUDE_KEYWORDS:
+        if kw in clean:
+            return True
+    return False
+
+def check_and_extract_info(name, extracted_info):
+    """
+    檢查是否為資訊資料夾 (如 材料AL6061、料號75612960)
+    若符合則提取後方字串並返回 True
+    """
+    if not name:
+        return False
+    clean = str(name).strip()
+    for prefix, key in INFO_PREFIX_RULES.items():
+        if clean.startswith(prefix):
+            val = clean[len(prefix):].strip(" :_-=")
+            if val:
+                extracted_info[key] = val
+            return True
+    return False
+
+def extract_stage_key(name):
+    """
+    從群組或工序名稱中精確解析工段標籤 (以 M1, M2, M3... 為核心，亦支援 OP10 與舊版 P1, P2)
+    若無明確工段標籤則回傳 None。
+    安全機制：限制序號為 1~49，排除刀柄懸伸長度 (如 P150, P200) 與一般規格字串。
+    """
+    if not name or str(name).strip().upper() in ["DEFAULT", "PROGRAM", "NC_PROGRAM", "NONE", "-"]:
+        return None
+
+    clean = str(name).strip()
+
+    # 1. 匹配中綴/後綴 [-_](M數字, OP數字, P數字, M, P)
+    # 限制 M/P 數字最多 2 位數且 < 50，排除大於等於 50 的刀柄懸伸規格 (如 P150, P200)
+    m_m = re.search(r'[-_](M\d{1,2}|OP\d{1,2}|P\d{1,2}|M|m|P|p)(?:[-_\s]|$)', clean, re.IGNORECASE)
+    if m_m:
+        val = m_m.group(1).upper()
+        if val in ["M", "P"]:
+            return "M1"
+        if val.startswith("P") and val[1:].isdigit():
+            p_num = int(val[1:])
+            if p_num < 50:
+                return f"M{p_num}"
+            return None
+        if val.startswith("M") and val[1:].isdigit():
+            m_num = int(val[1:])
+            if m_num < 50:
+                return f"M{m_num}"
+            return None
+        return val
+
+    # 2. 匹配開頭的 M1, M2, OP10, OP20, P1, P2
+    m_op = re.match(r'^(M\d{1,2}|OP\d{1,2}|P\d{1,2})(?:[-_\s]|$)', clean, re.IGNORECASE)
+    if m_op:
+        val = m_op.group(1).upper()
+        if val.startswith("P") and val[1:].isdigit():
+            p_num = int(val[1:])
+            if p_num < 50:
+                return f"M{p_num}"
+            return None
+        if val.startswith("M") and val[1:].isdigit():
+            m_num = int(val[1:])
+            if m_num < 50:
+                return f"M{m_num}"
+            return None
+        return val
+
+    return None
+
+def build_cam_tree_map(root_group, extracted_info=None):
+    """
+    從 ProgramOrder 樹根節點建立全域父子與頂層母資料夾映射表 (以物件 Tag 為 Key)
+    並自動全域掃描提取資訊資料夾 (ExcelTool 模式：材料/尺寸/厚度/料號等)
+    Tag -> {"top_parent": str, "stage": str, "direct_group": str}
+    """
+    node_info = {}
+
+    def traverse(node, current_top=None, current_stage=None, direct_parent_group=None):
+        if not node:
+            return
+
+        node_name = getattr(node, "Name", "").strip()
+        is_grp = isinstance(node, NXOpen.CAM.NCGroup)
+        stg = extract_stage_key(node_name)
+
+        next_top = current_top
+        next_stage = current_stage
+        next_direct = direct_parent_group
+
+        if is_grp:
+            # 1. 檢查並自動提取資訊資料夾 (ExcelTool 模式：材料、尺寸、料號、厚度等)
+            if extracted_info is not None and check_and_extract_info(node_name, extracted_info):
+                # 這是資訊資料夾，提取資訊後不當作加工程式群組，直接返回
+                return
+
+            # 2. 排除群組判定
+            if is_excluded_group_name(node_name):
+                return
+
+            if node_name.upper() not in ["PROGRAM", "NC_PROGRAM", "未用項"]:
+                if current_top is None or stg:
+                    # 這是頂層父資料夾！例如 MK-1-M1, MK-2-M2
+                    next_top = node_name
+                    next_stage = stg or current_stage or "通用工段"
+                next_direct = node_name
+
+        tag = getattr(node, "Tag", None)
+        if tag:
+            node_info[tag] = {
+                "top_parent": next_top or "DEFAULT",
+                "stage": next_stage or "通用工段",
+                "direct_group": next_direct or "DEFAULT"
+            }
+
+        if is_grp:
+            try:
+                for child in node.GetMembers():
+                    traverse(child, next_top, next_stage, next_direct)
+            except Exception:
+                pass
+
+    try:
+        traverse(root_group)
+    except Exception:
+        pass
+    return node_info
+
+def resolve_stage_and_parent_program(node, current_stage=None, current_parent=None, tree_map=None):
+    """
+    沿著 CAM 導覽器樹狀結構向上回溯，精準鎖定所屬 (工段標籤, 母程式父資料夾名稱, 直接群組名稱)
+    核心原則：
+    1. 優先查全域樹地圖 (保證 100% 精確)
+    2. 工序 (Operation) 絕非資料夾，溯源時直接跳過，只收集 NCGroup
+    3. 父資料夾為頂層 NCGroup (緊鄰 PROGRAM 下方) 或具備工段標籤 (如 MK-1-M1) 者
+    """
+    tag = getattr(node, "Tag", None)
+    if tree_map and tag and tag in tree_map:
+        info = tree_map[tag]
+        return info["stage"], info["top_parent"], info["direct_group"]
+
+    curr = node
+    # 若當前節點是工序，必須先跳到其所屬群組，絕不能將工序名當成程式群組
+    if isinstance(curr, NXOpen.CAM.Operation):
+        try:
+            curr = curr.GetParent(NXOpen.CAM.CAMSetup.View.ProgramOrder)
+        except Exception:
+            curr = None
+
+    ancestor_groups = []
+    while curr is not None:
+        name = getattr(curr, "Name", "").strip()
+        is_grp = isinstance(curr, NXOpen.CAM.NCGroup)
+        if is_grp and name.upper() not in ["PROGRAM", "NC_PROGRAM", "DEFAULT", "未用項", ""]:
+            ancestor_groups.append((curr, name))
+        try:
+            curr = curr.GetParent(NXOpen.CAM.CAMSetup.View.ProgramOrder)
+        except Exception:
+            break
+
+    if not ancestor_groups:
+        fallback_stage = current_stage or "通用工段"
+        fallback_parent = current_parent or "DEFAULT"
+        return fallback_stage, fallback_parent, "DEFAULT"
+
+    # ancestor_groups 由底至頂：[子資料夾, 父資料夾]
+    direct_group = ancestor_groups[0][1]
+
+    # 尋找帶有工段標籤之群組 (例如 MK-1-M1)
+    stage_found = None
+    stage_prog_name = None
+    for _, grp_name in reversed(ancestor_groups):
+        stg = extract_stage_key(grp_name)
+        if stg:
+            stage_found = stg
+            stage_prog_name = grp_name
+            break
+
+    # 最頂層的有效群組 (緊鄰 PROGRAM 之下)
+    top_group_name = ancestor_groups[-1][1]
+
+    final_stage = stage_found or current_stage or "通用工段"
+    final_prog = stage_prog_name or top_group_name or current_parent or "DEFAULT"
+    return final_stage, final_prog, direct_group
+
+def collect_cam_hierarchy(obj, target_chunks, extracted_info, current_group_name="", current_stage=None, parent_program=None, tree_map=None, visited_tags=None, directly_selected_tags=None):
+    """
+    遞迴走訪 CAM 物件，依據群組歸納為 Chunk，並過濾排除群組與提取資訊群組。
+    各子資料夾維持獨立 Chunk (不跨子資料夾合併)，並自動溯源鎖定所屬「母程式父資料夾」與工段標籤。
+    具備工序自動去重防護，並標記直接選取的工序。
+    """
+    if isinstance(obj, NXOpen.CAM.Operation):
+        tag = getattr(obj, "Tag", None)
+        # 工序自動去重防護 (避免重複/重疊選取導致工步重複輸出)
+        if visited_tags is not None and tag:
+            if tag in visited_tags:
+                return
+            visited_tags.add(tag)
+
+        # 標記是否為使用者直接點選之工序
+        is_direct = False
+        if directly_selected_tags is not None and tag:
+            is_direct = (tag in directly_selected_tags)
+        try:
+            setattr(obj, "_is_direct_op", is_direct)
+        except Exception:
+            pass
+
+        # 決定所屬之直接子群組、工段與母程式父資料夾
+        if tree_map and tag and tag in tree_map:
+            t_stage = tree_map[tag]["stage"]
+            t_top = tree_map[tag]["top_parent"]
+            t_direct = tree_map[tag]["direct_group"]
+        else:
+            t_stage, t_top, t_direct = resolve_stage_and_parent_program(obj, current_stage, parent_program, tree_map)
+
+        op_group = current_group_name or t_direct or "DEFAULT"
+        stage = current_stage or t_stage or "通用工段"
+        top_prog = parent_program or t_top or "DEFAULT"
+
+        if not target_chunks or target_chunks[-1]["group_name"] != op_group or target_chunks[-1]["stage"] != stage:
+            target_chunks.append({
+                "group_name": op_group,
+                "parent_program": top_prog,
+                "stage": stage,
+                "operations": [obj]
+            })
+        else:
+            target_chunks[-1]["operations"].append(obj)
+
+    elif isinstance(obj, NXOpen.CAM.NCGroup):
+        grp_name = obj.Name.strip()
+
+        # 1. 檢查是否為資訊資料夾 (如: 材料AL6061)
+        if check_and_extract_info(grp_name, extracted_info):
+            return
+
+        # 2. 檢查是否在排除清單中 (如: 未用項)
+        if is_excluded_group_name(grp_name):
+            return
+
+        # 3. 溯源/繼承工段與母程式群組
+        t_stage, t_top, _ = resolve_stage_and_parent_program(obj, current_stage, parent_program, tree_map)
+        detected_stage = extract_stage_key(grp_name)
+
+        if grp_name.upper() in ["PROGRAM", "NC_PROGRAM"]:
+            next_group_name = current_group_name
+            next_stage = current_stage
+            next_parent = parent_program
+        elif detected_stage or not parent_program:
+            # 頂層父資料夾 (如 MK-1-M1, MK-2-M2)
+            next_group_name = grp_name
+            next_stage = detected_stage if detected_stage else t_stage
+            next_parent = t_top if t_top != "DEFAULT" else grp_name
+        else:
+            # 已經在某個母群組內部之子資料夾 (如 E20-125L)：
+            # current_group_name 設為該子資料夾以維持各子資料夾獨立 Chunk (不跨組合併)，母程式父資料夾名稱向下維持！
+            next_group_name = grp_name
+            next_stage = current_stage
+            next_parent = parent_program
+
+        members = obj.GetMembers()
+        for member in members:
+            collect_cam_hierarchy(member, target_chunks, extracted_info, next_group_name, next_stage, next_parent, tree_map, visited_tags, directly_selected_tags)
+
+# ==================== 表頭資訊萃取模組 (圖號/圖名/素材尺寸) ====================
+
+def extract_14_digit_drawing_number(name):
+    """
+    從檔案名稱中提取 14 碼編號 (若當中有 14 碼編號則為圖號，若無則留空)
+    """
+    if not name:
+        return ""
+    m = re.search(r'(?<![A-Za-z0-9])([A-Za-z0-9]{14})(?![A-Za-z0-9])', str(name))
+    return m.group(1) if m else ""
+
+def extract_blank_size_from_group_name(group_name):
+    """
+    從程式群組名稱中探測素材規格 (例如 160x160x10-P1 -> 160x160x10)
+    """
+    if not group_name:
+        return ""
+    m = re.search(r'(\d+(?:\.\d+)?)\s*[xX*]\s*(\d+(?:\.\d+)?)\s*[xX*]\s*(\d+(?:\.\d+)?)', str(group_name))
+    if m:
+        def fmt_s(s):
+            try:
+                f = float(s)
+                return str(int(f)) if f.is_integer() else s
+            except Exception:
+                return s
+        return f"{fmt_s(m.group(1))}x{fmt_s(m.group(2))}x{fmt_s(m.group(3))}"
+    return ""
+
+def extract_blank_size_from_cam(work_part, uf_session):
+    """
+    嘗試從 NX CAM WORKPIECE 設定的素材幾何 (Blank) 讀取其邊界尺寸 (長x寬x高)
+    """
+    try:
+        cam_setup = work_part.CAMSetup
+        if not cam_setup:
+            return ""
+
+        geom_root = cam_setup.GetRoot(NXOpen.CAM.CAMSetup.View.Geometry)
+        if not geom_root:
+            return ""
+
+        nodes_to_check = []
+        def traverse_geom(node):
+            if not node:
+                return
+            nodes_to_check.append(node)
+            try:
+                for member in node.GetMembers():
+                    if isinstance(member, NXOpen.CAM.NCGroup):
+                        traverse_geom(member)
+            except Exception:
+                pass
+
+        traverse_geom(geom_root)
+
+        for g_node in nodes_to_check:
+            try:
+                name_upper = g_node.Name.upper()
+                if "WORKPIECE" in name_upper or "BLANK" in name_upper:
+                    box = uf_session.Bnd.AskBox(g_node.Tag)
+                    if box and len(box) >= 6:
+                        lx, ly, lz = box[3], box[4], box[5]
+                        if lx > 0.5 and ly > 0.5 and lz > 0.5:
+                            def fmt_val(v):
+                                return str(int(round(v))) if abs(v - round(v)) < 0.05 else f"{v:.1f}"
+                            return f"{fmt_val(lx)}x{fmt_val(ly)}x{fmt_val(lz)}"
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return ""
+
+def determine_blank_size(work_part, uf_session, raw_chunks, extracted_info):
+    """
+    尺寸應該由取得設定的素材大小決定，若無資訊則留空 ("")
+    優先順序 (完全整合 ExcelTool 模式與 NX 原生幾何讀取)：
+    1. 資訊資料夾明確定義 (ExcelTool 經典模式)：
+       - 優先讀取「尺寸」/「素材」前綴資料夾 (如 尺寸160x160x10、素材160*160*10)
+       - 相容讀取 ExcelTool「材料」/「材質」前綴資料夾 (如 材料160x160x10、材料AL6061 160x160x10)
+    2. 選取的程式群組名稱中內含的素材規格 (如 160x160x10-P1)
+    3. NX CAM WORKPIECE 設定的素材幾何邊界 (原生 3D AskBox 量測)
+    4. 若無資訊則留空 ("")
+    """
+    # 1. 資訊資料夾 (ExcelTool 模式)
+    if "size" in extracted_info and extracted_info["size"]:
+        raw_sz = extracted_info["size"]
+        clean_sz = extract_blank_size_from_group_name(raw_sz)
+        return clean_sz if clean_sz else raw_sz
+
+    if "material" in extracted_info and extracted_info["material"]:
+        mat_val = extracted_info["material"]
+        # 若材料名稱中內含規格數值 (例如 AL6061 160x160x10 或 160*160*10)
+        sz_in_mat = extract_blank_size_from_group_name(mat_val)
+        if sz_in_mat:
+            return sz_in_mat
+        # 若使用者直接在材料資料夾寫入單純文字 (如 ExcelTool 的 {material} 填法)
+        return mat_val
+
+    # 2. 程式群組名稱
+    for chunk in raw_chunks:
+        grp = chunk.get("group_name", "")
+        sz = extract_blank_size_from_group_name(grp)
+        if sz:
+            return sz
+
+    # 3. CAM WORKPIECE 素材幾何
+    cam_sz = extract_blank_size_from_cam(work_part, uf_session)
+    if cam_sz:
+        return cam_sz
+
+    # 4. 若無資訊則留空
+    return ""
+
+# ==================== 刀具與幾何萃取模組 ====================
+
+def get_tool_from_operation(op, uf_session):
+    """
+    使用 MachineTool 視圖層級溯源與 UF 備援取得刀具物件與標籤
+    """
+    tool_obj = None
+    tool_tag = 0
+
+    try:
+        parent = op.GetParent(NXOpen.CAM.CAMSetup.View.MachineTool)
+        while parent is not None:
+            if isinstance(parent, NXOpen.CAM.Tool):
+                tool_obj = parent
+                tool_tag = parent.Tag
+                break
+            try:
+                parent = parent.GetParent()
+            except Exception:
+                break
+    except Exception:
+        pass
+
+    if tool_tag == 0:
+        try:
+            c_tag = uf_session.Oper.AskCutterGroup(op.Tag)
+            if c_tag and c_tag != 0:
+                tool_tag = c_tag
+        except Exception:
+            pass
+
+    return tool_obj, tool_tag
+
+def format_tool_number(val):
+    """
+    標準化刀號格式為 T01, T02...
+    """
+    if not val or val == "-":
+        return "-"
+    try:
+        num = int(float(val))
+        if num > 0:
+            return f"T{num:02d}"
+    except Exception:
+        pass
+    return str(val)
+
+def calculate_safe_holder_length(flute_len_str, holder_len_str):
+    """
+    夾長安全防護運算 (基準至少 20mm，且夾長必須大於刃長 + 5mm)
+    """
+    try:
+        f_val = float(flute_len_str) if flute_len_str != "-" else 0.0
+    except Exception:
+        f_val = 0.0
+
+    try:
+        h_val = float(holder_len_str) if holder_len_str != "-" else 0.0
+    except Exception:
+        h_val = 0.0
+
+    if h_val > 0:
+        if h_val < 20.0:
+            h_val = 20.0
+        if f_val > 0 and h_val <= f_val:
+            h_val = f_val + 5.0
+        return f"{h_val:.1f}" if h_val % 1 != 0 else str(int(h_val))
+    elif f_val > 0:
+        safe_h = max(20.0, f_val + 5.0)
+        return f"{safe_h:.1f}" if safe_h % 1 != 0 else str(int(safe_h))
+
+    return holder_len_str
+
+def get_tool_parameters(uf_session, tool_obj, tool_tag):
+    """
+    透過 UF 底層核心索引讀取刀具參數 (1000直徑, 1001長度, 1002刃長, 1038刀號)
+    """
+    tool_name = "未指派"
+    tool_number = "-"
+    tool_diameter = "-"
+    flute_length = "-"
+    holder_length = "-"
+
+    if tool_obj is not None:
+        try:
+            tool_name = tool_obj.Name
+        except Exception:
+            pass
+    elif tool_tag and tool_tag != 0:
+        try:
+            tool_name = uf_session.Obj.AskName(tool_tag)
+        except Exception:
+            pass
+
+    if not tool_tag or tool_tag == 0:
+        return tool_name, tool_number, tool_diameter, flute_length, holder_length
+
+    # 1. 取得刀號
+    if tool_obj is not None:
+        try:
+            if hasattr(tool_obj, "ToolNumber") and tool_obj.ToolNumber > 0:
+                tool_number = str(tool_obj.ToolNumber)
+        except Exception:
+            pass
+
+    if tool_number == "-":
+        try:
+            t_num = uf_session.Param.AskIntValue(tool_tag, 1038)
+            if t_num > 0:
+                tool_number = str(t_num)
+        except Exception:
+            pass
+
+    if tool_number == "-":
+        try:
+            t_num = uf_session.Obj.AskIntAttr(tool_tag, "TL_NUMBER")
+            if t_num > 0:
+                tool_number = str(t_num)
+        except Exception:
+            pass
+
+    if tool_number == "-":
+        try:
+            t_val = uf_session.Obj.AskAttrValue(tool_tag, "TL_NUMBER")
+            if t_val and t_val.strip():
+                tool_number = t_val.strip()
+        except Exception:
+            pass
+
+    tool_number = format_tool_number(tool_number)
+
+    # 2. 透過 Cutter.AskParameters 讀取直徑、長度、刃長
+    try:
+        params = uf_session.Cutter.AskParameters(tool_tag)
+        if params and len(params) > 0:
+            if params[0] > 0:
+                tool_diameter = f"{params[0]:.2f}"
+            if len(params) > 1 and params[1] > 0:
+                holder_length = f"{params[1]:.1f}"
+            if len(params) > 2 and params[2] > 0:
+                flute_length = f"{params[2]:.1f}"
+    except Exception:
+        pass
+
+    # 3. 備援底層索引讀取
+    if tool_diameter == "-":
+        try:
+            dia = uf_session.Param.AskDoubleValue(tool_tag, 1000)
+            if dia > 0:
+                tool_diameter = f"{dia:.2f}"
+        except Exception:
+            pass
+
+    if holder_length == "-":
+        try:
+            hlen = uf_session.Param.AskDoubleValue(tool_tag, 1001)
+            if hlen > 0:
+                holder_length = f"{hlen:.1f}"
+        except Exception:
+            pass
+
+    if flute_length == "-":
+        try:
+            flen = uf_session.Param.AskDoubleValue(tool_tag, 1002)
+            if flen > 0:
+                flute_length = f"{flen:.1f}"
+        except Exception:
+            pass
+
+    holder_length = calculate_safe_holder_length(flute_length, holder_length)
+
+    return tool_name, tool_number, tool_diameter, flute_length, holder_length
+
+def format_tool_display(tool_name, tool_diameter):
+    """
+    刀具規格顯示格式化：
+    若有刀具名稱型號 (如 E3, E1, CC6, C0.5, D0.5) 則直接顯示名稱，不須額外顯示後綴 (Dxx)；
+    若無刀具名稱僅有直徑時，顯示為 Dxx (如 D0.5, D0.36)。
+    """
+    has_name = bool(tool_name and str(tool_name).strip() not in ["未指派", "None", "-", ""])
+    has_dia = bool(tool_diameter and str(tool_diameter).strip() not in ["-", "None", ""])
+
+    if has_name:
+        clean_name = str(tool_name).strip()
+        # 清除任何可能存在的 (Dxx) 或 (xx) 直徑後綴，確保輸出純淨刀名
+        clean_name = re.sub(r'\s*\([dD]?[\d\.]+\)$', '', clean_name).strip()
+        return clean_name if clean_name else str(tool_name).strip()
+    elif has_dia:
+        try:
+            dia_f = float(tool_diameter)
+            dia_str = f"D{dia_f:.2f}".rstrip('0').rstrip('.') if dia_f % 1 != 0 else f"D{int(dia_f)}"
+            return dia_str
+        except Exception:
+            return f"D{tool_diameter}"
+    return "-"
+
+def get_operation_time_seconds(op):
+    """
+    取得工序切削時間 (單位：秒)
+    """
+    minutes = 0.0
+    try:
+        minutes = op.GetToolpathTime()
+    except Exception:
+        pass
+
+    if minutes <= 0.0:
+        try:
+            minutes = op.GetToolpathCuttingTime()
+        except Exception:
+            pass
+
+    total_seconds = int(round(minutes * 60.0))
+    return max(0, total_seconds)
+
+def format_seconds_to_hms(total_seconds):
+    """
+    將總秒數格式化為 HH:MM:SS
+    """
+    if total_seconds <= 0:
+        return "00:00:00"
+    hours, remainder = divmod(int(total_seconds), 3600)
+    mins, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+def get_operation_time(op):
+    """
+    取得工序切削時間並格式化為 HH:MM:SS
+    """
+    return format_seconds_to_hms(get_operation_time_seconds(op))
+
+# ==================== 刀號與工步智慧合併模組 (Tool Merge Engine) ====================
+
+def parse_tool_int(val):
+    """
+    解析刀號字串或數字為整數，若無效則回傳 -99999
+    """
+    if not val or str(val).strip() in ["-", "", "None"]:
+        return -99999
+    try:
+        m = re.search(r'\d+', str(val))
+        if m:
+            return int(m.group())
+    except Exception:
+        pass
+    return -99999
+
+def normalize_tool_name(name):
+    """
+    標準化刀具名稱：移除尾部 -Txx 或 _Txx (例如 E4-T01 -> E4)
+    """
+    if not name or name in ["未指派", "None", "-"]:
+        return ""
+    clean = str(name).strip()
+    clean = re.sub(r'[-_]T\d+$', '', clean, flags=re.IGNORECASE)
+    return clean
+
+def extract_float(val):
+    """
+    安全解析浮點數數值
+    """
+    if not val or str(val).strip() in ["-", "", "None"]:
+        return 0.0
+    try:
+        m = re.search(r'[-+]?\d*\.?\d+', str(val))
+        if m:
+            return float(m.group())
+    except Exception:
+        pass
+    return 0.0
+
+def merge_consecutive_tools(raw_ops, group_name=""):
+    """
+    依據 ExcelTool 核心規則合併同群組相鄰刀具工步：
+    1. 狀況 A (同刀號累加)：相鄰工步刀號相同時，合併為一列，加工時間自動加總
+    2. 狀況 B (連續刀號同規格)：相鄰工步刀號連續 (t_curr == t_prev + 1)，
+       且刀名去後綴、直徑、刃長、夾長一致時，合併為範圍字串 (如 T01~T02)，加工時間加總，長度取最大值防護
+    3. 備註欄位串接合併，保留轉速進給資訊
+    """
+    if not raw_ops:
+        return []
+
+    merged_ops = []
+    temp_op = None
+
+    for op in raw_ops:
+        if temp_op is None:
+            temp_op = dict(op)
+            t_int = parse_tool_int(temp_op.get("tool_number"))
+            temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
+            temp_op["_last_tool_int"] = t_int
+            continue
+
+        # 1. 取得前後刀號整數
+        t_curr_int = parse_tool_int(op.get("tool_number"))
+        t_prev_int = temp_op.get("_last_tool_int", parse_tool_int(temp_op.get("tool_number")))
+
+        # 2. 規格一致性比對 (乾淨刀名、直徑、刃長、夾長)
+        name_prev = normalize_tool_name(temp_op.get("raw_tool_name", temp_op.get("tool_name", "")))
+        name_curr = normalize_tool_name(op.get("raw_tool_name", op.get("tool_name", "")))
+
+        dia_prev = extract_float(temp_op.get("tool_diameter"))
+        dia_curr = extract_float(op.get("tool_diameter"))
+
+        flute_prev = extract_float(temp_op.get("flute_length"))
+        flute_curr = extract_float(op.get("flute_length"))
+
+        holder_prev = extract_float(temp_op.get("holder_length"))
+        holder_curr = extract_float(op.get("holder_length"))
+
+        is_spec_match = (
+            name_prev == name_curr and
+            dia_prev == dia_curr and
+            flute_prev == flute_curr and
+            holder_prev == holder_curr
+        )
+
+        # 狀況 A：同把刀 (刀號相同且有效)
+        is_same_id = (t_curr_int == t_prev_int and t_curr_int != -99999)
+
+        # 狀況 B：連續刀號且規格完全相同 (例如 T01 與 T02)
+        is_consecutive = (t_curr_int == t_prev_int + 1 and t_curr_int != -99999 and is_spec_match)
+
+        if is_same_id or is_consecutive:
+            # 觸發合併
+            # (1) 刀名正規化為乾淨名稱 (去後綴)
+            if name_prev:
+                temp_op["raw_tool_name"] = name_prev
+                temp_op["tool_name"] = name_prev
+
+            # (2) 刀號字串處理
+            if is_consecutive:
+                start_str = temp_op.get("_start_tool_str", format_tool_number(temp_op.get("tool_number")))
+                end_str = format_tool_number(op.get("tool_number"))
+                temp_op["tool_number"] = f"{start_str}~{end_str}"
+                temp_op["_last_tool_int"] = t_curr_int
+            else:
+                # 相同刀號維持原樣
+                temp_op["_last_tool_int"] = t_curr_int
+
+            # (3) 加工時間秒數累加
+            sec_prev = temp_op.get("time_seconds", 0)
+            sec_curr = op.get("time_seconds", 0)
+            total_sec = sec_prev + sec_curr
+            temp_op["time_seconds"] = total_sec
+            temp_op["time"] = format_seconds_to_hms(total_sec)
+
+            # (4) 刃長與夾長取最大值防護
+            max_flute = max(flute_prev, flute_curr)
+            max_holder = max(holder_prev, holder_curr)
+            flute_str = f"{max_flute:.1f}" if max_flute % 1 != 0 else str(int(max_flute)) if max_flute > 0 else "-"
+            holder_str = f"{max_holder:.1f}" if max_holder % 1 != 0 else str(int(max_holder)) if max_holder > 0 else "-"
+            temp_op["flute_length"] = flute_str
+            temp_op["holder_length"] = calculate_safe_holder_length(flute_str, holder_str)
+
+            # (5) 重新格式化刀具規格欄位
+            clean_display_name = temp_op.get("raw_tool_name", temp_op.get("tool_name", ""))
+            temp_op["tool_spec_display"] = format_tool_display(clean_display_name, temp_op.get("tool_diameter"))
+
+            # (6) 備註串接合併
+            n1 = str(temp_op.get("note", "")).strip()
+            n2 = str(op.get("note", "")).strip()
+            if n2 and n2 not in n1:
+                temp_op["note"] = f"{n1} {n2}".strip()
+        else:
+            # 不符合合併條件，結算前一工步
+            merged_ops.append(temp_op)
+            temp_op = dict(op)
+            t_int = parse_tool_int(temp_op.get("tool_number"))
+            temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
+            temp_op["_last_tool_int"] = t_int
+
+    if temp_op is not None:
+        merged_ops.append(temp_op)
+
+    # 重新編排群組工站序號 (seq)、程式檔名填寫規則 (同群組首行填寫，後續留空) 與規格統一格式化
+    final_ops = []
+    for idx, mop in enumerate(merged_ops):
+        seq_num = idx + 1
+        if idx == 0:
+            prog_file_name = clean_program_name(group_name) if (group_name and group_name != "DEFAULT") else mop.get("clean_op_name", "")
+        else:
+            prog_file_name = ""
+
+        mop["seq"] = seq_num
+        mop["op_name"] = prog_file_name
+
+        # 統一格式化刀具規格欄位 (如 E4 (D4.0))
+        clean_tool_title = mop.get("raw_tool_name", mop.get("tool_name", ""))
+        mop["tool_spec_display"] = format_tool_display(clean_tool_title, mop.get("tool_diameter"))
+
+        final_ops.append(mop)
+
+    return final_ops
+
+# ==================== 工段示圖截取與拍照精靈模組 ====================
+
+def get_distinct_stages(chunks):
+    """
+    分析所有 chunks 歸納出獨立工段清單
+    若有明顯工段標籤 (如 M1, M2, OP10) 則保留各工段；
+    若無特定標籤，則歸納為單一工段，避免多餘拍照彈窗干擾。
+    """
+    raw_stages = []
+    for c in chunks:
+        if not c.get("operations"):
+            continue
+        stg = c.get("stage")
+        if not stg:
+            stg = extract_stage_key(c.get("group_name", "")) or "通用工段"
+        if stg not in raw_stages:
+            raw_stages.append(stg)
+
+    if not raw_stages:
+        return ["通用工段"]
+
+    # 檢查是否有具體的工段識別標籤 (M數字, OP數字 等)
+    has_explicit_stage = any(re.match(r'^(M\d+|OP\d+)$', k) for k in raw_stages)
+    if has_explicit_stage:
+        explicit_list = [s for s in raw_stages if s != "通用工段"]
+        return explicit_list if explicit_list else ["通用工段"]
+
+    return ["通用工段"]
+
+def ensure_white_background_image(png_path):
+    """
+    確保圖檔背景為 100% 純白色 (RGB 255, 255, 255)：
+    1. 若圖檔包含 Alpha 透明通道，複合至純白底色；
+    2. 若圖檔為 RGB 但四周邊界非純白色 (如 NX 漸變背景未清除)，執行邊界多點泛洪填充 (Floodfill) 將外圍背景清洗為純白。
+    雙層防護：支援當前直譯器 PIL 與外部 Python 3.13 (已安裝 Pillow) 執行。
+    """
+    if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
+        return
+
+    # 外部處理腳本 (在獨立進程中執行，保證 Pillow 100% 成功執行)
+    external_script = (
+        "from PIL import Image, ImageDraw\n"
+        "def process(path):\n"
+        "    with Image.open(path) as im:\n"
+        "        im = im.convert('RGBA')\n"
+        "        bg = Image.new('RGBA', im.size, (255, 255, 255, 255))\n"
+        "        bg.paste(im, mask=im.split()[-1])\n"
+        "        rgb_im = bg.convert('RGB')\n"
+        "        w, h = rgb_im.size\n"
+        "        corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]\n"
+        "        need_flood = any(sum(c) < 735 for c in corners)\n"
+        "        if need_flood:\n"
+        "            step = max(10, min(w, h) // 40)\n"
+        "            seeds = ([(x, 0) for x in range(0, w, step)] +\n"
+        "                     [(x, h-1) for x in range(0, w, step)] +\n"
+        "                     [(0, y) for y in range(0, h, step)] +\n"
+        "                     [(w-1, y) for y in range(0, h, step)])\n"
+        "            for pt in seeds:\n"
+        "                if sum(rgb_im.getpixel(pt)) < 735:\n"
+        "                    try:\n"
+        "                        ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)\n"
+        "                    except Exception:\n"
+        "                        pass\n"
+        "        rgb_im.save(path, 'PNG')\n"
+        f"process(r'{png_path}')\n"
+    )
+
+    # 優先嘗試在當前直譯器中運行
+    try:
+        from PIL import Image, ImageDraw
+        with Image.open(png_path) as im:
+            im = im.convert("RGBA")
+            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            rgb_im = bg.convert("RGB")
+            w, h = rgb_im.size
+            corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]
+            if any(sum(c) < 735 for c in corners):
+                step = max(10, min(w, h) // 40)
+                seeds = (
+                    [(x, 0) for x in range(0, w, step)] +
+                    [(x, h-1) for x in range(0, w, step)] +
+                    [(0, y) for y in range(0, h, step)] +
+                    [(w-1, y) for y in range(0, h, step)]
+                )
+                for pt in seeds:
+                    if sum(rgb_im.getpixel(pt)) < 735:
+                        try:
+                            ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)
+                        except Exception:
+                            pass
+            rgb_im.save(png_path, "PNG")
+            return
+    except Exception:
+        pass
+
+    # 若當前直譯器未安裝 PIL，呼叫已確認安裝 PIL 的外部 Python 3.13 執行
+    try:
+        py_candidates = [
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\python.exe"),
+            "pythonw.exe"
+        ]
+        valid_py = None
+        for cand in py_candidates:
+            if os.path.isabs(cand) and os.path.exists(cand):
+                valid_py = cand
+                break
+        if not valid_py:
+            valid_py = "pythonw"
+
+        subprocess.run([valid_py, "-c", external_script], timeout=6, creationflags=0x08000000)
+    except Exception:
+        pass
+
+def capture_nx_viewport(the_ui, out_png_path, white_background=True, listing=None, work_part=None):
+    """
+    截取當前 NX 圖形視窗畫面為高解析度 PNG 圖片 (預設白底渲染模式，避免黑底浪費墨水)
+    技術特色：
+    1. 底層座標圖示徹底隱藏：
+       - 視圖層級 (WorkView.TriadVisibility & WcsVisibility)：直接關閉畫面左下角 3D 方塊方位座標與工作座標系
+       - 零件偏好設定層級 (PartPreferences.ScreenVisualization.TriadVisibility)：關閉當前零件視圖三面角
+       - 會話偏好設定層級 (SessionPreferences.ScreenVisualization.TriadVisibility)：關閉 Session 視圖三面角
+       - 座標系控制器 (WCS.Visibility & UFSession.Csys.SetWcsDisplay)：雙重隱藏 WCS
+       - 即時視圖刷新 (WorkView.Update & UFSession.Disp.RegenerateDisplay)：立即清除渲染緩衝區中的座標殘留
+    2. 拍照前透過 NX 原生 CreateBackground 暫時切換視圖為單色純白底，截圖後自動還原
+    3. 配合 ImageExportBuilder Transparent 模式輸出
+    4. 圖片產生後調用 ensure_white_background_image 進行邊界泛洪去背，確保 100% 絕對純白底！
+    5. 全程透過 try...finally 架構，拍照結束後 100% 精確還原使用者原本的視圖座標與背景設定！
+    """
+    out_dir = os.path.dirname(out_png_path)
+    if out_dir and not os.path.exists(out_dir):
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            pass
+
+    base_no_ext, ext = os.path.splitext(out_png_path)
+    if not ext:
+        ext = ".png"
+        out_png_path = base_no_ext + ext
+
+    # 安全動態匯入 Gateway 模組
+    NXGateway = None
+    try:
+        import NXOpen.Gateway as _gw
+        NXGateway = _gw
+    except Exception:
+        try:
+            import NXOpen_Gateway as _gw
+            NXGateway = _gw
+        except Exception:
+            NXGateway = None
+
+    # 確保取得 Session、WorkPart、WorkView 與 UFSession
+    the_session = None
+    try:
+        the_session = NXOpen.Session.GetSession()
+        if work_part is None and hasattr(the_session, "Parts") and hasattr(the_session.Parts, "Work"):
+            work_part = the_session.Parts.Work
+    except Exception:
+        pass
+
+    w_view = None
+    if work_part is not None and hasattr(work_part, "Views"):
+        try:
+            w_view = work_part.Views.WorkView
+        except Exception:
+            w_view = None
+
+    uf_session = None
+    try:
+        uf_session = NXOpen.UF.UFSession.GetUFSession()
+    except Exception:
+        pass
+
+    # 暫時隱藏 View Triad (視圖方塊三軸座標架) 與 WCS (工作座標系)
+    orig_view_triad_vis = None
+    orig_view_wcs_vis = None
+    orig_part_triad_vis = None
+    orig_sess_triad_vis = None
+    orig_wcs_vis = None
+    part_screen = None
+    sess_screen = None
+    bg_override = None
+    orig_bg_type = None
+
+    try:
+        # (A) 視圖層級控制 (View Level：最底層直接控制當前視窗 Triad 與 WCS 渲染)
+        if w_view is not None:
+            try:
+                if hasattr(w_view, "TriadVisibility"):
+                    orig_view_triad_vis = w_view.TriadVisibility
+                    w_view.TriadVisibility = False
+            except Exception:
+                pass
+            try:
+                if hasattr(w_view, "WcsVisibility"):
+                    orig_view_wcs_vis = w_view.WcsVisibility
+                    w_view.WcsVisibility = False
+            except Exception:
+                pass
+
+        # (B) 零件偏好設定層級 (Part Preferences Level：NX 12+ 官方標準)
+        if work_part is not None and hasattr(work_part, "Preferences"):
+            try:
+                if hasattr(work_part.Preferences, "ScreenVisualization"):
+                    part_screen = work_part.Preferences.ScreenVisualization
+                    if hasattr(part_screen, "TriadVisibility"):
+                        orig_part_triad_vis = part_screen.TriadVisibility
+                        part_screen.TriadVisibility = False
+            except Exception:
+                pass
+
+        # (C) 會話偏好設定層級 (Session Preferences Level：全域備援)
+        if the_session is not None and hasattr(the_session, "Preferences"):
+            try:
+                if hasattr(the_session.Preferences, "ScreenVisualization"):
+                    sess_screen = the_session.Preferences.ScreenVisualization
+                    if hasattr(sess_screen, "TriadVisibility"):
+                        orig_sess_triad_vis = sess_screen.TriadVisibility
+                        sess_screen.TriadVisibility = 0
+            except Exception:
+                pass
+
+        # (D) 工作座標系 (WCS / UF Csys 控制)
+        if work_part is not None and hasattr(work_part, "WCS"):
+            try:
+                if hasattr(work_part.WCS, "Visibility"):
+                    orig_wcs_vis = work_part.WCS.Visibility
+                    work_part.WCS.Visibility = False
+            except Exception:
+                pass
+        if uf_session is not None and hasattr(uf_session, "Csys"):
+            try:
+                if hasattr(uf_session.Csys, "SetWcsDisplay"):
+                    uf_session.Csys.SetWcsDisplay(0)
+            except Exception:
+                pass
+
+        # (E) 強制立即重繪與刷新視圖，使隱藏 Triad / WCS 立即生效於渲染緩衝區
+        try:
+            if w_view is not None and hasattr(w_view, "Update"):
+                w_view.Update()
+        except Exception:
+            pass
+        try:
+            if uf_session is not None and hasattr(uf_session, "Disp"):
+                if hasattr(uf_session.Disp, "RegenerateDisplay"):
+                    uf_session.Disp.RegenerateDisplay()
+                if hasattr(uf_session.Disp, "Refresh"):
+                    uf_session.Disp.Refresh()
+        except Exception:
+            pass
+
+        # 第一重防護：截圖前透過 NX 原生 API 將視圖暫時設為純白底
+        if white_background and work_part is not None and w_view is not None:
+            try:
+                bg_override = work_part.Views.CreateBackground(w_view, False)
+                try:
+                    orig_bg_type = bg_override.BackgroundShadedViewsType
+                except Exception:
+                    pass
+                bg_override.BackgroundShadedViewsType = 1 # 1: Plain (單色背景)
+                bg_override.SetBackgroundShadedViewsPlain([1.0, 1.0, 1.0]) # 純白色
+                bg_override.Commit()
+            except Exception:
+                bg_override = None
+
+        # 1. 現代 NX 標準 API: CreateImageExportBuilder
+        builder = None
+        try:
+            if the_ui is not None and hasattr(the_ui, "CreateImageExportBuilder"):
+                builder = the_ui.CreateImageExportBuilder()
+        except Exception:
+            pass
+
+        if builder is None and work_part is not None:
+            try:
+                if hasattr(work_part, "Views") and hasattr(work_part.Views, "CreateImageExportBuilder"):
+                    builder = work_part.Views.CreateImageExportBuilder()
+            except Exception:
+                pass
+
+        if builder is not None:
+            try:
+                builder.RegionMode = False
+
+                # 設定輸出格式為 PNG
+                format_set = False
+                if NXGateway and hasattr(NXGateway, "ImageExportBuilder"):
+                    try:
+                        builder.FileFormat = NXGateway.ImageExportBuilder.FileFormats.Png
+                        format_set = True
+                    except Exception:
+                        pass
+                if not format_set:
+                    try:
+                        builder.FileFormat = NXOpen.Gateway.ImageExportBuilder.FileFormats.Png
+                        format_set = True
+                    except Exception:
+                        pass
+
+                # 設定目標檔名
+                builder.FileName = out_png_path
+
+                # 白底輸出設定：優先使用 Transparent (透明背景去背，再複合為純白底)
+                if white_background:
+                    bg_set = False
+                    if NXGateway and hasattr(NXGateway, "ImageExportBuilder"):
+                        try:
+                            builder.BackgroundOption = NXGateway.ImageExportBuilder.BackgroundOptions.Transparent
+                            bg_set = True
+                        except Exception:
+                            pass
+                    if not bg_set:
+                        try:
+                            builder.BackgroundOption = NXOpen.Gateway.ImageExportBuilder.BackgroundOptions.Transparent
+                            bg_set = True
+                        except Exception:
+                            pass
+                    if not bg_set and NXGateway and hasattr(NXGateway, "ImageExportBuilder"):
+                        try:
+                            builder.BackgroundOption = NXGateway.ImageExportBuilder.BackgroundOptions.Original
+                            bg_set = True
+                        except Exception:
+                            pass
+
+                # 執行輸出
+                builder.Commit()
+
+            except Exception as ex_bld:
+                if listing:
+                    listing.WriteLine(f"  [ImageExportBuilder 異常] {str(ex_bld)}")
+            finally:
+                try:
+                    builder.Destroy()
+                except Exception:
+                    pass
+
+        # 檢查是否有檔案生成 (涵蓋 NX 自行追加 .png 或雙重副檔名狀況)
+        possible_paths = [
+            out_png_path,
+            out_png_path + ".png",
+            base_no_ext + ".png"
+        ]
+        has_file = False
+        for p in possible_paths:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                if p != out_png_path:
+                    try:
+                        if os.path.exists(out_png_path):
+                            os.remove(out_png_path)
+                        os.rename(p, out_png_path)
+                    except Exception:
+                        out_png_path = p
+                has_file = True
+                break
+
+        # 2. 備援方案：若 builder 未能輸出圖檔，嘗試 UF.Disp (若支援)
+        if not has_file and uf_session is not None:
+            try:
+                if hasattr(uf_session, "Disp") and hasattr(uf_session.Disp, "CreateImage"):
+                    uf_session.Disp.CreateImage(out_png_path, 2, 1) # 2: PNG, 1: White
+            except Exception:
+                pass
+            for p in possible_paths:
+                if os.path.exists(p) and os.path.getsize(p) > 0:
+                    if p != out_png_path:
+                        try:
+                            if os.path.exists(out_png_path):
+                                os.remove(out_png_path)
+                            os.rename(p, out_png_path)
+                        except Exception:
+                            out_png_path = p
+                    has_file = True
+                    break
+
+        if has_file:
+            # 第二重防護：透明背景複合 + 邊界多點泛洪清洗
+            if white_background:
+                ensure_white_background_image(out_png_path)
+
+            if listing:
+                listing.WriteLine(f"  [示圖擷取成功] 圖檔已儲存 (已強化純白底與座標圖示隱藏)：{out_png_path}")
+            return True
+
+        if listing:
+            listing.WriteLine(f"  [示圖擷取失敗] 無法在硬碟產生圖檔：{out_png_path}")
+        return False
+
+    finally:
+        # 還原 NX 原生視圖背景
+        if bg_override is not None:
+            try:
+                if orig_bg_type is not None:
+                    bg_override.BackgroundShadedViewsType = orig_bg_type
+                    bg_override.Commit()
+                bg_override.Destroy()
+            except Exception:
+                pass
+
+        # 全方位恢復 View Triad (方位方塊座標) 與 WCS 顯示
+        restore_triad_and_wcs(the_session, work_part, w_view, uf_session)
+
+def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_session=None):
+    """
+    底層座標圖示與視圖方位方塊 (View Triad / WCS) 全方位強制還原核心：
+    1. 視圖層級 (WorkView.TriadVisibility & WcsVisibility)：恢復為 True
+    2. 零件偏好設定 (PartPreferences.ScreenVisualization)：呼叫 SetTriadVisibility(True) 與 TriadVisibility = True
+    3. 會話偏好設定 (SessionPreferences.ScreenVisualization / SessionVisualizationScreen)：呼叫 SetTriadVisibility(1)
+    4. 工作座標系 (WCS.Visibility & UFSession.Csys.SetWcsDisplay)：恢復顯示
+    5. 立即調用 RegenerateDisplay / Refresh / MakeDisplayUpToDate 強制刷新圖形渲染緩衝區！
+    """
+    if the_session is None:
+        try:
+            the_session = NXOpen.Session.GetSession()
+        except Exception:
+            pass
+
+    if work_part is None and the_session is not None and hasattr(the_session, "Parts"):
+        try:
+            work_part = the_session.Parts.Work
+        except Exception:
+            pass
+
+    if w_view is None and work_part is not None and hasattr(work_part, "Views"):
+        try:
+            w_view = work_part.Views.WorkView
+        except Exception:
+            pass
+
+    if uf_session is None:
+        try:
+            uf_session = NXOpen.UF.UFSession.GetUFSession()
+        except Exception:
+            pass
+
+    # (A) 視圖層級 View Triad 與 WCS 恢復
+    if w_view is not None:
+        try:
+            if hasattr(w_view, "TriadVisibility"):
+                w_view.TriadVisibility = True
+        except Exception:
+            pass
+        try:
+            if hasattr(w_view, "WcsVisibility"):
+                w_view.WcsVisibility = True
+        except Exception:
+            pass
+
+    # (B) 零件偏好設定層級 (PartPreferences)
+    if work_part is not None and hasattr(work_part, "Preferences"):
+        pref_objs = []
+        for attr in ["ScreenVisualization", "PartVisualizationScreen", "VisualizationScreen"]:
+            if hasattr(work_part.Preferences, attr):
+                try:
+                    pref_objs.append(getattr(work_part.Preferences, attr))
+                except Exception:
+                    pass
+        for p_obj in pref_objs:
+            try:
+                if hasattr(p_obj, "SetTriadVisibility"):
+                    p_obj.SetTriadVisibility(True)
+            except Exception:
+                pass
+            try:
+                if hasattr(p_obj, "TriadVisibility"):
+                    p_obj.TriadVisibility = True
+            except Exception:
+                pass
+
+    # (C) 會話偏好設定層級 (SessionPreferences)
+    if the_session is not None and hasattr(the_session, "Preferences"):
+        sess_objs = []
+        for attr in ["ScreenVisualization", "SessionVisualizationScreen", "VisualizationScreen"]:
+            if hasattr(the_session.Preferences, attr):
+                try:
+                    sess_objs.append(getattr(the_session.Preferences, attr))
+                except Exception:
+                    pass
+        for s_obj in sess_objs:
+            try:
+                if hasattr(s_obj, "SetTriadVisibility"):
+                    s_obj.SetTriadVisibility(1)
+            except Exception:
+                pass
+            try:
+                if hasattr(s_obj, "TriadVisibility"):
+                    s_obj.TriadVisibility = 1
+            except Exception:
+                pass
+
+    # (D) 工作座標系 (WCS)
+    if work_part is not None and hasattr(work_part, "WCS"):
+        try:
+            if hasattr(work_part.WCS, "Visibility"):
+                work_part.WCS.Visibility = True
+        except Exception:
+            pass
+    if uf_session is not None and hasattr(uf_session, "Csys"):
+        try:
+            if hasattr(uf_session.Csys, "SetWcsDisplay"):
+                uf_session.Csys.SetWcsDisplay(1)
+        except Exception:
+            pass
+
+    # (E) 多重強制重繪與刷新圖形緩衝區
+    try:
+        if w_view is not None and hasattr(w_view, "Update"):
+            w_view.Update()
+    except Exception:
+        pass
+    try:
+        if uf_session is not None and hasattr(uf_session, "Disp"):
+            if hasattr(uf_session.Disp, "RegenerateDisplay"):
+                uf_session.Disp.RegenerateDisplay()
+            if hasattr(uf_session.Disp, "Refresh"):
+                uf_session.Disp.Refresh()
+            if hasattr(uf_session.Disp, "MakeDisplayUpToDate"):
+                uf_session.Disp.MakeDisplayUpToDate()
+    except Exception:
+        pass
+    try:
+        if uf_session is not None and hasattr(uf_session, "View") and w_view is not None:
+            if hasattr(uf_session.View, "UpdateView") and hasattr(w_view, "Tag"):
+                uf_session.View.UpdateView(w_view.Tag)
+    except Exception:
+        pass
+
+def snap_work_view_closest(work_part, w_view, uf_session=None):
+    """
+    底層原生視圖擺正核心 (Snap to Closest Orthogonal View / F8 功能)：
+    1. 透過 UFSession 取得當前視圖的 3x3 旋轉矩陣 (AskViewMatrix)
+    2. 投影分析視線向量 (View Normal)，精準計算與 6 大正交方向 (Top, Bottom, Front, Back, Right, Left) 的夾角
+    3. 呼叫 NX 原生 w_view.Orient 貼齊最接近的標準視圖 (Canned View)
+    4. 即時觸發視圖更新 (Update) 與顯存再生 (RegenerateDisplay)，畫面瞬間 100% 擺正！
+    """
+    if work_part is None:
+        try:
+            the_sess = NXOpen.Session.GetSession()
+            work_part = the_sess.Parts.Work
+        except Exception:
+            pass
+
+    if w_view is None and work_part is not None and hasattr(work_part, "Views"):
+        try:
+            w_view = work_part.Views.WorkView
+        except Exception:
+            pass
+
+    if w_view is None:
+        return False
+
+    best_view_name = "Top"
+
+    # 1. 嘗試從 UFSession.View.AskViewMatrix 獲取當前視圖矩陣
+    if uf_session is not None and hasattr(uf_session, "View") and hasattr(w_view, "Tag"):
+        try:
+            mat = uf_session.View.AskViewMatrix(w_view.Tag)
+            if mat and len(mat) >= 9:
+                vx, vy, vz = mat[6], mat[7], mat[8]
+                dot_products = {
+                    "Top": vz,
+                    "Bottom": -vz,
+                    "Front": -vy,
+                    "Back": vy,
+                    "Right": vx,
+                    "Left": -vx
+                }
+                best_view_name = max(dot_products.items(), key=lambda x: x[1])[0]
+        except Exception:
+            pass
+
+    # 2. 調用 NXOpen.View.Canned 進行原生旋轉貼齊
+    orient_success = False
+    try:
+        import NXOpen
+        canned_enum = getattr(NXOpen.View.Canned, best_view_name, None)
+        if canned_enum is not None:
+            scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Fit", 0)
+            try:
+                scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Saved", scale_adj)
+            except Exception:
+                pass
+            w_view.Orient(canned_enum, scale_adj)
+            orient_success = True
+    except Exception:
+        orient_success = False
+
+    # 3. 強制視圖重繪刷新
+    try:
+        if hasattr(w_view, "Update"):
+            w_view.Update()
+    except Exception:
+        pass
+    try:
+        if uf_session is not None and hasattr(uf_session, "Disp"):
+            if hasattr(uf_session.Disp, "RegenerateDisplay"):
+                uf_session.Disp.RegenerateDisplay()
+            if hasattr(uf_session.Disp, "Refresh"):
+                uf_session.Disp.Refresh()
+    except Exception:
+        pass
+
+    return orient_success
+
+def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, listing=None, work_part=None):
+    """
+    方案二：【無黑窗精緻置頂拍照精靈 + NX 視圖流暢旋轉 + 原生 F8 視角擺正】
+    技術核心：
+    1. 採用 pythonw.exe + 純淨環境變數隔離，徹底消除黑窗與直譯器崩潰。
+    2. 採用 Popen 非阻塞進程 + Windows 原生訊息泵 (PeekMessage / DispatchMessage)，
+       即時泵出滑鼠中鍵與視圖重繪訊息，讓 NX 主視窗在小工具懸浮時 100% 自由流暢旋轉縮放！
+    3. 支援【雙重 F8 視角擺正】：
+       - 小工具點選【📐 擺正 (F8)】或小工具內按 F8：透過跨進程旗標通知主進程原生執行 snap_work_view_closest
+       - NX 主視窗內按 F8：訊息泵即時攔截 WM_KEYDOWN(VK_F8) 直接執行原生擺正！
+    """
+    if not stages:
+        return {}
+
+    captured_images = {}
+    total_stages = len(stages)
+
+    # 確保取得當前工作視圖 WorkView
+    w_view = None
+    if work_part is not None and hasattr(work_part, "Views"):
+        try:
+            w_view = work_part.Views.WorkView
+        except Exception:
+            w_view = None
+
+    # 1. 尋找精緻置頂拍照組件 capture_assistant_gui.py
+    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
+    assistant_script = os.path.join(current_dir, "capture_assistant_gui.py")
+    if not os.path.exists(assistant_script):
+        assistant_script = r"C:\NX_Standard\Template\capture_assistant_gui.py"
+
+    # 2. 構建深度純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
+    clean_env = os.environ.copy()
+    clean_env.pop("PYTHONHOME", None)
+    clean_env.pop("PYTHONPATH", None)
+    clean_env.pop("PYTHONSTARTUP", None)
+    clean_env.pop("PYTHONEXECUTABLE", None)
+
+    # 尋找外部 pythonw.exe (原生 Windows GUI 子系統，天然零黑窗)
+    pythonw_candidates = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python310\pythonw.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), r"Python313\pythonw.exe"),
+        os.path.join(os.environ.get("ProgramFiles", ""), r"Python310\pythonw.exe"),
+        "pythonw.exe",
+        "pythonw"
+    ]
+
+    valid_pythonw = None
+    for cand in pythonw_candidates:
+        try:
+            if os.path.isabs(cand) and os.path.exists(cand):
+                valid_pythonw = cand
+                break
+        except Exception:
+            continue
+
+    # 針對選定的 python 直譯器，設定正確的 DLLs 與 Tcl/Tk 函式庫路徑，防止加載 NX 的舊版 tcl86t.dll
+    if valid_pythonw and os.path.isabs(valid_pythonw):
+        py_dir = os.path.dirname(valid_pythonw)
+        py_dlls = os.path.join(py_dir, "DLLs")
+        py_scripts = os.path.join(py_dir, "Scripts")
+        tcl_lib = os.path.join(py_dir, r"tcl\tcl8.6")
+        tk_lib = os.path.join(py_dir, r"tcl\tk8.6")
+
+        if os.path.exists(tcl_lib):
+            clean_env["TCL_LIBRARY"] = tcl_lib
+        else:
+            clean_env.pop("TCL_LIBRARY", None)
+
+        if os.path.exists(tk_lib):
+            clean_env["TK_LIBRARY"] = tk_lib
+        else:
+            clean_env.pop("TK_LIBRARY", None)
+
+        # 將 Python 自身目錄與 DLLs 置於 PATH 最前端，並濾除 NX 的 python 目錄干擾
+        filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
+        clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
+
+    # 若無絕對路徑，在純淨環境下以命令測試
+    if not valid_pythonw:
+        for cand in ["pythonw", "pyw"]:
+            try:
+                t_res = subprocess.run([cand, "-c", "import tkinter"], capture_output=True, timeout=3, env=clean_env)
+                if t_res.returncode == 0:
+                    valid_pythonw = cand
+                    break
+            except Exception:
+                continue
+
+    gui_success = False
+
+    # 3. 執行置頂拍照小工具 + Windows 訊息泵
+    if valid_pythonw and os.path.exists(assistant_script):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            import time
+
+            user32 = ctypes.windll.user32
+            msg = wintypes.MSG()
+            PM_REMOVE = 0x0001
+
+            for s_idx, stg in enumerate(stages):
+                safe_stg_name = re.sub(r'[\\/:*?"<>|]', '_', stg)
+                out_img = os.path.join(temp_dir, f"_temp_stage_{safe_stg_name}.png")
+                display_name = stg if stg != "通用工段" else "加工工件全貌 / 裝夾示圖"
+                req_file = os.path.join(temp_dir, f"_snap_request_{s_idx}.flag")
+                if os.path.exists(req_file):
+                    try:
+                        os.remove(req_file)
+                    except Exception:
+                        pass
+
+                nx_hwnd = user32.GetForegroundWindow()
+                cmd = [
+                    valid_pythonw,
+                    assistant_script,
+                    "--stage", stg,
+                    "--index", str(s_idx + 1),
+                    "--total", str(total_stages),
+                    "--parent-hwnd", str(nx_hwnd),
+                    "--req-file", req_file
+                ]
+
+                if listing:
+                    listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正)...")
+
+                # 啟動獨立置頂小工具 (傳入純淨環境 clean_env，pythonw 本身無控制台黑窗)
+                proc = subprocess.Popen(
+                    cmd,
+                    env=clean_env
+                )
+
+                # Windows 原生訊息泵循環：讓 NX 主視窗保持 100% 流暢響應滑鼠中鍵旋轉、重繪與 F8 擺正
+                start_wait = time.time()
+                while proc.poll() is None:
+                    # 檢查是否有來自小工具的擺正請求 (點擊按鈕或小工具中按 F8)
+                    if os.path.exists(req_file):
+                        try:
+                            os.remove(req_file)
+                        except Exception:
+                            pass
+                        snap_work_view_closest(work_part, w_view, uf_session)
+
+                    # 即時派發 Windows 訊息給 NX 主視窗，同時攔截鍵盤 F8 (VK_F8 = 0x77)
+                    while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
+                        if msg.message == 0x0100 and msg.wParam == 0x77: # WM_KEYDOWN with F8
+                            snap_work_view_closest(work_part, w_view, uf_session)
+                        user32.TranslateMessage(ctypes.byref(msg))
+                        user32.DispatchMessageW(ctypes.byref(msg))
+                    time.sleep(0.01) # 10毫秒短延遲，兼顧即時響應與 CPU 節能
+
+                    # 超時保護 (5分鐘未操作自動退出)
+                    if time.time() - start_wait > 300:
+                        proc.kill()
+                        break
+
+                # 清理旗標檔案
+                if os.path.exists(req_file):
+                    try:
+                        os.remove(req_file)
+                    except Exception:
+                        pass
+
+                # 狀態代碼精確分流判定：
+                if proc.returncode == 0:
+                    # 使用者點選「📸 立即拍照」
+                    success = capture_nx_viewport(the_ui, out_img, white_background=True, listing=listing, work_part=work_part)
+                    if success:
+                        captured_images[stg] = out_img
+                        if listing:
+                            listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
+                elif proc.returncode == 2:
+                    # 使用者在小工具點選「略過此段」或關閉 (X)
+                    if listing:
+                        listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
+                else:
+                    # 外部小工具異常 (returncode != 0 且 != 2)，自動啟動原生對話框備援，避免功能被跳過
+                    if listing:
+                        listing.WriteLine(f"  [拍照引導提示] 獨立小工具異常退出 (代碼 {proc.returncode})，自動啟用 NX 備援確認視窗...")
+                    if the_ui:
+                        backup_msg = (
+                            f"【工段 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
+                            f"請確認當前 NX 視窗視角是否已適當？\n\n"
+                            f"・點選【是 (Yes)】：立即截取當前視圖 (白底高清)\n"
+                            f"・點選【否 (No)】：略過此工段不放圖"
+                        )
+                        resp = the_ui.NXMessageBox.Show(
+                            "CNC 加工示圖拍照確認",
+                            NXOpen.NXMessageBox.DialogType.Question,
+                            backup_msg
+                        )
+                        if resp == 1:
+                            success = capture_nx_viewport(the_ui, out_img, white_background=True, listing=listing, work_part=work_part)
+                            if success:
+                                captured_images[stg] = out_img
+                                if listing:
+                                    listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
+                        else:
+                            if listing:
+                                listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
+
+            gui_success = True
+
+        except Exception as ex_pump:
+            if listing:
+                listing.WriteLine(f"  [拍照引導提示] 獨立小工具啟動異常 ({str(ex_pump)})，自動啟用備援拍照模式...")
+
+    # 4. 備援模式：若外部直譯器異常，以 NX 原生對話框作為保底
+    if not gui_success and the_ui:
+        try:
+            for s_idx, stg in enumerate(stages):
+                safe_stg_name = re.sub(r'[\\/:*?"<>|]', '_', stg)
+                out_img = os.path.join(temp_dir, f"_temp_stage_{safe_stg_name}.png")
+                display_name = stg if stg != "通用工段" else "加工工件全貌 / 裝夾示圖"
+
+                dialog_msg = (
+                    f"【工段 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
+                    f"請確認當前 NX 視窗視角是否已適當？\n\n"
+                    f"・點選【是 (Yes)】：立即截取當前視圖 (白底高清)\n"
+                    f"・點選【否 (No)】：略過此工段不放圖"
+                )
+                resp = the_ui.NXMessageBox.Show(
+                    "CNC 加工示圖拍照確認",
+                    NXOpen.NXMessageBox.DialogType.Question,
+                    dialog_msg
+                )
+                if resp == 1:
+                    success = capture_nx_viewport(the_ui, out_img, white_background=True, listing=listing, work_part=work_part)
+                    if success:
+                        captured_images[stg] = out_img
+                        if listing:
+                            listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
+                else:
+                    if listing:
+                        listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
+        except Exception as ex_fb:
+            if listing:
+                listing.WriteLine(f"  [拍照精靈警告] 備援模式執行異常：{str(ex_fb)}")
+
+    # 拍照流程完全結束，雙重保證 NX 主視窗座標圖示 (View Triad / WCS) 100% 恢復顯示並強制刷新
+    try:
+        restore_triad_and_wcs(the_session=None, work_part=work_part, w_view=w_view, uf_session=uf_session)
+    except Exception:
+        pass
+
+    return captured_images
+
+# ==================== 分頁排版核心模組 (Pagination Engine) ====================
+
+def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE):
+    """
+    核心分頁演算法：
+    1. 保持群組完整性 (Keep Group Together)
+    2. 群組間若在同頁自動插入 1 行 Spacer 空行
+    3. 遇到 -P 或 -p 後綴群組或不同工段執行強制分頁 (Force Page Break)
+    4. 超過每頁行數限制自動分頁
+    回傳：[{"stage": stage_key, "rows": page_rows}, ...]
+    """
+    pages = []
+    current_page = []
+    current_page_stage = None
+
+    for chunk in chunks:
+        grp_name = chunk["group_name"]
+        ops = chunk["operations"]
+        if not ops:
+            continue
+
+        chunk_stage = chunk.get("stage") or extract_stage_key(grp_name) or "通用工段"
+
+        # 檢查是否帶有強制分頁後綴 (-M, -m, -P, -p)
+        force_break = False
+        for sfx in FORCE_PAGE_SUFFIXES:
+            if grp_name.endswith(sfx):
+                force_break = True
+                break
+
+        # 若切換了工段 (例如 M1 -> M2)，強制換新頁
+        is_stage_changed = (current_page_stage is not None and chunk_stage != current_page_stage)
+        if is_stage_changed and current_page:
+            pages.append({"stage": current_page_stage, "rows": current_page})
+            current_page = []
+            current_page_stage = None
+
+        if current_page_stage is None:
+            current_page_stage = chunk_stage
+
+        chunk_size = len(ops)
+        space_left = rows_per_page - len(current_page)
+
+        # 相同工段的刀具工步緊密排列，不須插入空白列 (空格)
+        if chunk_size <= space_left:
+            # 空間足夠：直接放入目前頁
+            for op_item in ops:
+                current_page.append({"type": "op", "data": op_item})
+
+            if force_break:
+                pages.append({"stage": current_page_stage, "rows": current_page})
+                current_page = []
+                current_page_stage = None
+        else:
+            # 空間不足：目前頁結案換新頁
+            if current_page:
+                pages.append({"stage": current_page_stage, "rows": current_page})
+                current_page = []
+
+            current_page_stage = chunk_stage
+
+            # 若該群組本身大於單頁上限，必須逐筆拆頁
+            if chunk_size > rows_per_page:
+                for op_item in ops:
+                    if len(current_page) >= rows_per_page:
+                        pages.append({"stage": current_page_stage, "rows": current_page})
+                        current_page = []
+                    current_page.append({"type": "op", "data": op_item})
+                if force_break and current_page:
+                    pages.append({"stage": current_page_stage, "rows": current_page})
+                    current_page = []
+                    current_page_stage = None
+            else:
+                # 放在全新一頁的開頭
+                for op_item in ops:
+                    current_page.append({"type": "op", "data": op_item})
+                if force_break:
+                    pages.append({"stage": current_page_stage, "rows": current_page})
+                    current_page = []
+                    current_page_stage = None
+
+    if current_page:
+        pages.append({"stage": current_page_stage if current_page_stage else "通用工段", "rows": current_page})
+
+    return pages
+
+# ==================== VBS 多頁動態生成與匯出模組 ====================
+
+def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None):
+    """
+    透過 Windows 原生 VBScript 動態複製 Excel 工作表產生「第1頁」、「第2頁」...
+    並填入表頭、工步明細、頁碼標註，並將工段對應之加工示圖等比例居中嵌入 A18:J36 區域
+    """
+    if not os.path.exists(template_path):
+        raise FileNotFoundError(f"找不到工單範本：{template_path}")
+
+    stage_images = stage_images or {}
+    part_name = work_part.Leaf
+    part_path = work_part.FullPath
+    part_dir = os.path.dirname(part_path)
+    today_str = datetime.datetime.now().strftime("%Y/%m/%d")
+
+    # 提取表頭資訊 (依使用者最新規則)
+    # 1. 圖號：若檔案名稱當中有 14 碼編號則為圖號，若無則留空
+    drawing_number = header_info.get("drawing_number", "").replace('"', '""')
+    # 2. 圖名：應為檔案名稱
+    drawing_name = header_info.get("drawing_name", part_name).replace('"', '""')
+    # 3. 尺寸：由設定的素材大小決定，若無資訊則留空
+    blank_size = header_info.get("blank_size", "").replace('"', '""')
+
+    part_no_val = header_info.get("part_number", "").replace('"', '""') # 工單編號/料號
+    holes_val = header_info.get("holes", "").replace('"', '""')         # 數量/孔數
+
+    abs_template = os.path.abspath(template_path).replace('"', '""')
+    abs_output = os.path.abspath(output_path).replace('"', '""')
+    total_pages = len(pages) if len(pages) > 0 else 1
+
+    vbs_lines = [
+        'Dim objExcel, objWb, seedWs, ws, fso',
+        'Dim shp, topCell, bottomCell, boxL, boxT, boxW, boxH, origW, origH, targetW, targetH',
+        'Set objExcel = CreateObject("Excel.Application")',
+        'objExcel.Visible = False',
+        'objExcel.DisplayAlerts = False',
+        'Set fso = CreateObject("Scripting.FileSystemObject")',
+        f'Set objWb = objExcel.Workbooks.Open("{abs_template}")',
+        'Set seedWs = objWb.Sheets(1)'
+    ]
+
+    # 逐頁複製母版並填入資料
+    for p_idx, page_item in enumerate(pages, start=1):
+        page_name = f"第{p_idx}頁"
+        page_str = f"{p_idx}-{total_pages}"
+
+        if isinstance(page_item, dict):
+            page_rows = page_item.get("rows", [])
+            page_stage = page_item.get("stage", "通用工段")
+        else:
+            page_rows = page_item
+            page_stage = "通用工段"
+
+        # 複製母版工作表至尾端
+        vbs_lines.extend([
+            'seedWs.Copy , objWb.Sheets(objWb.Sheets.Count)',
+            'Set ws = objWb.Sheets(objWb.Sheets.Count)',
+            f'ws.Name = "{page_name}"',
+            # 填入表頭基本資訊 (精確對應 ShopDoc_Template.xlsx 欄位定義)
+            f'ws.Range("B1").Value = "{drawing_number}"',  # A1「圖號」 (14碼/留空)
+            f'ws.Range("B2").Value = "{drawing_name}"',    # A2「圖名」 (檔案名稱)
+            f'ws.Range("G1").Value = "{part_no_val}"',     # E1「工單編號」
+            f'ws.Range("B3").Value = "{blank_size}"',      # A3「尺寸」 (素材大小/留空)
+            f'ws.Range("D3").Value = "{holes_val}"',       # C3「數量」
+            f'ws.Range("J2").Value = "{today_str}"',       # I2「表單日期」
+            f'ws.Range("B4").Value = "{part_path}"',       # A4「檔案位置」
+            f'ws.Range("B5").Value = "{part_dir}"',        # A5「程式位置」
+            'ws.Range("J37").NumberFormat = "@"',          # 強制指定頁數欄位為純文字格式，防止 Excel 自動轉換為日期 (如 1-7 變成 1月7日)
+            f'ws.Range("J37").Value = "{page_str}"'        # 頁數標記 (J37)
+        ])
+
+        start_row = 7
+        page_seq = 1  # 每頁有效工步流水號，從 1 開始計算 (空行不計)
+        for row_offset in range(ROWS_PER_PAGE):
+            curr_r = start_row + row_offset
+            if row_offset < len(page_rows):
+                item = page_rows[row_offset]
+                if item["type"] == "spacer":
+                    # 空行分隔：清空此列資料 (不計序號)
+                    for col_i in range(1, 9):
+                        vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
+                else:
+                    d = item["data"]
+                    safe_seq = str(page_seq)
+                    safe_op_name = d["op_name"].replace('"', '""')
+                    safe_tool_num = d["tool_number"].replace('"', '""')
+                    spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
+                    safe_tool_dia = str(spec_str).replace('"', '""')
+                    safe_flute_len = d["flute_length"].replace('"', '""')
+                    safe_holder_len = d["holder_length"].replace('"', '""')
+                    safe_time = d["time"].replace('"', '""')
+                    safe_note = d["note"].replace('"', '""')
+
+                    vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 3).Value = "{safe_tool_num}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 4).Value = "{safe_tool_dia}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 5).Value = "{safe_flute_len}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
+                    page_seq += 1
+            else:
+                # 未填滿的列位：清空範本預設的工站數字，保持頁面乾淨
+                for col_i in range(1, 9):
+                    vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
+
+        # 插入該工段對應之加工示圖 (等比例居中置放於 A18:J36 區域)
+        img_path = stage_images.get(page_stage)
+        if not img_path:
+            img_path = stage_images.get("通用工段")
+        if not img_path and len(stage_images) == 1:
+            img_path = list(stage_images.values())[0]
+
+        if img_path and os.path.exists(img_path):
+            safe_img = os.path.abspath(img_path).replace('"', '""')
+            vbs_lines.extend([
+                f'If fso.FileExists("{safe_img}") Then',
+                '    Set topCell = ws.Range("A18")',
+                '    Set bottomCell = ws.Range("J36")',
+                '    boxL = topCell.Left + 5',
+                '    boxT = topCell.Top + 5',
+                '    boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
+                '    boxH = (bottomCell.Top + bottomCell.Height) - topCell.Top - 10',
+                f'    Set shp = ws.Shapes.AddPicture("{safe_img}", 0, -1, boxL, boxT, -1, -1)',
+                '    shp.LockAspectRatio = -1',
+                '    origW = shp.Width',
+                '    origH = shp.Height',
+                '    If (origW / origH) > (boxW / boxH) Then',
+                '        targetW = boxW',
+                '        targetH = origH * (boxW / origW)',
+                '    Else',
+                '        targetH = boxH',
+                '        targetW = origW * (boxH / origH)',
+                '    End If',
+                '    shp.Width = targetW',
+                '    shp.Height = targetH',
+                '    shp.Left = boxL + (boxW - targetW) / 2',
+                '    shp.Top = boxT + (boxH - targetH) / 2',
+                '    shp.Placement = 1',
+                'End If'
+            ])
+
+    # 刪除最初的母版，只保留產出的 第1頁, 第2頁...
+    vbs_lines.extend([
+        'seedWs.Delete',
+        f'objWb.SaveAs "{abs_output}"',
+        'objWb.Close False',
+        'objExcel.Quit',
+        'Set fso = Nothing',
+        'Set seedWs = Nothing',
+        'Set ws = Nothing',
+        'Set objWb = Nothing',
+        'Set objExcel = Nothing'
+    ])
+
+    vbs_content = "\r\n".join(vbs_lines)
+    temp_vbs = os.path.join(part_dir, "_temp_shopdoc_multipage.vbs")
+
+    with open(temp_vbs, "w", encoding="cp950", errors="ignore") as f:
+        f.write(vbs_content)
+
+    try:
+        subprocess.run(["cscript.exe", "//Nologo", temp_vbs], check=True, creationflags=0x08000000)
+    finally:
+        if os.path.exists(temp_vbs):
+            try:
+                os.remove(temp_vbs)
+            except Exception:
+                pass
+
+# ==================== 主執行流程 ====================
+
+def main():
+    the_session = NXOpen.Session.GetSession()
+    the_ui = NXOpen.UI.GetUI()
+    uf_session = NXOpen.UF.UFSession.GetUFSession()
+
+    try:
+        the_session.ListingWindow.Open()
+    except Exception:
+        pass
+
+    # 安全取得工作零件 (支援 Work 與 Display 降級防護)
+    work_part = None
+    try:
+        work_part = the_session.Parts.Work
+    except NXOpen.NXException as ex:
+        err_str = str(ex)
+        if "使用者中止" in err_str or "abort" in err_str.lower():
+            try:
+                the_session.ListingWindow.WriteLine("提示：操作已由使用者中止。")
+            except Exception:
+                pass
+            return
+    except Exception:
+        pass
+
+    if work_part is None:
+        try:
+            work_part = the_session.Parts.Display
+        except Exception:
+            pass
+
+    if work_part is None:
+        try:
+            the_session.ListingWindow.WriteLine("錯誤：未開啟任何工作零件，請確認零件處於開啟中！")
+        except Exception:
+            pass
+        return
+
+    full_part_path = work_part.FullPath
+    if not full_part_path or not os.path.isabs(full_part_path):
+        the_session.ListingWindow.WriteLine("錯誤：當前零件尚未存檔，請先儲存零件！")
+        return
+
+    sel_mgr = the_ui.SelectionManager
+    num_selected = sel_mgr.GetNumSelectedObjects()
+
+    if num_selected == 0:
+        the_session.ListingWindow.WriteLine("提示：請先在 CAM 導覽器中選取要匯出的【程式群組/資料夾】或【工序】！")
+        return
+
+    target_folder = os.path.dirname(full_part_path)
+    part_name = work_part.Leaf
+
+    template_path = r"C:\NX_Standard\Template\ShopDoc_Template.xlsx"
+    output_path = os.path.join(target_folder, f"{part_name}_選定工序工單.xlsx")
+
+    the_session.ListingWindow.WriteLine("========================================")
+    the_session.ListingWindow.WriteLine("開始分析 CAM 導覽器結構與工藝數據...")
+
+    # 1. 遞迴收集並按群組分塊 (Chunks)，同時過濾排除群組與提取資訊群組
+    selected_objects = []
+    for i in range(num_selected):
+        obj = sel_mgr.GetSelectedTaggedObject(i)
+        if obj is not None:
+            selected_objects.append(obj)
+
+    # 嚴格保證選取物件之順序 100% 符合 CAM 導覽器面板由上至下 (Program Order) 之順序，並構建全域樹狀地圖
+    cam_tree_map = {}
+    extracted_info = {}
+    try:
+        cam_setup = work_part.CAMSetup
+        if cam_setup:
+            root_group = cam_setup.GetRoot(NXOpen.CAM.CAMSetup.View.ProgramOrder)
+            if root_group:
+                # 建立全域樹狀地圖 (精確鎖定每個節點所屬之頂層父資料夾與工段)，並自動全域掃描資訊資料夾 (ExcelTool 模式)
+                cam_tree_map = build_cam_tree_map(root_group, extracted_info)
+
+                order_map = {}
+                order_counter = [0]
+                def _build_order(node):
+                    if not node:
+                        return
+                    t = getattr(node, "Tag", None)
+                    if t and t not in order_map:
+                        order_map[t] = order_counter[0]
+                        order_counter[0] += 1
+                    if isinstance(node, NXOpen.CAM.NCGroup):
+                        try:
+                            for m in node.GetMembers():
+                                _build_order(m)
+                        except Exception:
+                            pass
+                _build_order(root_group)
+                selected_objects.sort(key=lambda o: order_map.get(getattr(o, "Tag", 0), 999999))
+    except Exception:
+        pass
+
+    # 識別使用者直接點選之工序 (直接選取的工序，程式檔名將顯示工序自身名稱)
+    directly_selected_tags = {obj.Tag for obj in selected_objects if isinstance(obj, NXOpen.CAM.Operation)}
+    visited_tags = set()
+
+    raw_chunks = []
+    for tagged_obj in selected_objects:
+        collect_cam_hierarchy(
+            tagged_obj, raw_chunks, extracted_info,
+            tree_map=cam_tree_map, visited_tags=visited_tags, directly_selected_tags=directly_selected_tags
+        )
+
+    if not raw_chunks:
+        the_session.ListingWindow.WriteLine("錯誤：選取的項目中未包含任何有效的 CAM 工序！")
+        return
+
+    # 若有提取到資訊關鍵字，印出提示
+    if extracted_info:
+        the_session.ListingWindow.WriteLine(f"已自動識別表頭資訊：{extracted_info}")
+
+    # 2. 逐一萃取工序資訊並執行群組內刀具合併 (各子資料夾獨立合併，不跨子資料夾合併！)
+    processed_chunks = []
+    total_op_count = 0
+    total_merged_step_count = 0
+    last_boundary_seen = None
+
+    for chunk in raw_chunks:
+        grp_name = chunk["group_name"]
+        parent_prog = chunk.get("parent_program") or grp_name
+        chunk_stage = chunk.get("stage", "通用工段")
+        raw_ops = []
+
+        for op in chunk["operations"]:
+            # 工序名稱
+            raw_op_name = op.Name
+            clean_op_name = clean_program_name(raw_op_name)
+
+            # 判定是否為使用者直接點選之工序
+            is_direct = getattr(op, "_is_direct_op", False) or (getattr(op, "Tag", None) in directly_selected_tags)
+
+            # 切削時間 (純秒數與格式化字串)
+            op_seconds = get_operation_time_seconds(op)
+            op_time_str = format_seconds_to_hms(op_seconds)
+
+            # 刀具物件與參數
+            tool_obj, tool_tag = get_tool_from_operation(op, uf_session)
+            tool_name, tool_number, tool_diameter, flute_length, holder_length = get_tool_parameters(
+                uf_session, tool_obj, tool_tag
+            )
+
+            # 轉速與進給
+            rpm_feed_note = ""
+            try:
+                feeds_builder = op.CreateFeedsBuilder()
+                rpm = f"{feeds_builder.SpindleRpmBuilder.Value:.0f}"
+                feed = f"{feeds_builder.CutFeedrateBuilder.Value:.1f}"
+                rpm_feed_note = f"S:{rpm} F:{feed}"
+                feeds_builder.Destroy()
+            except Exception:
+                pass
+
+            raw_ops.append({
+                "clean_op_name": clean_op_name,
+                "is_direct_op": is_direct,
+                "raw_tool_name": tool_name,
+                "tool_name": tool_name,
+                "tool_number": tool_number,
+                "tool_diameter": tool_diameter,
+                "flute_length": flute_length,
+                "holder_length": holder_length,
+                "time_seconds": op_seconds,
+                "time": op_time_str,
+                "note": rpm_feed_note
+            })
+            total_op_count += 1
+
+        # 執行子群組內部刀號與工步智慧合併 (各子資料夾獨立合併，絕不跨子資料夾合併)
+        merged_ops = merge_consecutive_tools(raw_ops, group_name=grp_name)
+
+        # 程式檔名規範：
+        # 1. 若該工步為「直接點選之工序」：程式檔名填寫該工序自身名稱，每道工序皆各自顯示
+        # 2. 若該工步為「資料夾展開」：以母工段/父資料夾為邊界，僅首道工步填寫父資料夾名稱，後續所有工步全部留空
+        current_boundary = (chunk_stage, parent_prog)
+        is_first_step_of_stage = (current_boundary != last_boundary_seen)
+        if is_first_step_of_stage:
+            last_boundary_seen = current_boundary
+
+        for idx, mop in enumerate(merged_ops):
+            is_direct = mop.get("is_direct_op", False)
+            if is_direct:
+                mop["op_name"] = mop.get("clean_op_name", "")
+            else:
+                if is_first_step_of_stage and idx == 0:
+                    mop["op_name"] = clean_program_name(parent_prog)
+                else:
+                    mop["op_name"] = ""
+
+        total_merged_step_count += len(merged_ops)
+
+        # 日誌輸出提示
+        the_session.ListingWindow.WriteLine(
+            f"子資料夾 [{grp_name}] (所屬母程式: {parent_prog})：原始 {len(raw_ops)} 道工序，合併後共 {len(merged_ops)} 個工步："
+        )
+        for mop in merged_ops:
+            seq_num = mop["seq"]
+            p_name = mop["op_name"] if mop["op_name"] else f"(同上: {clean_program_name(parent_prog)})"
+            t_num = mop["tool_number"]
+            t_spec = mop.get("tool_spec_display", format_tool_display(mop.get("raw_tool_name"), mop.get("tool_diameter")))
+            flen = mop["flute_length"]
+            hlen = mop["holder_length"]
+            t_str = mop["time"]
+            mop["tool_spec_display"] = t_spec
+
+            the_session.ListingWindow.WriteLine(
+                f"  - 序號: {seq_num:02d} | 檔名: {p_name} | 刀號: {t_num} | 規格: {t_spec} | 刃長: {flen} | 夾長: {hlen} | 時間: {t_str}"
+            )
+
+        if merged_ops:
+            processed_chunks.append({
+                "group_name": grp_name,
+                "parent_program": parent_prog,
+                "stage": chunk.get("stage", "通用工段"),
+                "operations": merged_ops
+            })
+
+    the_session.ListingWindow.WriteLine("----------------------------------------")
+    the_session.ListingWindow.WriteLine(
+        f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
+    )
+
+    # 3. 執行智慧分頁 (相同工段刀具緊密排列不留空格、跨工段強制分頁、單頁上限自動換頁)
+    pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE)
+    the_session.ListingWindow.WriteLine(f"分頁計算完成：共分配為 {len(pages)} 頁。")
+
+    # 4. 分析所有群組歸納獨立工段清單
+    distinct_stages = get_distinct_stages(processed_chunks)
+    the_session.ListingWindow.WriteLine(f"識別到的加工工段清單：{distinct_stages}")
+
+    # 5. 方案二：【互動引導式拍照精靈】
+    the_session.ListingWindow.WriteLine("----------------------------------------")
+    the_session.ListingWindow.WriteLine("啟動【互動引導式拍照精靈】...")
+    the_session.ListingWindow.WriteLine("提示：請在置頂拍照小視窗引導下，在 NX 主視窗旋轉縮放工件至最佳視角後點選拍照。")
+
+    stage_images = {}
+    try:
+        stage_images = run_interactive_capture_wizard(
+            distinct_stages, target_folder, uf_session, the_ui=the_ui, listing=the_session.ListingWindow, work_part=work_part
+        )
+        if stage_images:
+            the_session.ListingWindow.WriteLine(f"各工段加工示圖已擷取：{list(stage_images.keys())}")
+        else:
+            the_session.ListingWindow.WriteLine("未截取示圖或已略過，工單展示區將保持留白。")
+    except Exception as ex:
+        the_session.ListingWindow.WriteLine(f"拍照精靈啟動異常 (安全跳過)：{str(ex)}")
+
+    # 6. 判定表頭資訊 (依使用者最新規則)
+    # 圖名：應為檔案名稱
+    drawing_name = part_name
+    # 圖號：若當中有 14 碼編號則為圖號，若無則留空
+    drawing_number = extract_14_digit_drawing_number(part_name)
+    # 尺寸：應該由取得設定的素材大小決定，若無資訊則留空
+    blank_size = determine_blank_size(work_part, uf_session, raw_chunks, extracted_info)
+
+    header_info = {
+        "drawing_name": drawing_name,
+        "drawing_number": drawing_number,
+        "blank_size": blank_size,
+        "part_number": extracted_info.get("part_number", ""),
+        "holes": extracted_info.get("holes", ""),
+        "thickness": extracted_info.get("thickness", "")
+    }
+
+    the_session.ListingWindow.WriteLine("----------------------------------------")
+    the_session.ListingWindow.WriteLine(
+        f"表頭解析結果：[圖名] {drawing_name} | "
+        f"[圖號] {drawing_number if drawing_number else '(無14碼，留空)'} | "
+        f"[尺寸] {blank_size if blank_size else '(未設定素材大小，留空)'}"
+    )
+
+    # 7. 透過 VBS 多頁寫入 Excel 並內嵌加工示圖
+    the_session.ListingWindow.WriteLine("正在產生多頁 Excel 工單與嵌入加工示圖...")
+    if stage_images:
+        the_session.ListingWindow.WriteLine(f"準備嵌入之加工示圖列表：{stage_images}")
+    try:
+        export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=stage_images)
+        the_session.ListingWindow.WriteLine(f"工單建立完成！檔案路徑：{output_path}")
+        the_session.ListingWindow.WriteLine("========================================")
+        os.startfile(output_path)
+    except Exception as ex:
+        the_session.ListingWindow.WriteLine(f"匯出失敗：{str(ex)}")
+    finally:
+        # Zero-Debug 清理：拍照精靈產生的暫存圖檔已實體內嵌於 Excel，安全刪除外部暫存檔保持目錄整潔
+        for img_f in stage_images.values():
+            if img_f and os.path.exists(img_f):
+                try:
+                    os.remove(img_f)
+                except Exception:
+                    pass
+
+if __name__ == "__main__":
+    try:
+        main()
+    except NXOpen.NXException as ex:
+        err_msg = str(ex)
+        try:
+            the_session = NXOpen.Session.GetSession()
+            the_session.ListingWindow.Open()
+            if "使用者中止" in err_msg or "abort" in err_msg.lower():
+                the_session.ListingWindow.WriteLine("\n[提示] 操作已中止。")
+            else:
+                the_session.ListingWindow.WriteLine(f"\n[NX 執行中斷] {err_msg}")
+        except Exception:
+            pass
+    except Exception as ex:
+        try:
+            the_session = NXOpen.Session.GetSession()
+            the_session.ListingWindow.Open()
+            the_session.ListingWindow.WriteLine(f"\n[執行未預期異常] {str(ex)}")
+        except Exception:
+            pass

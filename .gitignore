@@ -1,0 +1,15 @@
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and log files
+*.log
+_capture_debug.log
+~$*.xlsx
+~$*.xls
+
+# OS generated files
+Thumbs.db
+[Dd]esktop.ini
+.DS_Store
