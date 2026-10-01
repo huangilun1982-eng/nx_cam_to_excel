@@ -18,6 +18,7 @@ import sys
 import re
 import datetime
 import subprocess
+import tempfile
 import NXOpen
 import NXOpen.CAM
 import NXOpen.UF
@@ -876,34 +877,6 @@ def ensure_white_background_image(png_path):
     if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
         return
 
-    # 外部處理腳本 (在獨立進程中執行，保證 Pillow 100% 成功執行)
-    external_script = (
-        "from PIL import Image, ImageDraw\n"
-        "def process(path):\n"
-        "    with Image.open(path) as im:\n"
-        "        im = im.convert('RGBA')\n"
-        "        bg = Image.new('RGBA', im.size, (255, 255, 255, 255))\n"
-        "        bg.paste(im, mask=im.split()[-1])\n"
-        "        rgb_im = bg.convert('RGB')\n"
-        "        w, h = rgb_im.size\n"
-        "        corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]\n"
-        "        need_flood = any(sum(c) < 735 for c in corners)\n"
-        "        if need_flood:\n"
-        "            step = max(10, min(w, h) // 40)\n"
-        "            seeds = ([(x, 0) for x in range(0, w, step)] +\n"
-        "                     [(x, h-1) for x in range(0, w, step)] +\n"
-        "                     [(0, y) for y in range(0, h, step)] +\n"
-        "                     [(w-1, y) for y in range(0, h, step)])\n"
-        "            for pt in seeds:\n"
-        "                if sum(rgb_im.getpixel(pt)) < 735:\n"
-        "                    try:\n"
-        "                        ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)\n"
-        "                    except Exception:\n"
-        "                        pass\n"
-        "        rgb_im.save(path, 'PNG')\n"
-        f"process(r'{png_path}')\n"
-    )
-
     # 優先嘗試在當前直譯器中運行
     try:
         from PIL import Image, ImageDraw
@@ -933,8 +906,34 @@ def ensure_white_background_image(png_path):
     except Exception:
         pass
 
-    # 若當前直譯器未安裝 PIL，呼叫已確認安裝 PIL 的外部 Python 3.13 執行
+    # 若當前直譯器未安裝 PIL，呼叫已確認安裝 PIL 的外部 Python 3.13 執行 (延遲構建指令碼)
     try:
+        external_script = (
+            "from PIL import Image, ImageDraw\n"
+            "def process(path):\n"
+            "    with Image.open(path) as im:\n"
+            "        im = im.convert('RGBA')\n"
+            "        bg = Image.new('RGBA', im.size, (255, 255, 255, 255))\n"
+            "        bg.paste(im, mask=im.split()[-1])\n"
+            "        rgb_im = bg.convert('RGB')\n"
+            "        w, h = rgb_im.size\n"
+            "        corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]\n"
+            "        need_flood = any(sum(c) < 735 for c in corners)\n"
+            "        if need_flood:\n"
+            "            step = max(10, min(w, h) // 40)\n"
+            "            seeds = ([(x, 0) for x in range(0, w, step)] +\n"
+            "                     [(x, h-1) for x in range(0, w, step)] +\n"
+            "                     [(0, y) for y in range(0, h, step)] +\n"
+            "                     [(w-1, y) for y in range(0, h, step)])\n"
+            "            for pt in seeds:\n"
+            "                if sum(rgb_im.getpixel(pt)) < 735:\n"
+            "                    try:\n"
+            "                        ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)\n"
+            "                    except Exception:\n"
+            "                        pass\n"
+            "        rgb_im.save(path, 'PNG')\n"
+            f"process(r'{png_path}')\n"
+        )
         py_candidates = [
             os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
             os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\python.exe"),
@@ -1239,16 +1238,26 @@ def capture_nx_viewport(the_ui, out_png_path, white_background=True, listing=Non
             except Exception:
                 pass
 
-        # 全方位恢復 View Triad (方位方塊座標) 與 WCS 顯示
-        restore_triad_and_wcs(the_session, work_part, w_view, uf_session)
+        # 全方位恢復 View Triad (方位方塊座標) 與 WCS 顯示，尊重使用者原本的偏好設定
+        restore_triad_and_wcs(
+            the_session, work_part, w_view, uf_session,
+            orig_view_triad=orig_view_triad_vis,
+            orig_view_wcs=orig_view_wcs_vis,
+            orig_part_triad=orig_part_triad_vis,
+            orig_sess_triad=orig_sess_triad_vis,
+            orig_wcs=orig_wcs_vis
+        )
 
-def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_session=None):
+def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_session=None,
+                          orig_view_triad=None, orig_view_wcs=None,
+                          orig_part_triad=None, orig_sess_triad=None, orig_wcs=None):
     """
-    底層座標圖示與視圖方位方塊 (View Triad / WCS) 全方位強制還原核心：
-    1. 視圖層級 (WorkView.TriadVisibility & WcsVisibility)：恢復為 True
-    2. 零件偏好設定 (PartPreferences.ScreenVisualization)：呼叫 SetTriadVisibility(True) 與 TriadVisibility = True
-    3. 會話偏好設定 (SessionPreferences.ScreenVisualization / SessionVisualizationScreen)：呼叫 SetTriadVisibility(1)
-    4. 工作座標系 (WCS.Visibility & UFSession.Csys.SetWcsDisplay)：恢復顯示
+    底層座標圖示與視圖方位方塊 (View Triad / WCS) 全方位還原核心：
+    優先依據拍照前記錄的原始偏好設定還原，若無記錄 (None) 則安全預設為顯示 (True / 1)。
+    1. 視圖層級 (WorkView.TriadVisibility & WcsVisibility)
+    2. 零件偏好設定 (PartPreferences.ScreenVisualization)
+    3. 會話偏好設定 (SessionPreferences.ScreenVisualization)
+    4. 工作座標系 (WCS.Visibility & UFSession.Csys.SetWcsDisplay)
     5. 立即調用 RegenerateDisplay / Refresh / MakeDisplayUpToDate 強制刷新圖形渲染緩衝區！
     """
     if the_session is None:
@@ -1275,16 +1284,19 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
         except Exception:
             pass
 
-    # (A) 視圖層級 View Triad 與 WCS 恢復
+    # (A) 視圖層級 View Triad 與 WCS 恢復 (尊重原始偏好)
+    target_view_triad = orig_view_triad if orig_view_triad is not None else True
+    target_view_wcs = orig_view_wcs if orig_view_wcs is not None else True
+
     if w_view is not None:
         try:
             if hasattr(w_view, "TriadVisibility"):
-                w_view.TriadVisibility = True
+                w_view.TriadVisibility = bool(target_view_triad)
         except Exception:
             pass
         try:
             if hasattr(w_view, "WcsVisibility"):
-                w_view.WcsVisibility = True
+                w_view.WcsVisibility = bool(target_view_wcs)
         except Exception:
             pass
 
@@ -1297,15 +1309,16 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
                     pref_objs.append(getattr(work_part.Preferences, attr))
                 except Exception:
                     pass
+        target_part_triad = orig_part_triad if orig_part_triad is not None else True
         for p_obj in pref_objs:
             try:
                 if hasattr(p_obj, "SetTriadVisibility"):
-                    p_obj.SetTriadVisibility(True)
+                    p_obj.SetTriadVisibility(bool(target_part_triad))
             except Exception:
                 pass
             try:
                 if hasattr(p_obj, "TriadVisibility"):
-                    p_obj.TriadVisibility = True
+                    p_obj.TriadVisibility = bool(target_part_triad)
             except Exception:
                 pass
 
@@ -1318,29 +1331,31 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
                     sess_objs.append(getattr(the_session.Preferences, attr))
                 except Exception:
                     pass
+        target_sess_triad = orig_sess_triad if orig_sess_triad is not None else 1
         for s_obj in sess_objs:
             try:
                 if hasattr(s_obj, "SetTriadVisibility"):
-                    s_obj.SetTriadVisibility(1)
+                    s_obj.SetTriadVisibility(int(target_sess_triad))
             except Exception:
                 pass
             try:
                 if hasattr(s_obj, "TriadVisibility"):
-                    s_obj.TriadVisibility = 1
+                    s_obj.TriadVisibility = int(target_sess_triad)
             except Exception:
                 pass
 
     # (D) 工作座標系 (WCS)
+    target_wcs = orig_wcs if orig_wcs is not None else True
     if work_part is not None and hasattr(work_part, "WCS"):
         try:
             if hasattr(work_part.WCS, "Visibility"):
-                work_part.WCS.Visibility = True
+                work_part.WCS.Visibility = bool(target_wcs)
         except Exception:
             pass
     if uf_session is not None and hasattr(uf_session, "Csys"):
         try:
             if hasattr(uf_session.Csys, "SetWcsDisplay"):
-                uf_session.Csys.SetWcsDisplay(1)
+                uf_session.Csys.SetWcsDisplay(1 if target_wcs else 0)
         except Exception:
             pass
 
@@ -1468,6 +1483,9 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
             w_view = work_part.Views.WorkView
         except Exception:
             w_view = None
+
+    orig_view_triad = getattr(w_view, "TriadVisibility", None) if w_view else None
+    orig_view_wcs = getattr(w_view, "WcsVisibility", None) if w_view else None
 
     # 1. 尋找精緻置頂拍照組件 capture_assistant_gui.py
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
@@ -1687,7 +1705,10 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
 
     # 拍照流程完全結束，雙重保證 NX 主視窗座標圖示 (View Triad / WCS) 100% 恢復顯示並強制刷新
     try:
-        restore_triad_and_wcs(the_session=None, work_part=work_part, w_view=w_view, uf_session=uf_session)
+        restore_triad_and_wcs(
+            the_session=None, work_part=work_part, w_view=w_view, uf_session=uf_session,
+            orig_view_triad=orig_view_triad, orig_view_wcs=orig_view_wcs
+        )
     except Exception:
         pass
 
@@ -1781,6 +1802,18 @@ def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE):
 
 # ==================== VBS 多頁動態生成與匯出模組 ====================
 
+def escape_vbs_str(val):
+    """
+    將字串安全轉義為 VBScript 字串常數：
+    1. 雙引號轉義為兩個雙引號 (" -> "")
+    2. 清除換行符號 (\r, \n)，轉為空格，防止 VBScript 跨行語法中斷 (Unterminated string constant)
+    """
+    if val is None:
+        return ""
+    s = str(val).replace('"', '""')
+    s = s.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
+    return s
+
 def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None):
     """
     透過 Windows 原生 VBScript 動態複製 Excel 工作表產生「第1頁」、「第2頁」...
@@ -1795,19 +1828,21 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
     part_dir = os.path.dirname(part_path)
     today_str = datetime.datetime.now().strftime("%Y/%m/%d")
 
-    # 提取表頭資訊 (依使用者最新規則)
+    # 提取表頭資訊 (依使用者最新規則，經過 escape_vbs_str 嚴格過濾雙引號與換行符)
     # 1. 圖號：若檔案名稱當中有 14 碼編號則為圖號，若無則留空
-    drawing_number = header_info.get("drawing_number", "").replace('"', '""')
+    drawing_number = escape_vbs_str(header_info.get("drawing_number", ""))
     # 2. 圖名：應為檔案名稱
-    drawing_name = header_info.get("drawing_name", part_name).replace('"', '""')
+    drawing_name = escape_vbs_str(header_info.get("drawing_name", part_name))
     # 3. 尺寸：由設定的素材大小決定，若無資訊則留空
-    blank_size = header_info.get("blank_size", "").replace('"', '""')
+    blank_size = escape_vbs_str(header_info.get("blank_size", ""))
 
-    part_no_val = header_info.get("part_number", "").replace('"', '""') # 工單編號/料號
-    holes_val = header_info.get("holes", "").replace('"', '""')         # 數量/孔數
+    part_no_val = escape_vbs_str(header_info.get("part_number", "")) # 工單編號/料號
+    holes_val = escape_vbs_str(header_info.get("holes", ""))         # 數量/孔數
 
-    abs_template = os.path.abspath(template_path).replace('"', '""')
-    abs_output = os.path.abspath(output_path).replace('"', '""')
+    part_path_vbs = escape_vbs_str(part_path)
+    part_dir_vbs = escape_vbs_str(part_dir)
+    abs_template = escape_vbs_str(os.path.abspath(template_path))
+    abs_output = escape_vbs_str(os.path.abspath(output_path))
     total_pages = len(pages) if len(pages) > 0 else 1
 
     vbs_lines = [
@@ -1845,8 +1880,8 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
             f'ws.Range("B3").Value = "{blank_size}"',      # A3「尺寸」 (素材大小/留空)
             f'ws.Range("D3").Value = "{holes_val}"',       # C3「數量」
             f'ws.Range("J2").Value = "{today_str}"',       # I2「表單日期」
-            f'ws.Range("B4").Value = "{part_path}"',       # A4「檔案位置」
-            f'ws.Range("B5").Value = "{part_dir}"',        # A5「程式位置」
+            f'ws.Range("B4").Value = "{part_path_vbs}"',       # A4「檔案位置」
+            f'ws.Range("B5").Value = "{part_dir_vbs}"',        # A5「程式位置」
             'ws.Range("J37").NumberFormat = "@"',          # 強制指定頁數欄位為純文字格式，防止 Excel 自動轉換為日期 (如 1-7 變成 1月7日)
             f'ws.Range("J37").Value = "{page_str}"'        # 頁數標記 (J37)
         ])
@@ -1864,14 +1899,14 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                 else:
                     d = item["data"]
                     safe_seq = str(page_seq)
-                    safe_op_name = d["op_name"].replace('"', '""')
-                    safe_tool_num = d["tool_number"].replace('"', '""')
+                    safe_op_name = escape_vbs_str(d.get("op_name", ""))
+                    safe_tool_num = escape_vbs_str(d.get("tool_number", ""))
                     spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
-                    safe_tool_dia = str(spec_str).replace('"', '""')
-                    safe_flute_len = d["flute_length"].replace('"', '""')
-                    safe_holder_len = d["holder_length"].replace('"', '""')
-                    safe_time = d["time"].replace('"', '""')
-                    safe_note = d["note"].replace('"', '""')
+                    safe_tool_dia = escape_vbs_str(spec_str)
+                    safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
+                    safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
+                    safe_time = escape_vbs_str(d.get("time", ""))
+                    safe_note = escape_vbs_str(d.get("note", ""))
 
                     vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
                     vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
@@ -1937,7 +1972,8 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
     ])
 
     vbs_content = "\r\n".join(vbs_lines)
-    temp_vbs = os.path.join(part_dir, "_temp_shopdoc_multipage.vbs")
+    temp_dir = tempfile.gettempdir()
+    temp_vbs = os.path.join(temp_dir, f"_temp_shopdoc_{os.getpid()}_{datetime.datetime.now().strftime('%H%M%S%f')}.vbs")
 
     with open(temp_vbs, "w", encoding="cp950", errors="ignore") as f:
         f.write(vbs_content)
