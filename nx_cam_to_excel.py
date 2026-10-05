@@ -1171,12 +1171,15 @@ def resolve_python_runtime(require_gui=True):
             _CACHED_PYTHON_RUNTIME_NOGUI = (cand_cmd, clean_env)
             return list(cand_cmd), clean_env
 
-    # 終極備援
-    fallback_cmd = ["pythonw"]
+    # 若未找到任何可用直譯器，真實回傳 None (由 NX 原生對話框接手處理)
     fallback_env = os.environ.copy()
     fallback_env.pop("PYTHONHOME", None)
     fallback_env.pop("PYTHONPATH", None)
-    return fallback_cmd, fallback_env
+    if require_gui:
+        _CACHED_PYTHON_RUNTIME_GUI = (None, fallback_env)
+    else:
+        _CACHED_PYTHON_RUNTIME_NOGUI = (None, fallback_env)
+    return None, fallback_env
 
 def get_clean_subprocess_env():
     """
@@ -1257,8 +1260,9 @@ def ensure_white_background_image(png_path):
             f"process(r'{png_path}')\n"
         )
         py_cmd, py_env = resolve_python_runtime(require_gui=False)
-        full_cmd = list(py_cmd) + ["-c", external_script]
-        subprocess.run(full_cmd, timeout=6, env=py_env, creationflags=0x08000000)
+        if py_cmd:
+            full_cmd = list(py_cmd) + ["-c", external_script]
+            subprocess.run(full_cmd, timeout=6, env=py_env, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -1928,9 +1932,11 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
             if listing:
                 listing.WriteLine(f"  [拍照引導提示] 獨立小工具啟動異常 ({str(ex_pump)})，自動啟用備援拍照模式...")
 
-    # 4. 備援模式：若外部直譯器異常，以 NX 原生對話框作為保底
+    # 4. 備援模式：若外部直譯器異常或未安裝外部 Python，以 NX 原生對話框作為保底
     if not gui_success and the_ui:
         try:
+            if listing:
+                listing.WriteLine("  [NX 原生引導] 啟動 NX 原生拍照確認視窗引導各工段示圖拍照...")
             for s_idx, stg in enumerate(stages):
                 safe_stg_name = re.sub(r'[\\/:*?"<>|]', '_', stg)
                 out_img = os.path.join(temp_dir, f"_temp_stage_{safe_stg_name}.png")
@@ -1938,7 +1944,8 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
 
                 dialog_msg = (
                     f"【工段 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
-                    f"請確認當前 NX 視窗視角是否已適當？\n\n"
+                    f"請在 NX 主視窗旋轉縮放工件至最佳加工示圖角度。\n\n"
+                    f"視角確認適當後：\n"
                     f"・點選【是 (Yes)】：立即截取當前視圖 (白底高清)\n"
                     f"・點選【否 (No)】：略過此工段不放圖"
                 )
@@ -2610,7 +2617,41 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
                 result = json.load(f)
     except Exception as ex:
         if listing:
-            listing.WriteLine(f"  [後處理對話框例外] {str(ex)}，預設僅匯出工單。")
+            listing.WriteLine(f"  [後處理對話框例外] {str(ex)}，自動啟用 NX 原生備援視窗...")
+        try:
+            the_ui = NXOpen.UI.GetUI()
+            if the_ui:
+                task_names = [t.get("program_name", "") for t in nc_tasks if t.get("program_name", "")]
+                task_summary_str = "、".join(task_names[:5])
+                if len(task_names) > 5:
+                    task_summary_str += f" 等共 {len(task_names)} 組"
+
+                msg = (
+                    "【後處理轉出確認 (NX 原生備援視窗)】\n\n"
+                    f"選定之 NC 程式：{task_summary_str}\n"
+                    f"預設後處理器：{default_post}\n"
+                    f"輸出目錄：{default_dir}\n\n"
+                    "是否要依照選定工序自動轉出 NC 碼？\n\n"
+                    "・點選【是 (Yes)】：轉出 NC 碼並匯出工單\n"
+                    "・點選【否 (No)】：僅匯出工單 (不轉出 NC 碼)"
+                )
+                resp = the_ui.NXMessageBox.Show(
+                    "後處理轉出與工單設定",
+                    NXOpen.NXMessageBox.DialogType.Question,
+                    msg
+                )
+                if resp == 1:
+                    result = {
+                        "action": "post_and_export",
+                        "postprocessor_name": default_post,
+                        "custom_post_path": "",
+                        "output_dir": default_dir,
+                        "extension": ".nc"
+                    }
+                else:
+                    result = {"action": "export_only"}
+        except Exception:
+            result = {"action": "export_only"}
     finally:
         for tmp_f in [cfg_file, res_file]:
             if os.path.exists(tmp_f):
@@ -2739,7 +2780,37 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
                 mode_result = res_data.get("mode", "extend")
     except Exception as ex:
         if listing:
-            listing.WriteLine(f"  [分頁對話框例外] {str(ex)}，預設採用單頁延伸排版。")
+            listing.WriteLine(f"  [分頁對話框例外] {str(ex)}，自動啟用 NX 原生備援視窗...")
+        try:
+            the_ui = NXOpen.UI.GetUI()
+            if the_ui:
+                stage_info_lines = []
+                for s in stage_stats:
+                    stage_info_lines.append(f"  ・工段【{s['stage']}】({s['count']}刀)：延伸 ➔ {s['extend_desc']} | 分頁 ➔ {s['paginate_desc']}")
+                stage_desc_str = "\n".join(stage_info_lines[:4])
+
+                msg = (
+                    "【工單分頁預覽與排版決策 (NX 原生備援視窗)】\n\n"
+                    f"目前工段刀具數已超過 15 格：\n"
+                    f"{stage_desc_str}\n\n"
+                    f"預計總頁數對比：\n"
+                    f"  - 單頁延伸模式：共 {total_extend_pages} 頁 (刀具列向下增加格數)\n"
+                    f"  - 自動分頁模式：共 {total_paginate_pages} 頁 (標準 10 格/頁分頁)\n\n"
+                    "請選擇排版模式：\n"
+                    "・點選【是 (Yes)】：自動分頁顯示 (共 " + str(total_paginate_pages) + " 頁)\n"
+                    "・點選【否 (No)】：單頁延伸顯示 (共 " + str(total_extend_pages) + " 頁)"
+                )
+                resp = the_ui.NXMessageBox.Show(
+                    "工單分頁模式決策",
+                    NXOpen.NXMessageBox.DialogType.Question,
+                    msg
+                )
+                if resp == 1:
+                    mode_result = "paginate"
+                else:
+                    mode_result = "extend"
+        except Exception:
+            mode_result = "extend"
     finally:
         for tmp_f in [cfg_file, res_file]:
             if os.path.exists(tmp_f):
