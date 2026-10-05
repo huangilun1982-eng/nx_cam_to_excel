@@ -2493,6 +2493,46 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
     interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
     if not interpreter_cmd or not os.path.exists(dialog_script):
+        # 備援防護：若無外部 Python 直譯器或獨立組件，啟動 NX 原生對話框完成決策，確保純 NX 電腦依然具備 100% 決策能力
+        try:
+            the_ui = NXOpen.UI.GetUI()
+            if the_ui:
+                task_names = [t.get("program_name", "") for t in nc_tasks if t.get("program_name", "")]
+                task_summary_str = "、".join(task_names[:5])
+                if len(task_names) > 5:
+                    task_summary_str += f" 等共 {len(task_names)} 組"
+
+                msg = (
+                    "【後處理轉出確認 (NX 原生備援視窗)】\n\n"
+                    f"選定之 NC 程式：{task_summary_str}\n"
+                    f"預設後處理器：{default_post}\n"
+                    f"輸出目錄：{default_dir}\n\n"
+                    "是否要依照選定工序自動轉出 NC 碼？\n\n"
+                    "・點選【是 (Yes)】：轉出 NC 碼並匯出工單\n"
+                    "・點選【否 (No)】：僅匯出工單 (不轉出 NC 碼)"
+                )
+                resp = the_ui.NXMessageBox.Show(
+                    "後處理轉出與工單設定",
+                    NXOpen.NXMessageBox.DialogType.Question,
+                    msg
+                )
+                if resp == 1:
+                    if listing:
+                        listing.WriteLine("  [NX 備援視窗] 使用者選擇【轉出 NC 碼並匯出工單】。")
+                    return {
+                        "action": "post_and_export",
+                        "postprocessor_name": default_post,
+                        "custom_post_path": "",
+                        "output_dir": default_dir,
+                        "extension": ".nc"
+                    }
+                else:
+                    if listing:
+                        listing.WriteLine("  [NX 備援視窗] 使用者選擇【僅匯出工單 (不轉 NC 碼)】。")
+                    return {"action": "export_only"}
+        except Exception:
+            pass
+
         if listing:
             if not interpreter_cmd:
                 listing.WriteLine("  [提示] 未能偵測到支援 Tkinter 之 Python 直譯器，預設僅匯出工單。")
@@ -2596,6 +2636,42 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
     interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
     if not interpreter_cmd or not os.path.exists(dialog_script):
+        # 備援防護：若無外部 Python 直譯器或獨立組件，啟動 NX 原生對話框完成決策，確保純 NX 電腦依然具備 100% 決策能力
+        try:
+            the_ui = NXOpen.UI.GetUI()
+            if the_ui:
+                stage_info_lines = []
+                for s in stage_stats:
+                    stage_info_lines.append(f"  ・工段【{s['stage']}】({s['count']}刀)：延伸 ➔ {s['extend_desc']} | 分頁 ➔ {s['paginate_desc']}")
+                stage_desc_str = "\n".join(stage_info_lines[:4])
+
+                msg = (
+                    "【工單分頁預覽與排版決策 (NX 原生備援視窗)】\n\n"
+                    f"目前工段刀具數已超過 15 格：\n"
+                    f"{stage_desc_str}\n\n"
+                    f"預計總頁數對比：\n"
+                    f"  - 單頁延伸模式：共 {total_extend_pages} 頁 (刀具列向下增加格數)\n"
+                    f"  - 自動分頁模式：共 {total_paginate_pages} 頁 (標準 10 格/頁分頁)\n\n"
+                    "請選擇排版模式：\n"
+                    "・點選【是 (Yes)】：自動分頁顯示 (共 " + str(total_paginate_pages) + " 頁)\n"
+                    "・點選【否 (No)】：單頁延伸顯示 (共 " + str(total_extend_pages) + " 頁)"
+                )
+                resp = the_ui.NXMessageBox.Show(
+                    "工單分頁模式決策",
+                    NXOpen.NXMessageBox.DialogType.Question,
+                    msg
+                )
+                if resp == 1:
+                    if listing:
+                        listing.WriteLine(f"  [NX 備援視窗] 使用者選擇【自動分頁顯示】(共 {total_paginate_pages} 頁)。")
+                    return "paginate"
+                else:
+                    if listing:
+                        listing.WriteLine(f"  [NX 備援視窗] 使用者選擇【單頁延伸顯示】(共 {total_extend_pages} 頁)。")
+                    return "extend"
+        except Exception:
+            pass
+
         if listing:
             if not interpreter_cmd:
                 listing.WriteLine("  [提示] 未能偵測到支援 Tkinter 之 Python 直譯器，預設採用單頁延伸排版模式。")
