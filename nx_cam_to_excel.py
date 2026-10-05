@@ -20,6 +20,12 @@ import json
 import datetime
 import subprocess
 import tempfile
+import glob
+import shutil
+try:
+    import winreg
+except ImportError:
+    winreg = None
 import NXOpen
 import NXOpen.CAM
 import NXOpen.UF
@@ -885,12 +891,310 @@ def get_distinct_stages(chunks):
 
     return ["通用工段"]
 
+# ==================== 跨機器環境與組件智慧解析引擎 ====================
+_CACHED_PYTHON_RUNTIME_GUI = None
+_CACHED_PYTHON_RUNTIME_NOGUI = None
+
+def resolve_project_root_dir(the_session=None, work_part=None):
+    """
+    智慧解析專案根目錄 (相容 NX Journal 模式、任意磁碟/路徑佈署、隨身碟或工作站環境)
+    優先順序：
+    1. globals().__file__ (若以獨立腳本或 IDE 執行)
+    2. the_session.ExecutingJournal (NX Journal 模式官方標準屬性)
+    3. sys.argv[0] (部分 NX 版本傳入的 journal 完整路徑)
+    4. os.getcwd() (當前工作目錄)
+    5. work_part.FullPath 所在目錄及其 Template 子目錄
+    6. 標準備援路徑 C:\\NX_Standard\\Template, D:\\NX_Standard\\Template
+    """
+    candidate_dirs = []
+
+    # 1. 檢查 __file__
+    if "__file__" in globals() and globals()["__file__"]:
+        try:
+            candidate_dirs.append(os.path.dirname(os.path.abspath(globals()["__file__"])))
+        except Exception:
+            pass
+
+    # 2. 檢查 NX Session 的 ExecutingJournal 屬性
+    if the_session is not None:
+        try:
+            exec_j = getattr(the_session, "ExecutingJournal", None)
+            if exec_j and os.path.exists(exec_j):
+                candidate_dirs.append(os.path.dirname(os.path.abspath(exec_j)))
+        except Exception:
+            pass
+
+    # 3. 檢查 sys.argv[0]
+    if sys.argv and sys.argv[0]:
+        try:
+            cand = os.path.abspath(sys.argv[0])
+            if os.path.exists(cand):
+                candidate_dirs.append(os.path.dirname(cand) if os.path.isfile(cand) else cand)
+        except Exception:
+            pass
+
+    # 4. 檢查當前工作目錄
+    try:
+        candidate_dirs.append(os.getcwd())
+    except Exception:
+        pass
+
+    # 5. 檢查當前工作 Part 所在目錄及其同級/上級目錄
+    if work_part is not None:
+        try:
+            part_path = getattr(work_part, "FullPath", None)
+            if part_path and os.path.exists(part_path):
+                part_dir = os.path.dirname(os.path.abspath(part_path))
+                candidate_dirs.append(part_dir)
+                candidate_dirs.append(os.path.join(part_dir, "Template"))
+        except Exception:
+            pass
+
+    # 6. 標準固定路徑
+    candidate_dirs.append(r"C:\NX_Standard\Template")
+    candidate_dirs.append(r"D:\NX_Standard\Template")
+
+    # 去重並驗證目錄中是否存在核心組件或範本
+    seen = set()
+    best_dir = None
+    key_files = ["ShopDoc_Template.xlsx", "nc_post_dialog.py", "nx_cam_to_excel.py"]
+
+    for d in candidate_dirs:
+        if not d:
+            continue
+        try:
+            d_norm = os.path.normpath(os.path.abspath(d))
+            if d_norm.lower() in seen:
+                continue
+            seen.add(d_norm.lower())
+
+            if os.path.isdir(d_norm):
+                hits = sum(1 for kf in key_files if os.path.exists(os.path.join(d_norm, kf)))
+                if hits > 0:
+                    best_dir = d_norm
+                    break
+        except Exception:
+            continue
+
+    if not best_dir:
+        best_dir = r"C:\NX_Standard\Template"
+
+    return best_dir
+
+def resolve_asset_file(filename, the_session=None, work_part=None):
+    """
+    精確解析專案資產檔案 (對話框腳本、Excel 範本等) 之絕對路徑
+    """
+    root_dir = resolve_project_root_dir(the_session=the_session, work_part=work_part)
+    target_path = os.path.join(root_dir, filename)
+    if os.path.exists(target_path):
+        return target_path
+
+    # 若根目錄未直接命中，進一步搜尋常見位置
+    search_dirs = [
+        os.getcwd(),
+        r"C:\NX_Standard\Template",
+        r"D:\NX_Standard\Template"
+    ]
+    if "__file__" in globals() and globals()["__file__"]:
+        try:
+            search_dirs.insert(0, os.path.dirname(os.path.abspath(globals()["__file__"])))
+        except Exception:
+            pass
+
+    for s_dir in search_dirs:
+        try:
+            p = os.path.join(s_dir, filename)
+            if os.path.exists(p):
+                return p
+        except Exception:
+            continue
+
+    return target_path
+
+def resolve_python_runtime(require_gui=True):
+    """
+    全方位跨機器 Python 直譯器智慧探測與純淨環境建構器
+    支援：
+    1. Windows 註冊表掃描 (Python 3.8 ~ 3.14+)
+    2. 常見安裝目錄列舉 (AppData, ProgramFiles, Anaconda, Miniconda)
+    3. Windows Python Launcher (pyw.exe / py.exe -3)
+    4. 系統 PATH 探測 (安全排除 WindowsApps 微軟商店假捷徑)
+    5. 當前直譯器 sys.executable
+    6. 針對 GUI 對話框進行輕量級 Tkinter 可用性快速校驗
+    7. 徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl/Tk 版本衝突
+    回傳: (interpreter_cmd_list, clean_env)
+    """
+    global _CACHED_PYTHON_RUNTIME_GUI, _CACHED_PYTHON_RUNTIME_NOGUI
+
+    if require_gui and _CACHED_PYTHON_RUNTIME_GUI is not None:
+        cmd, env = _CACHED_PYTHON_RUNTIME_GUI
+        return list(cmd), env.copy()
+    if not require_gui and _CACHED_PYTHON_RUNTIME_NOGUI is not None:
+        cmd, env = _CACHED_PYTHON_RUNTIME_NOGUI
+        return list(cmd), env.copy()
+
+    candidates = []
+
+    # 1. 掃描 Windows 註冊表 (HKCU 與 HKLM)
+    if winreg:
+        for root in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
+            for key_path in [r"Software\Python\PythonCore", r"Software\WOW6432Node\Python\PythonCore"]:
+                try:
+                    with winreg.OpenKey(root, key_path) as base_key:
+                        num_subkeys = winreg.QueryInfoKey(base_key)[0]
+                        for i in range(num_subkeys):
+                            try:
+                                ver_name = winreg.EnumKey(base_key, i)
+                                if ver_name.startswith("2."):
+                                    continue
+                                with winreg.OpenKey(base_key, rf"{ver_name}\InstallPath") as ip_key:
+                                    install_dir, _ = winreg.QueryValueEx(ip_key, "")
+                                    if install_dir and os.path.isdir(install_dir):
+                                        pw = os.path.join(install_dir, "pythonw.exe")
+                                        p = os.path.join(install_dir, "python.exe")
+                                        if os.path.exists(pw):
+                                            candidates.append([pw])
+                                        if os.path.exists(p):
+                                            candidates.append([p])
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+    # 2. 智慧列舉常見安裝目錄
+    patterns = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python3*"),
+        os.path.join(os.environ.get("ProgramFiles", ""), r"Python3*"),
+        os.path.join(os.environ.get("ProgramFiles(x86)", ""), r"Python3*"),
+        r"C:\Python3*",
+        r"D:\Python3*",
+        os.path.join(os.environ.get("ProgramData", ""), r"anaconda*"),
+        os.path.join(os.environ.get("ProgramData", ""), r"miniconda*"),
+        os.path.join(os.environ.get("USERPROFILE", ""), r"anaconda*"),
+        os.path.join(os.environ.get("USERPROFILE", ""), r"miniconda*")
+    ]
+    for pat in patterns:
+        try:
+            for p_dir in glob.glob(pat):
+                if os.path.isdir(p_dir):
+                    pw = os.path.join(p_dir, "pythonw.exe")
+                    p = os.path.join(p_dir, "python.exe")
+                    if os.path.exists(pw):
+                        candidates.append([pw])
+                    if os.path.exists(p):
+                        candidates.append([p])
+        except Exception:
+            pass
+
+    # 3. 掃描 Windows Python Launcher (pyw.exe / py.exe)
+    py_launcher = shutil.which("pyw") or shutil.which("py")
+    if not py_launcher:
+        for p_cand in [
+            r"C:\Windows\pyw.exe",
+            r"C:\Windows\py.exe",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\pyw.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\py.exe")
+        ]:
+            try:
+                if os.path.exists(p_cand):
+                    py_launcher = p_cand
+                    break
+            except Exception:
+                pass
+    if py_launcher:
+        candidates.append([py_launcher, "-3"])
+
+    # 4. 掃描 PATH (排除 WindowsApps 假捷徑)
+    for cmd in ["pythonw", "python"]:
+        try:
+            found = shutil.which(cmd)
+            if found and "windowsapps" not in found.lower():
+                candidates.append([found])
+        except Exception:
+            pass
+
+    # 5. 當前直譯器 (若是 NX 內建 Python 或系統 Python)
+    if sys.executable and os.path.exists(sys.executable):
+        candidates.append([sys.executable])
+
+    seen_keys = set()
+    CREATE_NO_WINDOW = 0x08000000
+
+    for cand_cmd in candidates:
+        cand_key = tuple(cand_cmd)
+        if cand_key in seen_keys:
+            continue
+        seen_keys.add(cand_key)
+
+        clean_env = os.environ.copy()
+        clean_env.pop("PYTHONHOME", None)
+        clean_env.pop("PYTHONPATH", None)
+        clean_env.pop("PYTHONSTARTUP", None)
+        clean_env.pop("PYTHONEXECUTABLE", None)
+
+        exe_path = cand_cmd[0]
+        if os.path.isabs(exe_path) and os.path.exists(exe_path):
+            py_dir = os.path.dirname(exe_path)
+            tcl_lib = os.path.join(py_dir, r"tcl\tcl8.6")
+            tk_lib = os.path.join(py_dir, r"tcl\tk8.6")
+            if os.path.exists(tcl_lib):
+                clean_env["TCL_LIBRARY"] = tcl_lib
+            else:
+                clean_env.pop("TCL_LIBRARY", None)
+            if os.path.exists(tk_lib):
+                clean_env["TK_LIBRARY"] = tk_lib
+            else:
+                clean_env.pop("TK_LIBRARY", None)
+
+            py_dlls = os.path.join(py_dir, "DLLs")
+            py_scripts = os.path.join(py_dir, "Scripts")
+            filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
+            clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
+
+        if require_gui:
+            test_cmd = list(cand_cmd) + ["-c", "import tkinter"]
+            try:
+                res = subprocess.run(
+                    test_cmd,
+                    capture_output=True,
+                    timeout=2,
+                    env=clean_env,
+                    creationflags=CREATE_NO_WINDOW
+                )
+                if res.returncode == 0:
+                    _CACHED_PYTHON_RUNTIME_GUI = (cand_cmd, clean_env)
+                    return list(cand_cmd), clean_env
+            except Exception:
+                continue
+        else:
+            _CACHED_PYTHON_RUNTIME_NOGUI = (cand_cmd, clean_env)
+            return list(cand_cmd), clean_env
+
+    # 終極備援
+    fallback_cmd = ["pythonw"]
+    fallback_env = os.environ.copy()
+    fallback_env.pop("PYTHONHOME", None)
+    fallback_env.pop("PYTHONPATH", None)
+    return fallback_cmd, fallback_env
+
+def get_clean_subprocess_env():
+    """
+    維持現有調用介面相容性的包裝函式
+    回傳: (valid_pythonw_str_or_list, clean_env)
+    """
+    cmd, env = resolve_python_runtime(require_gui=True)
+    if cmd:
+        valid_pythonw = cmd[0] if len(cmd) == 1 else cmd
+        return valid_pythonw, env
+    return None, env
+
 def ensure_white_background_image(png_path):
     """
     確保圖檔背景為 100% 純白色 (RGB 255, 255, 255)：
     1. 若圖檔包含 Alpha 透明通道，複合至純白底色；
     2. 若圖檔為 RGB 但四周邊界非純白色 (如 NX 漸變背景未清除)，執行邊界多點泛洪填充 (Floodfill) 將外圍背景清洗為純白。
-    雙層防護：支援當前直譯器 PIL 與外部 Python 3.13 (已安裝 Pillow) 執行。
+    雙層防護：支援當前直譯器 PIL 與外部 Python (已安裝 Pillow) 執行。
     """
     if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
         return
@@ -924,7 +1228,7 @@ def ensure_white_background_image(png_path):
     except Exception:
         pass
 
-    # 若當前直譯器未安裝 PIL，呼叫已確認安裝 PIL 的外部 Python 3.13 執行 (延遲構建指令碼)
+    # 若當前直譯器未安裝 PIL，呼叫外部 Python 執行 (延遲構建指令碼)
     try:
         external_script = (
             "from PIL import Image, ImageDraw\n"
@@ -952,20 +1256,9 @@ def ensure_white_background_image(png_path):
             "        rgb_im.save(path, 'PNG')\n"
             f"process(r'{png_path}')\n"
         )
-        py_candidates = [
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\python.exe"),
-            "pythonw.exe"
-        ]
-        valid_py = None
-        for cand in py_candidates:
-            if os.path.isabs(cand) and os.path.exists(cand):
-                valid_py = cand
-                break
-        if not valid_py:
-            valid_py = "pythonw"
-
-        subprocess.run([valid_py, "-c", external_script], timeout=6, creationflags=0x08000000)
+        py_cmd, py_env = resolve_python_runtime(require_gui=False)
+        full_cmd = list(py_cmd) + ["-c", external_script]
+        subprocess.run(full_cmd, timeout=6, env=py_env, creationflags=0x08000000)
     except Exception:
         pass
 
@@ -1477,73 +1770,11 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
 
     return orient_success
 
-def get_clean_subprocess_env():
-    """
-    構建深度純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
-    並尋找合適的外部 pythonw.exe 直譯器路徑
-    回傳: (valid_pythonw, clean_env)
-    """
-    clean_env = os.environ.copy()
-    clean_env.pop("PYTHONHOME", None)
-    clean_env.pop("PYTHONPATH", None)
-    clean_env.pop("PYTHONSTARTUP", None)
-    clean_env.pop("PYTHONEXECUTABLE", None)
-
-    pythonw_candidates = [
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python313\pythonw.exe"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python310\pythonw.exe"),
-        os.path.join(os.environ.get("ProgramFiles", ""), r"Python313\pythonw.exe"),
-        os.path.join(os.environ.get("ProgramFiles", ""), r"Python310\pythonw.exe"),
-        "pythonw.exe",
-        "pythonw"
-    ]
-
-    valid_pythonw = None
-    for cand in pythonw_candidates:
-        try:
-            if os.path.isabs(cand) and os.path.exists(cand):
-                valid_pythonw = cand
-                break
-        except Exception:
-            continue
-
-    if valid_pythonw and os.path.isabs(valid_pythonw):
-        py_dir = os.path.dirname(valid_pythonw)
-        py_dlls = os.path.join(py_dir, "DLLs")
-        py_scripts = os.path.join(py_dir, "Scripts")
-        tcl_lib = os.path.join(py_dir, r"tcl\tcl8.6")
-        tk_lib = os.path.join(py_dir, r"tcl\tk8.6")
-
-        if os.path.exists(tcl_lib):
-            clean_env["TCL_LIBRARY"] = tcl_lib
-        else:
-            clean_env.pop("TCL_LIBRARY", None)
-
-        if os.path.exists(tk_lib):
-            clean_env["TK_LIBRARY"] = tk_lib
-        else:
-            clean_env.pop("TK_LIBRARY", None)
-
-        filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
-        clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
-
-    if not valid_pythonw:
-        for cand in ["pythonw", "pyw"]:
-            try:
-                t_res = subprocess.run([cand, "-c", "import tkinter"], capture_output=True, timeout=3, env=clean_env)
-                if t_res.returncode == 0:
-                    valid_pythonw = cand
-                    break
-            except Exception:
-                continue
-
-    return valid_pythonw, clean_env
-
 def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, listing=None, work_part=None):
     """
     方案二：【無黑窗精緻置頂拍照精靈 + NX 視圖流暢旋轉 + 原生 F8 視角擺正】
     技術核心：
-    1. 採用 pythonw.exe + 純淨環境變數隔離，徹底消除黑窗與直譯器崩潰。
+    1. 採用跨機器直譯器探測與純淨環境變數隔離，徹底消除黑窗與直譯器崩潰。
     2. 採用 Popen 非阻塞進程 + Windows 原生訊息泵 (PeekMessage / DispatchMessage)，
        即時泵出滑鼠中鍵與視圖重繪訊息，讓 NX 主視窗在小工具懸浮時 100% 自由流暢旋轉縮放！
     3. 支援【雙重 F8 視角擺正】：
@@ -1568,18 +1799,20 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
     orig_view_wcs = getattr(w_view, "WcsVisibility", None) if w_view else None
 
     # 1. 尋找精緻置頂拍照組件 capture_assistant_gui.py
-    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
-    assistant_script = os.path.join(current_dir, "capture_assistant_gui.py")
-    if not os.path.exists(assistant_script):
-        assistant_script = r"C:\NX_Standard\Template\capture_assistant_gui.py"
+    the_session = None
+    try:
+        the_session = NXOpen.Session.GetSession()
+    except Exception:
+        pass
+    assistant_script = resolve_asset_file("capture_assistant_gui.py", the_session=the_session, work_part=work_part)
 
-    # 2. 取得純淨子進程環境 (徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl 8.6.12 DLL 版本衝突)
-    valid_pythonw, clean_env = get_clean_subprocess_env()
+    # 2. 取得跨機器純淨 Python 直譯器環境
+    interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
     gui_success = False
 
     # 3. 執行置頂拍照小工具 + Windows 訊息泵
-    if valid_pythonw and os.path.exists(assistant_script):
+    if interpreter_cmd and os.path.exists(assistant_script):
         try:
             import ctypes
             from ctypes import wintypes
@@ -1601,8 +1834,7 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                         pass
 
                 nx_hwnd = user32.GetForegroundWindow()
-                cmd = [
-                    valid_pythonw,
+                cmd = list(interpreter_cmd) + [
                     assistant_script,
                     "--stage", stg,
                     "--index", str(s_idx + 1),
@@ -1614,10 +1846,11 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                 if listing:
                     listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正)...")
 
-                # 啟動獨立置頂小工具 (傳入純淨環境 clean_env，pythonw 本身無控制台黑窗)
+                # 啟動獨立置頂小工具 (傳入純淨環境 clean_env，無控制台黑窗)
                 proc = subprocess.Popen(
                     cmd,
-                    env=clean_env
+                    env=clean_env,
+                    creationflags=0x08000000
                 )
 
                 # Windows 原生訊息泵循環：讓 NX 主視窗保持 100% 流暢響應滑鼠中鍵旋轉、重繪與 F8 擺正
@@ -2238,7 +2471,7 @@ def build_nc_tasks_from_selection(selected_objects):
 
     return tasks
 
-def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", listing=None):
+def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", listing=None, the_session=None, work_part=None):
     """
     啟動獨立進程之後處理確認視窗 (nc_post_dialog.py)
     回傳 post_config 字典：
@@ -2250,16 +2483,23 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
          "extension": ".nc"
       }
     """
-    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
-    dialog_script = os.path.join(current_dir, "nc_post_dialog.py")
-    if not os.path.exists(dialog_script):
-        dialog_script = r"C:\NX_Standard\Template\nc_post_dialog.py"
+    if the_session is None:
+        try:
+            the_session = NXOpen.Session.GetSession()
+        except Exception:
+            pass
 
-    valid_pythonw, clean_env = get_clean_subprocess_env()
+    dialog_script = resolve_asset_file("nc_post_dialog.py", the_session=the_session, work_part=work_part)
+    interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
-    if not valid_pythonw or not os.path.exists(dialog_script):
+    if not interpreter_cmd or not os.path.exists(dialog_script):
         if listing:
-            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設僅匯出工單。")
+            if not interpreter_cmd:
+                listing.WriteLine("  [提示] 未能偵測到支援 Tkinter 之 Python 直譯器，預設僅匯出工單。")
+            elif not os.path.exists(dialog_script):
+                listing.WriteLine(f"  [提示] 找不到後處理對話框組件 ({dialog_script})，預設僅匯出工單。")
+            else:
+                listing.WriteLine("  [提示] 找不到外部 Python 或對話框組件，預設僅匯出工單。")
         return {"action": "export_only"}
 
     temp_dir = tempfile.gettempdir()
@@ -2292,8 +2532,7 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
             listing.WriteLine(f"  [錯誤] 無法寫入後處理設定暫存檔：{str(ex)}")
         return {"action": "export_only"}
 
-    cmd = [
-        valid_pythonw,
+    cmd = list(interpreter_cmd) + [
         dialog_script,
         "--cfg-file", cfg_file,
         "--res-file", res_file
@@ -2309,7 +2548,11 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
         msg = wintypes.MSG()
         PM_REMOVE = 0x0001
 
-        proc = subprocess.Popen(cmd, env=clean_env)
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_env,
+            creationflags=0x08000000
+        )
 
         # 訊息泵循環，確保 NX 主視窗維持響應
         start_wait = time.time()
@@ -2338,21 +2581,28 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
 
     return result
 
-def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_paginate_pages, listing=None):
+def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_paginate_pages, listing=None, the_session=None, work_part=None):
     """
     啟動獨立進程之工單分頁預覽與排版決策對話視窗 (pagination_prompt_dialog.py)
     回傳: "extend" (單頁延伸顯示), "paginate" (自動分頁顯示) 或 "cancel" (取消操作)
     """
-    current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else r"C:\NX_Standard\Template"
-    dialog_script = os.path.join(current_dir, "pagination_prompt_dialog.py")
-    if not os.path.exists(dialog_script):
-        dialog_script = r"C:\NX_Standard\Template\pagination_prompt_dialog.py"
+    if the_session is None:
+        try:
+            the_session = NXOpen.Session.GetSession()
+        except Exception:
+            pass
 
-    valid_pythonw, clean_env = get_clean_subprocess_env()
+    dialog_script = resolve_asset_file("pagination_prompt_dialog.py", the_session=the_session, work_part=work_part)
+    interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
-    if not valid_pythonw or not os.path.exists(dialog_script):
+    if not interpreter_cmd or not os.path.exists(dialog_script):
         if listing:
-            listing.WriteLine("  [提示] 找不到外部 pythonw 或對話框組件，預設採用單頁延伸排版模式。")
+            if not interpreter_cmd:
+                listing.WriteLine("  [提示] 未能偵測到支援 Tkinter 之 Python 直譯器，預設採用單頁延伸排版模式。")
+            elif not os.path.exists(dialog_script):
+                listing.WriteLine(f"  [提示] 找不到分頁對話框組件 ({dialog_script})，預設採用單頁延伸排版模式。")
+            else:
+                listing.WriteLine("  [提示] 找不到外部 Python 或對話框組件，預設採用單頁延伸排版模式。")
         return "extend"
 
     temp_dir = tempfile.gettempdir()
@@ -2375,8 +2625,7 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
             listing.WriteLine(f"  [錯誤] 無法寫入分頁設定暫存檔：{str(ex)}")
         return "extend"
 
-    cmd = [
-        valid_pythonw,
+    cmd = list(interpreter_cmd) + [
         dialog_script,
         "--cfg-file", cfg_file,
         "--res-file", res_file
@@ -2392,7 +2641,11 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
         msg = wintypes.MSG()
         PM_REMOVE = 0x0001
 
-        proc = subprocess.Popen(cmd, env=clean_env)
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_env,
+            creationflags=0x08000000
+        )
 
         start_wait = time.time()
         while proc.poll() is None:
@@ -2550,7 +2803,10 @@ def main():
     target_folder = os.path.dirname(full_part_path)
     part_name = work_part.Leaf
 
-    template_path = r"C:\NX_Standard\Template\ShopDoc_Template.xlsx"
+    template_path = resolve_asset_file("ShopDoc_Template.xlsx", the_session=the_session, work_part=work_part)
+    if not os.path.exists(template_path):
+        the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
+        return
     output_path = os.path.join(target_folder, f"{part_name}_選定工序工單.xlsx")
 
     the_session.ListingWindow.WriteLine("========================================")
@@ -2620,7 +2876,8 @@ def main():
     the_session.ListingWindow.WriteLine("----------------------------------------")
     the_session.ListingWindow.WriteLine("正在啟動後處理轉出與工單設定視窗...")
     post_config = invoke_nc_post_dialog(
-        nc_tasks, target_folder, default_post="Fanuc_2026", listing=the_session.ListingWindow
+        nc_tasks, target_folder, default_post="Fanuc_2026", listing=the_session.ListingWindow,
+        the_session=the_session, work_part=work_part
     )
 
     action = post_config.get("action", "export_only")
@@ -2763,7 +3020,8 @@ def main():
         the_session.ListingWindow.WriteLine("正在啟動【工單分頁預覽與排版決策視窗】供使用者選擇...")
 
         user_choice = invoke_pagination_prompt_dialog(
-            stage_stats, total_extend_pages, total_paginate_pages, listing=the_session.ListingWindow
+            stage_stats, total_extend_pages, total_paginate_pages, listing=the_session.ListingWindow,
+            the_session=the_session, work_part=work_part
         )
 
         if user_choice == "cancel":
