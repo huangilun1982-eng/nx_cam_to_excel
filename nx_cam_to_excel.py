@@ -1206,9 +1206,9 @@ def ensure_white_background_image(png_path):
     try:
         from PIL import Image, ImageDraw
         with Image.open(png_path) as im:
-            im = im.convert("RGBA")
-            bg = Image.new("RGBA", im.size, (255, 255, 255, 255))
-            bg.paste(im, mask=im.split()[-1])
+            im_rgba = im.convert("RGBA")
+            bg = Image.new("RGBA", im_rgba.size, (255, 255, 255, 255))
+            bg.paste(im_rgba, mask=im_rgba.split()[-1])
             rgb_im = bg.convert("RGB")
             w, h = rgb_im.size
             corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]
@@ -1227,6 +1227,12 @@ def ensure_white_background_image(png_path):
                         except Exception:
                             pass
             rgb_im.save(png_path, "PNG")
+            try:
+                rgb_im.close()
+                bg.close()
+                im_rgba.close()
+            except Exception:
+                pass
             return
     except Exception:
         pass
@@ -1850,36 +1856,55 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                 if listing:
                     listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正)...")
 
-                # 啟動獨立置頂小工具 (傳入純淨環境 clean_env，無控制台黑窗)
-                proc = subprocess.Popen(
-                    cmd,
-                    env=clean_env,
-                    creationflags=0x08000000
-                )
+                proc = None
+                ret_code = -1
+                try:
+                    # 啟動獨立置頂小工具 (傳入純淨環境 clean_env，無控制台黑窗)
+                    proc = subprocess.Popen(
+                        cmd,
+                        env=clean_env,
+                        creationflags=0x08000000
+                    )
 
-                # Windows 原生訊息泵循環：讓 NX 主視窗保持 100% 流暢響應滑鼠中鍵旋轉、重繪與 F8 擺正
-                start_wait = time.time()
-                while proc.poll() is None:
-                    # 檢查是否有來自小工具的擺正請求 (點擊按鈕或小工具中按 F8)
-                    if os.path.exists(req_file):
+                    # Windows 原生訊息泵循環：讓 NX 主視窗保持 100% 流暢響應滑鼠中鍵旋轉、重繪與 F8 擺正
+                    start_wait = time.time()
+                    while proc.poll() is None:
+                        # 檢查是否有來自小工具的擺正請求 (點擊按鈕或小工具中按 F8)
+                        if os.path.exists(req_file):
+                            try:
+                                os.remove(req_file)
+                            except Exception:
+                                pass
+                            snap_work_view_closest(work_part, w_view, uf_session)
+
+                        # 即時派發 Windows 訊息給 NX 主視窗，同時攔截鍵盤 F8 (VK_F8 = 0x77)
+                        while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
+                            if msg.message == 0x0100 and msg.wParam == 0x77: # WM_KEYDOWN with F8
+                                snap_work_view_closest(work_part, w_view, uf_session)
+                            user32.TranslateMessage(ctypes.byref(msg))
+                            user32.DispatchMessageW(ctypes.byref(msg))
+                        time.sleep(0.01) # 10毫秒短延遲，兼顧即時響應與 CPU 節能
+
+                        # 超時保護 (5分鐘未操作自動退出)
+                        if time.time() - start_wait > 300:
+                            proc.kill()
+                            break
+
+                    ret_code = proc.returncode
+                finally:
+                    if proc is not None:
+                        if proc.poll() is None:
+                            try:
+                                proc.kill()
+                                proc.wait(timeout=2)
+                            except Exception:
+                                pass
                         try:
-                            os.remove(req_file)
+                            if proc.stdout: proc.stdout.close()
+                            if proc.stderr: proc.stderr.close()
+                            if proc.stdin: proc.stdin.close()
                         except Exception:
                             pass
-                        snap_work_view_closest(work_part, w_view, uf_session)
-
-                    # 即時派發 Windows 訊息給 NX 主視窗，同時攔截鍵盤 F8 (VK_F8 = 0x77)
-                    while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                        if msg.message == 0x0100 and msg.wParam == 0x77: # WM_KEYDOWN with F8
-                            snap_work_view_closest(work_part, w_view, uf_session)
-                        user32.TranslateMessage(ctypes.byref(msg))
-                        user32.DispatchMessageW(ctypes.byref(msg))
-                    time.sleep(0.01) # 10毫秒短延遲，兼顧即時響應與 CPU 節能
-
-                    # 超時保護 (5分鐘未操作自動退出)
-                    if time.time() - start_wait > 300:
-                        proc.kill()
-                        break
 
                 # 清理旗標檔案
                 if os.path.exists(req_file):
@@ -1889,21 +1914,21 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                         pass
 
                 # 狀態代碼精確分流判定：
-                if proc.returncode == 0:
+                if ret_code == 0:
                     # 使用者點選「📸 立即拍照」
                     success = capture_nx_viewport(the_ui, out_img, white_background=True, listing=listing, work_part=work_part)
                     if success:
                         captured_images[stg] = out_img
                         if listing:
                             listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
-                elif proc.returncode == 2:
+                elif ret_code == 2:
                     # 使用者在小工具點選「略過此段」或關閉 (X)
                     if listing:
                         listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
                 else:
                     # 外部小工具異常 (returncode != 0 且 != 2)，自動啟動原生對話框備援，避免功能被跳過
                     if listing:
-                        listing.WriteLine(f"  [拍照引導提示] 獨立小工具異常退出 (代碼 {proc.returncode})，自動啟用 NX 備援確認視窗...")
+                        listing.WriteLine(f"  [拍照引導提示] 獨立小工具異常退出 (代碼 {ret_code})，自動啟用 NX 備援確認視窗...")
                     if the_ui:
                         backup_msg = (
                             f"【工段 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
@@ -2221,11 +2246,27 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
     vbs_lines = [
         'Dim objExcel, objWb, seedWs, ws, fso',
         'Dim shp, topCell, bottomCell, boxL, boxT, boxW, boxH, origW, origH, targetW, targetH',
+        'Dim r, vbsErrCode, vbsErrDesc',
+        'vbsErrCode = 0',
+        'vbsErrDesc = ""',
+        'On Error Resume Next',
         'Set objExcel = CreateObject("Excel.Application")',
+        'If Err.Number <> 0 Then',
+        '    WScript.StdErr.WriteLine "無法啟動 Excel.Application: " & Err.Description',
+        '    WScript.Quit Err.Number',
+        'End If',
         'objExcel.Visible = False',
         'objExcel.DisplayAlerts = False',
         'Set fso = CreateObject("Scripting.FileSystemObject")',
         f'Set objWb = objExcel.Workbooks.Open("{abs_template}")',
+        'If Err.Number <> 0 Then',
+        '    vbsErrCode = Err.Number',
+        '    vbsErrDesc = "無法開啟工單範本: " & Err.Description',
+        '    objExcel.Quit',
+        '    Set objExcel = Nothing',
+        '    WScript.StdErr.WriteLine vbsErrDesc',
+        '    WScript.Quit vbsErrCode',
+        'End If',
         'Set seedWs = objWb.Sheets(1)'
     ]
 
@@ -2367,13 +2408,28 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
     vbs_lines.extend([
         'seedWs.Delete',
         f'objWb.SaveAs "{abs_output}"',
-        'objWb.Close False',
-        'objExcel.Quit',
-        'Set fso = Nothing',
-        'Set seedWs = Nothing',
+        'If Err.Number <> 0 Then',
+        '    vbsErrCode = Err.Number',
+        '    vbsErrDesc = "Excel 寫入或儲存錯誤: " & Err.Description',
+        'End If',
+        'If Not objWb Is Nothing Then',
+        '    objWb.Close False',
+        'End If',
+        'If Not objExcel Is Nothing Then',
+        '    objExcel.Quit',
+        'End If',
+        'Set shp = Nothing',
+        'Set topCell = Nothing',
+        'Set bottomCell = Nothing',
         'Set ws = Nothing',
+        'Set seedWs = Nothing',
         'Set objWb = Nothing',
-        'Set objExcel = Nothing'
+        'Set objExcel = Nothing',
+        'Set fso = Nothing',
+        'If vbsErrCode <> 0 Then',
+        '    WScript.StdErr.WriteLine vbsErrDesc',
+        '    WScript.Quit vbsErrCode',
+        'End If'
     ])
 
     vbs_content = "\r\n".join(vbs_lines)
@@ -2384,7 +2440,19 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         f.write(vbs_content)
 
     try:
-        subprocess.run(["cscript.exe", "//Nologo", temp_vbs], check=True, creationflags=0x08000000)
+        subprocess.run(
+            ["cscript.exe", "//Nologo", temp_vbs],
+            check=True,
+            timeout=180,
+            capture_output=True,
+            text=True,
+            creationflags=0x08000000
+        )
+    except subprocess.TimeoutExpired:
+        raise TimeoutError("Excel 匯出程序執行超時 (超過 180 秒)，已強制終止進程，避免記憶體與程序卡死。")
+    except subprocess.CalledProcessError as cpe:
+        err_detail = cpe.stderr.strip() if cpe.stderr else cpe.stdout.strip()
+        raise RuntimeError(f"Excel 匯出失敗 (VBScript 代碼 {cpe.returncode})：{err_detail}")
     finally:
         if os.path.exists(temp_vbs):
             try:
@@ -2586,6 +2654,7 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
     ]
 
     result = {"action": "export_only"}
+    proc = None
     try:
         import ctypes
         from ctypes import wintypes
@@ -2653,6 +2722,19 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
         except Exception:
             result = {"action": "export_only"}
     finally:
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            try:
+                if proc.stdout: proc.stdout.close()
+                if proc.stderr: proc.stderr.close()
+                if proc.stdin: proc.stdin.close()
+            except Exception:
+                pass
         for tmp_f in [cfg_file, res_file]:
             if os.path.exists(tmp_f):
                 try:
@@ -2749,6 +2831,7 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
     ]
 
     mode_result = "extend"
+    proc = None
     try:
         import ctypes
         from ctypes import wintypes
@@ -2812,6 +2895,19 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
         except Exception:
             mode_result = "extend"
     finally:
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            try:
+                if proc.stdout: proc.stdout.close()
+                if proc.stderr: proc.stderr.close()
+                if proc.stdin: proc.stdin.close()
+            except Exception:
+                pass
         for tmp_f in [cfg_file, res_file]:
             if os.path.exists(tmp_f):
                 try:
@@ -3070,16 +3166,23 @@ def main():
                 uf_session, tool_obj, tool_tag
             )
 
-            # 轉速與進給
+            # 轉速與進給 (以 try-finally 保證 NX C++ Builder 記憶體 100% 釋放，防止 ugraf.exe 核心記憶體洩漏)
             rpm_feed_note = ""
+            feeds_builder = None
             try:
                 feeds_builder = op.CreateFeedsBuilder()
-                rpm = f"{feeds_builder.SpindleRpmBuilder.Value:.0f}"
-                feed = f"{feeds_builder.CutFeedrateBuilder.Value:.1f}"
-                rpm_feed_note = f"S:{rpm} F:{feed}"
-                feeds_builder.Destroy()
+                if feeds_builder:
+                    rpm = f"{feeds_builder.SpindleRpmBuilder.Value:.0f}"
+                    feed = f"{feeds_builder.CutFeedrateBuilder.Value:.1f}"
+                    rpm_feed_note = f"S:{rpm} F:{feed}"
             except Exception:
                 pass
+            finally:
+                if feeds_builder is not None:
+                    try:
+                        feeds_builder.Destroy()
+                    except Exception:
+                        pass
 
             raw_ops.append({
                 "clean_op_name": clean_op_name,
@@ -3250,13 +3353,43 @@ def main():
     except Exception as ex:
         the_session.ListingWindow.WriteLine(f"匯出失敗：{str(ex)}")
     finally:
-        # Zero-Debug 清理：拍照精靈產生的暫存圖檔已實體內嵌於 Excel，安全刪除外部暫存檔保持目錄整潔
+        # Zero-Debug 資源防護與記憶體清理：
+        # 1. 拍照精靈產生的暫存圖檔已實體內嵌於 Excel，安全刪除外部暫存檔保持目錄整潔
         for img_f in stage_images.values():
             if img_f and os.path.exists(img_f):
                 try:
                     os.remove(img_f)
                 except Exception:
                     pass
+
+        # 2. 清理目標目錄中所有本次殘留之拍照暫存圖檔與擺正旗標
+        try:
+            for f in os.listdir(target_folder):
+                if (f.startswith("_temp_stage_") and f.endswith(".png")) or (f.startswith("_snap_request_") and f.endswith(".flag")):
+                    fp = os.path.join(target_folder, f)
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # 3. 顯式解構大型資料集合參照，釋放 NXOpen 封裝物件
+        try:
+            raw_chunks.clear()
+            processed_chunks.clear()
+            pages.clear()
+            cam_tree_map.clear()
+            selected_objects.clear()
+        except Exception:
+            pass
+
+        # 4. 主動觸發 Python 垃圾回收 (Garbage Collection)，徹底釋放 NX 內部記憶體堆疊
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     try:
