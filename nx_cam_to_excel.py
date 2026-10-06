@@ -1877,13 +1877,12 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                 pass
                             snap_work_view_closest(work_part, w_view, uf_session)
 
-                        # 即時派發 Windows 訊息給 NX 主視窗，同時攔截鍵盤 F8 (VK_F8 = 0x77)
-                        while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                            if msg.message == 0x0100 and msg.wParam == 0x77: # WM_KEYDOWN with F8
-                                snap_work_view_closest(work_part, w_view, uf_session)
-                            user32.TranslateMessage(ctypes.byref(msg))
-                            user32.DispatchMessageW(ctypes.byref(msg))
-                        time.sleep(0.01) # 10毫秒短延遲，兼顧即時響應與 CPU 節能
+                        # 安全訊息分發：僅精確放行 NX 主視窗之滑鼠旋轉縮放訊息 (0x0200~0x020E)
+                        # 絕不調用 hWnd=0 全域過濾，杜絕掠奪 Qt / QtWebEngine 私有 IPC 訊息導致記憶體累積暴增
+                        if nx_hwnd and user32.IsWindow(nx_hwnd):
+                            while user32.PeekMessageW(ctypes.byref(msg), nx_hwnd, 0x0200, 0x020E, PM_REMOVE):
+                                user32.DispatchMessageW(ctypes.byref(msg))
+                        time.sleep(0.03) # 30毫秒平滑睡眠，兼顧流暢操作與 CPU 節能
 
                         # 超時保護 (5分鐘未操作自動退出)
                         if time.time() - start_wait > 300:
@@ -2656,30 +2655,17 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
     result = {"action": "export_only"}
     proc = None
     try:
-        import ctypes
-        from ctypes import wintypes
-        import time
-
-        user32 = ctypes.windll.user32
-        msg = wintypes.MSG()
-        PM_REMOVE = 0x0001
-
         proc = subprocess.Popen(
             cmd,
             env=clean_env,
             creationflags=0x08000000
         )
 
-        # 訊息泵循環，確保 NX 主視窗維持響應
-        start_wait = time.time()
-        while proc.poll() is None:
-            while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-            time.sleep(0.02)
-            if time.time() - start_wait > 600: # 10 分鐘超時保護
-                proc.kill()
-                break
+        # 安全等待外部對話框完成 (絕對不呼叫 PeekMessage 搶奪 Qt / QtWebEngine 私有訊息隊列)
+        try:
+            proc.wait(timeout=600) # 10 分鐘保護
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
         if os.path.exists(res_file):
             with open(res_file, "r", encoding="utf-8") as f:
@@ -2833,29 +2819,17 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
     mode_result = "extend"
     proc = None
     try:
-        import ctypes
-        from ctypes import wintypes
-        import time
-
-        user32 = ctypes.windll.user32
-        msg = wintypes.MSG()
-        PM_REMOVE = 0x0001
-
         proc = subprocess.Popen(
             cmd,
             env=clean_env,
             creationflags=0x08000000
         )
 
-        start_wait = time.time()
-        while proc.poll() is None:
-            while user32.PeekMessageW(ctypes.byref(msg), 0, 0, 0, PM_REMOVE):
-                user32.TranslateMessage(ctypes.byref(msg))
-                user32.DispatchMessageW(ctypes.byref(msg))
-            time.sleep(0.02)
-            if time.time() - start_wait > 300:  # 5分鐘保護
-                proc.kill()
-                break
+        # 安全等待外部對話框完成 (絕對不呼叫 PeekMessage 搶奪 Qt / QtWebEngine 私有訊息隊列)
+        try:
+            proc.wait(timeout=300) # 5 分鐘保護
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
         if os.path.exists(res_file):
             with open(res_file, "r", encoding="utf-8") as f:
@@ -3388,6 +3362,13 @@ def main():
         try:
             import gc
             gc.collect()
+        except Exception:
+            pass
+
+        # 5. 安全關閉資訊視窗 (ListingWindow)，釋放 NX 內部關聯之 QtWebEngine 瀏覽器資源
+        try:
+            if the_session is not None and hasattr(the_session, "ListingWindow"):
+                the_session.ListingWindow.Close()
         except Exception:
             pass
 
