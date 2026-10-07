@@ -339,7 +339,7 @@ class NcPostDialogApp:
         combo_ext = ttk.Combobox(
             row_ext,
             textvariable=self.ext_var,
-            values=[".nc", ".ptp", ".mpf", ".h", ".tap", ".txt"],
+            values=[".nc", ".i", ".ptp", ".mpf", ".h", ".tap", ".txt"],
             font=("Microsoft JhengHei", 9),
             width=10
         )
