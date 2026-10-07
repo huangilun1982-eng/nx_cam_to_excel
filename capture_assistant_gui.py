@@ -12,6 +12,7 @@ CNC 加工示圖精緻置頂拍照按鈕小工具 (獨立進程組件)
 """
 
 import sys
+import os
 import argparse
 import tkinter as tk
 import ctypes

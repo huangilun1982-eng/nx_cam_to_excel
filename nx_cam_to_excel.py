@@ -1724,30 +1724,29 @@ def get_nx_standard_canned_views():
         {"name": "Left",   "vec": (-1.0,  0.0,  0.0), "canned": "Left"}
     ]
 
-def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
+def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing=None):
     """
     底層原生視圖擺正核心 (100% 遵循 NX 原生 F8 Orient to Closest 行為)：
-    1. 讀取當前視圖即時法向 (m.Zx, m.Zy, m.Zz)
-    2. 比對與 NX 6 大標準工藝視向之夾角，吸附至最近之標準視圖 (Top, Bottom, Front, Back, Right, Left)
-    3. 調用 NX 原生 w_view.Orient(canned_enum, ScaleAdjustment.Current)
-       完全依循 NX 官方出廠固有之標準工藝坐標系，絕無任何擅自篡改或外加邏輯！
-    4. 保持當前視圖縮放 (Current)，不強制 Fit，即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
+    1. 強制向當前 Session 即時獲取最新的 WorkPart 與 WorkView (確保滑鼠旋轉後取得即時視圖矩陣)
+    2. 讀取即時視線法向 (m.Zx, m.Zy, m.Zz)
+    3. 比對與 NX 6 大標準工藝視向之夾角，吸附至最近之標準視圖 (Top, Bottom, Front, Back, Right, Left)
+    4. 調用 NX 原生 w_view.Orient(canned_enum, ScaleAdjustment.Current) 原生切換
+    5. 保持當前視圖縮放 (Current)，即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
     """
-    if work_part is None:
-        try:
-            import NXOpen
-            the_sess = NXOpen.Session.GetSession()
-            work_part = getattr(the_sess.Parts, "Work", None)
-            if work_part is None:
-                work_part = getattr(the_sess.Parts, "Display", None)
-        except Exception:
-            pass
-
-    if w_view is None and work_part is not None and hasattr(work_part, "Views"):
-        try:
-            w_view = work_part.Views.WorkView
-        except Exception:
-            pass
+    try:
+        import NXOpen
+        the_sess = NXOpen.Session.GetSession()
+        wp = getattr(the_sess.Parts, "Work", None)
+        if wp is None:
+            wp = getattr(the_sess.Parts, "Display", None)
+        if wp is not None:
+            work_part = wp
+            if hasattr(wp, "Views"):
+                fresh_v = getattr(wp.Views, "WorkView", None)
+                if fresh_v is not None:
+                    w_view = fresh_v
+    except Exception:
+        pass
 
     if w_view is None or not hasattr(w_view, "Matrix"):
         return False
