@@ -1704,56 +1704,34 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
     except Exception:
         pass
 
-def calculate_closest_orthogonal_matrix(cur_matrix):
+def get_nx_standard_canned_views():
     """
-    底層三維幾何正交化吸附演算法 (Snap to Closest Orthogonal View)
-    輸入: 9 維視圖矩陣 (Xx, Xy, Xz, Yx, Yy, Yz, Zx, Zy, Zz)
-    輸出: 最接近的正交視角矩陣，100% 保持螢幕向上向量 (Up Vector)，絕無翻轉顛倒！
+    定義 NX 原生 6 大標準工藝視向 (完全遵循 NX 官方 Canned View 標準坐標系定義)
+    視線法向向量 (View Normal) 均依 NX 官方標準矩陣精確測量：
+      Top:    ( 0,  0,  1) -> NX 官方固態坐標系 (X 向右, Y 向上)
+      Bottom: ( 0,  0, -1) -> NX 官方固態坐標系 (X 向右, -Y 向上)
+      Front:  ( 0, -1,  0) -> NX 官方固態坐標系 (X 向右, Z 向上)
+      Back:   ( 0,  1,  0) -> NX 官方固態坐標系 (-X 向右, Z 向上)
+      Right:  ( 1,  0,  0) -> NX 官方固態坐標系 (Y 向右, Z 向上)
+      Left:   (-1,  0,  0) -> NX 官方固態坐標系 (-Y 向右, Z 向上)
     """
-    m = cur_matrix
-    cur_z = [float(m[6]), float(m[7]), float(m[8])]
-    cur_y = [float(m[3]), float(m[4]), float(m[5])]
-
-    # 6 大基準正交軸向
-    axes = [
-        (0.0, 0.0, 1.0),
-        (0.0, 0.0, -1.0),
-        (0.0, 1.0, 0.0),
-        (0.0, -1.0, 0.0),
-        (1.0, 0.0, 0.0),
-        (-1.0, 0.0, 0.0)
+    return [
+        {"name": "Top",    "vec": ( 0.0,  0.0,  1.0), "canned": "Top"},
+        {"name": "Bottom", "vec": ( 0.0,  0.0, -1.0), "canned": "Bottom"},
+        {"name": "Front",  "vec": ( 0.0, -1.0,  0.0), "canned": "Front"},
+        {"name": "Back",   "vec": ( 0.0,  1.0,  0.0), "canned": "Back"},
+        {"name": "Right",  "vec": ( 1.0,  0.0,  0.0), "canned": "Right"},
+        {"name": "Left",   "vec": (-1.0,  0.0,  0.0), "canned": "Left"}
     ]
-
-    def dot(v1, v2):
-        return v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]
-
-    # 1. 尋找與視線法向量 cur_z 最接近 (dot product 最大) 之目標軸向
-    best_z = max(axes, key=lambda a: dot(cur_z, a))
-
-    # 2. 尋找與當前向上向量 cur_y 最接近、且與 best_z 正交之目標向上方向 (Up Vector)
-    perp_axes = [a for a in axes if abs(dot(a, best_z)) < 1e-5]
-    best_y = max(perp_axes, key=lambda a: dot(cur_y, a))
-
-    # 3. 叉積計算水平向右向量 X_target = Y_target x Z_target
-    best_x = (
-        best_y[1]*best_z[2] - best_y[2]*best_z[1],
-        best_y[2]*best_z[0] - best_y[0]*best_z[2],
-        best_y[0]*best_z[1] - best_y[1]*best_z[0]
-    )
-
-    return (
-        best_x[0], best_x[1], best_x[2],
-        best_y[0], best_y[1], best_y[2],
-        best_z[0], best_z[1], best_z[2]
-    )
 
 def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
     """
-    底層原生視圖擺正核心 (Snap to Closest Standard View / F8 功能)：
-    1. 讀取當前視圖即時矩陣 work_view.Matrix
-    2. 調用 calculate_closest_orthogonal_matrix 精確吸附至最接近的正交基準坐標系
-    3. 調用 work_view.Orient(target_matrix) 原生定向：保持當前縮放與畫面中心，零翻轉！
-    4. 即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
+    底層原生視圖擺正核心 (100% 遵循 NX 原生 F8 Orient to Closest 行為)：
+    1. 讀取當前視圖即時法向 (m.Zx, m.Zy, m.Zz)
+    2. 比對與 NX 6 大標準工藝視向之夾角，吸附至最近之標準視圖 (Top, Bottom, Front, Back, Right, Left)
+    3. 調用 NX 原生 w_view.Orient(canned_enum, ScaleAdjustment.Current)
+       完全依循 NX 官方出廠固有之標準工藝坐標系，絕無任何擅自篡改或外加邏輯！
+    4. 保持當前視圖縮放 (Current)，不強制 Fit，即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
     """
     if work_part is None:
         try:
@@ -1775,20 +1753,35 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
         return False
 
     try:
+        import NXOpen
+
         m = w_view.Matrix
-        cur_mat = (m.Xx, m.Xy, m.Xz, m.Yx, m.Yy, m.Yz, m.Zx, m.Zy, m.Zz)
-        target_tuple = calculate_closest_orthogonal_matrix(cur_mat)
+        vx, vy, vz = float(m.Zx), float(m.Zy), float(m.Zz)
+        v_mag = (vx*vx + vy*vy + vz*vz) ** 0.5
+        if v_mag > 1e-6:
+            vx, vy, vz = vx/v_mag, vy/v_mag, vz/v_mag
+        else:
+            vx, vy, vz = 0.0, 0.0, 1.0
 
-        # 構造目標 Matrix3x3
-        m_target = w_view.Matrix
-        m_target.Xx, m_target.Xy, m_target.Xz = target_tuple[0], target_tuple[1], target_tuple[2]
-        m_target.Yx, m_target.Yy, m_target.Yz = target_tuple[3], target_tuple[4], target_tuple[5]
-        m_target.Zx, m_target.Zy, m_target.Zz = target_tuple[6], target_tuple[7], target_tuple[8]
+        canned_views = get_nx_standard_canned_views()
+        best_cand = max(canned_views, key=lambda c: vx*c["vec"][0] + vy*c["vec"][1] + vz*c["vec"][2])
+        canned_name = best_cand["canned"]
 
-        # 執行原生矩陣定向
-        w_view.Orient(m_target)
+        canned_enum = getattr(NXOpen.View.Canned, canned_name, None)
+        if canned_enum is None:
+            return False
 
-        # 全面強制顯存再生與視圖刷新
+        # 保持當前視圖縮放比例 (ScaleAdjustment.Current)
+        scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Current", None)
+        if scale_adj is not None:
+            try:
+                w_view.Orient(canned_enum, scale_adj)
+            except Exception:
+                w_view.Orient(canned_enum)
+        else:
+            w_view.Orient(canned_enum)
+
+        # 顯存再生與視圖刷新
         try:
             if hasattr(w_view, "Tag") and uf_session is not None and hasattr(uf_session, "View"):
                 uf_session.View.UpdateView(w_view.Tag)
@@ -1803,7 +1796,7 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
 
         if listing:
             try:
-                listing.WriteLine("  [📐 視角擺正] 已精確吸附至最近正交視角 (保持畫面中心與縮放，無翻轉)。")
+                listing.WriteLine(f"  [📐 視角擺正] 已吸附至 NX 原生標準視向 ➔ 【{canned_name}】。")
             except Exception:
                 pass
         return True
