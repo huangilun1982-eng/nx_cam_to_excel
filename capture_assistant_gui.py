@@ -100,7 +100,7 @@ def main():
     lbl_title.pack(pady=(10, 2))
 
     lbl_hint = tk.Label(
-        root, text="中鍵旋轉視圖 | 支援鍵盤 F8 或點擊下方擺正",
+        root, text="中鍵旋轉視圖 | 支援鍵盤 F8 或點擊下方 45° 擺正",
         font=("Microsoft JhengHei", 9), bg="#F0F4F8", fg="#555555"
     )
     lbl_hint.pack(pady=(0, 8))
@@ -111,7 +111,7 @@ def main():
 
     # 按鈕 1：畫面擺正 (F8)
     btn_snap = tk.Button(
-        btn_frame, text=" 📐 擺正 (F8) ", command=trigger_f8_snap,
+        btn_frame, text=" 📐 45° 擺正 (F8) ", command=trigger_f8_snap,
         bg="#008080", fg="white", activebackground="#006666", activeforeground="white",
         font=("Microsoft JhengHei", 9, "bold"), padx=8, pady=4, relief=tk.FLAT, cursor="hand2"
     )

@@ -1703,13 +1703,58 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
     except Exception:
         pass
 
+def get_45deg_craft_orientations():
+    """
+    定義空間中 26 個以 45° 為單位的標準工藝視向 (以視線法向量定義)
+    """
+    return [
+        # 6 大正交面
+        {"name": "Top (正頂俯視)", "vec": (0.0, 0.0, 1.0), "canned": "Top"},
+        {"name": "Bottom (正底仰視)", "vec": (0.0, 0.0, -1.0), "canned": "Bottom"},
+        {"name": "Front (正前視)", "vec": (0.0, -1.0, 0.0), "canned": "Front"},
+        {"name": "Back (正後視)", "vec": (0.0, 1.0, 0.0), "canned": "Back"},
+        {"name": "Right (正右視)", "vec": (1.0, 0.0, 0.0), "canned": "Right"},
+        {"name": "Left (正左視)", "vec": (-1.0, 0.0, 0.0), "canned": "Left"},
+
+        # 4 個水平 45° 斜平視向
+        {"name": "Front-Right 45°", "vec": (0.70710678, -0.70710678, 0.0), "base_canned": "Front", "z_rot": 45.0},
+        {"name": "Back-Right 45°", "vec": (0.70710678, 0.70710678, 0.0), "base_canned": "Right", "z_rot": 45.0},
+        {"name": "Back-Left 45°", "vec": (-0.70710678, 0.70710678, 0.0), "base_canned": "Back", "z_rot": 45.0},
+        {"name": "Front-Left 45°", "vec": (-0.70710678, -0.70710678, 0.0), "base_canned": "Left", "z_rot": 45.0},
+
+        # 4 個 45° 俯視正交棱向
+        {"name": "Top-Front 45°", "vec": (0.0, -0.70710678, 0.70710678), "base_canned": "Front", "x_rot": -45.0},
+        {"name": "Top-Back 45°", "vec": (0.0, 0.70710678, 0.70710678), "base_canned": "Back", "x_rot": -45.0},
+        {"name": "Top-Right 45°", "vec": (0.70710678, 0.0, 0.70710678), "base_canned": "Right", "x_rot": -45.0},
+        {"name": "Top-Left 45°", "vec": (-0.70710678, 0.0, 0.70710678), "base_canned": "Left", "x_rot": -45.0},
+
+        # 4 個 45° 俯視等角向 (Isometric 45°)
+        {"name": "Isometric Top-Front-Right", "vec": (0.57735027, -0.57735027, 0.57735027), "base_canned": "Front", "combo_rot": (45.0, -35.26)},
+        {"name": "Isometric Top-Back-Right", "vec": (0.57735027, 0.57735027, 0.57735027), "base_canned": "Right", "combo_rot": (45.0, -35.26)},
+        {"name": "Isometric Top-Back-Left", "vec": (-0.57735027, 0.57735027, 0.57735027), "base_canned": "Back", "combo_rot": (45.0, -35.26)},
+        {"name": "Isometric Top-Front-Left", "vec": (-0.57735027, -0.57735027, 0.57735027), "base_canned": "Left", "combo_rot": (45.0, -35.26)},
+
+        # 4 個 45° 仰視正交棱向
+        {"name": "Bottom-Front 45°", "vec": (0.0, -0.70710678, -0.70710678), "base_canned": "Front", "x_rot": 45.0},
+        {"name": "Bottom-Back 45°", "vec": (0.0, 0.70710678, -0.70710678), "base_canned": "Back", "x_rot": 45.0},
+        {"name": "Bottom-Right 45°", "vec": (0.70710678, 0.0, -0.70710678), "base_canned": "Right", "x_rot": 45.0},
+        {"name": "Bottom-Left 45°", "vec": (-0.70710678, 0.0, -0.70710678), "base_canned": "Left", "x_rot": 45.0},
+
+        # 4 個 45° 仰視等角向
+        {"name": "Isometric Bottom-Front-Right", "vec": (0.57735027, -0.57735027, -0.57735027), "base_canned": "Front", "combo_rot": (45.0, 35.26)},
+        {"name": "Isometric Bottom-Back-Right", "vec": (0.57735027, 0.57735027, -0.57735027), "base_canned": "Right", "combo_rot": (45.0, 35.26)},
+        {"name": "Isometric Bottom-Back-Left", "vec": (-0.57735027, 0.57735027, -0.57735027), "base_canned": "Back", "combo_rot": (45.0, 35.26)},
+        {"name": "Isometric Bottom-Front-Left", "vec": (-0.57735027, -0.57735027, -0.57735027), "base_canned": "Left", "combo_rot": (45.0, 35.26)}
+    ]
+
 def snap_work_view_closest(work_part, w_view, uf_session=None):
     """
-    底層原生視圖擺正核心 (Snap to Closest Orthogonal View / F8 功能)：
+    底層原生視圖擺正核心 (Snap to Closest 45° Craft Orientation / F8 功能)：
     1. 透過 UFSession 取得當前視圖的 3x3 旋轉矩陣 (AskViewMatrix)
-    2. 投影分析視線向量 (View Normal)，精準計算與 6 大正交方向 (Top, Bottom, Front, Back, Right, Left) 的夾角
-    3. 呼叫 NX 原生 w_view.Orient 貼齊最接近的標準視圖 (Canned View)
-    4. 即時觸發視圖更新 (Update) 與顯存再生 (RegenerateDisplay)，畫面瞬間 100% 擺正！
+    2. 分析視線法向量 (View Normal)，在 26 個以 45° 為單位的全空間標準工藝視向中尋找最接近之方向
+    3. 優先嘗試建立 45° 正交相機矩陣直接貼齊，或先貼齊基準 Canned View 後以 RotateView 精準旋轉 45°
+    4. 保證工件世界 Z 軸在螢幕上垂直向上 (無側傾 Roll 偏差)，視角工整整齊！
+    5. 即時觸發視圖更新 (Update) 與顯存再生 (RegenerateDisplay)！
     """
     if work_part is None:
         try:
@@ -1727,15 +1772,32 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
     if w_view is None:
         return False
 
-    best_view_name = "Top"
+    orientations = get_45deg_craft_orientations()
+    best_cand = orientations[0] # 預設 Top
+    fallback_ortho_name = "Top"
 
-    # 1. 嘗試從 UFSession.View.AskViewMatrix 獲取當前視圖矩陣
+    # 1. 嘗試從 UFSession.View.AskViewMatrix 獲取當前視圖矩陣並尋找最接近的 45° 工藝方向
     if uf_session is not None and hasattr(uf_session, "View") and hasattr(w_view, "Tag"):
         try:
             mat = uf_session.View.AskViewMatrix(w_view.Tag)
             if mat and len(mat) >= 9:
                 vx, vy, vz = mat[6], mat[7], mat[8]
-                dot_products = {
+                v_mag = math.sqrt(vx*vx + vy*vy + vz*vz)
+                if v_mag > 1e-6:
+                    vx, vy, vz = vx/v_mag, vy/v_mag, vz/v_mag
+                else:
+                    vx, vy, vz = 0.0, 0.0, 1.0
+
+                # 尋找 26 個 45° 方向中夾角最小 (Dot Product 最大) 者
+                best_dot = -999.0
+                for cand in orientations:
+                    d = vx*cand["vec"][0] + vy*cand["vec"][1] + vz*cand["vec"][2]
+                    if d > best_dot:
+                        best_dot = d
+                        best_cand = cand
+
+                # 同步計算 6 大正交面作為萬一回退之基準
+                ortho_dots = {
                     "Top": vz,
                     "Bottom": -vz,
                     "Front": -vy,
@@ -1743,27 +1805,92 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
                     "Right": vx,
                     "Left": -vx
                 }
-                best_view_name = max(dot_products.items(), key=lambda x: x[1])[0]
+                fallback_ortho_name = max(ortho_dots.items(), key=lambda x: x[1])[0]
         except Exception:
             pass
 
-    # 2. 調用 NXOpen.View.Canned 進行原生旋轉貼齊
     orient_success = False
-    try:
-        import NXOpen
-        canned_enum = getattr(NXOpen.View.Canned, best_view_name, None)
+    scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Saved", 0)
+
+    # 方案 1 (優先)：若為標準正交面，直接調用原生的 Canned View (如 Top, Front, Right)
+    if "canned" in best_cand:
+        canned_enum = getattr(NXOpen.View.Canned, best_cand["canned"], None)
         if canned_enum is not None:
-            scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Fit", 0)
             try:
-                scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Saved", scale_adj)
+                w_view.Orient(canned_enum, scale_adj)
+                orient_success = True
             except Exception:
                 pass
-            w_view.Orient(canned_enum, scale_adj)
-            orient_success = True
-    except Exception:
-        orient_success = False
 
-    # 3. 強制視圖重繪刷新
+    # 方案 2 (次選)：若為 45° 斜角視向且支援 Matrix3x3，建構正交相機矩陣直接貼齊
+    if not orient_success:
+        try:
+            import NXOpen
+            N = best_cand["vec"]
+            if abs(N[0]) < 1e-4 and abs(N[1]) < 1e-4:
+                R = (1.0, 0.0, 0.0)
+                U = (0.0, 1.0, 0.0) if N[2] > 0 else (0.0, -1.0, 0.0)
+            else:
+                Rx = -N[1]
+                Ry = N[0]
+                Rz = 0.0
+                mag_r = math.sqrt(Rx*Rx + Ry*Ry)
+                R = (Rx/mag_r, Ry/mag_r, 0.0)
+                Ux = N[1]*R[2] - N[2]*R[1]
+                Uy = N[2]*R[0] - N[0]*R[2]
+                Uz = N[0]*R[1] - N[1]*R[0]
+                mag_u = math.sqrt(Ux*Ux + Uy*Uy + Uz*Uz)
+                U = (Ux/mag_u, Uy/mag_u, Uz/mag_u)
+
+            new_m = NXOpen.Matrix3x3()
+            new_m.Xx, new_m.Xy, new_m.Xz = R[0], R[1], R[2]
+            new_m.Yx, new_m.Yy, new_m.Yz = U[0], U[1], U[2]
+            new_m.Zx, new_m.Zy, new_m.Zz = N[0], N[1], N[2]
+
+            try:
+                w_view.Orient(new_m, scale_adj)
+                orient_success = True
+            except TypeError:
+                try:
+                    w_view.Orient(new_m)
+                    orient_success = True
+                except Exception:
+                    w_view.Matrix = new_m
+                    orient_success = True
+        except Exception:
+            pass
+
+    # 方案 3 (三層防護)：若 Orient 矩陣不可用，透過基準 Canned View + RotateView 精確旋轉 45°
+    if not orient_success and uf_session is not None and hasattr(uf_session, "View"):
+        try:
+            base_canned_name = best_cand.get("base_canned") or fallback_ortho_name
+            canned_enum = getattr(NXOpen.View.Canned, base_canned_name, None)
+            if canned_enum is not None:
+                w_view.Orient(canned_enum, scale_adj)
+                v_tag = getattr(w_view, "Tag", None)
+                if v_tag:
+                    if "z_rot" in best_cand:
+                        uf_session.View.RotateView(v_tag, 6, best_cand["z_rot"]) # 6 = UF_VIEW_MODEL_Z
+                    elif "x_rot" in best_cand:
+                        uf_session.View.RotateView(v_tag, 1, best_cand["x_rot"]) # 1 = UF_VIEW_VIEW_X
+                    elif "combo_rot" in best_cand:
+                        uf_session.View.RotateView(v_tag, 6, best_cand["combo_rot"][0])
+                        uf_session.View.RotateView(v_tag, 1, best_cand["combo_rot"][1])
+                orient_success = True
+        except Exception:
+            pass
+
+    # 方案 4 (終極備援)：安全回退至最接近的 6 大正交 Canned View
+    if not orient_success:
+        try:
+            canned_enum = getattr(NXOpen.View.Canned, fallback_ortho_name, None) or getattr(NXOpen.View.Canned, "Top", None)
+            if canned_enum:
+                w_view.Orient(canned_enum, scale_adj)
+                orient_success = True
+        except Exception:
+            pass
+
+    # 強制視圖重繪刷新
     try:
         if hasattr(w_view, "Update"):
             w_view.Update()
