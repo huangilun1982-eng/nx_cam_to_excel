@@ -51,6 +51,22 @@ except ImportError:
         def detect_tool_conflicts_for_operations(ops):
             return []
 
+# 匯入加工座標系 (MCS / G54) 原點方位解析引擎 (支援本機與 Journal 動態加載)
+try:
+    from mcs_origin_detector import resolve_stage_mcs_origin_string
+except ImportError:
+    import importlib.util
+    _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
+    _mcs_path = os.path.join(_cur_dir, "mcs_origin_detector.py")
+    if os.path.exists(_mcs_path):
+        _spec = importlib.util.spec_from_file_location("mcs_origin_detector", _mcs_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        resolve_stage_mcs_origin_string = _mod.resolve_stage_mcs_origin_string
+    else:
+        def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_session=None):
+            return "加工原點【G54】：X=MID, Y=MID, Z=TOP"
+
 # ==================== 設定區 (參考 ExcelTool 規則) ====================
 ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
 EXCLUDE_KEYWORDS = ["NC_PROGRAM", "未用項"]  # 排除群組關鍵字
@@ -2467,7 +2483,7 @@ def escape_vbs_str(val):
     s = s.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
     return s
 
-def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None):
+def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None, stage_origins=None):
     """
     透過 Windows 原生 VBScript 動態複製 Excel 工作表產生「第1頁」、「第2頁」...
     並填入表頭、工步明細、頁碼標註，並將工段對應之加工示圖等比例居中嵌入 A18:J36 區域
@@ -2476,6 +2492,7 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         raise FileNotFoundError(f"找不到工單範本：{template_path}")
 
     stage_images = stage_images or {}
+    stage_origins = stage_origins or {}
     part_name = work_part.Leaf
     part_path = work_part.FullPath
     part_dir = os.path.dirname(part_path)
@@ -2561,6 +2578,26 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
             f'ws.Range("B5").Value = "{part_dir_vbs}"',        # A5「程式位置」
             'ws.Range("J37").NumberFormat = "@"',          # 強制指定頁數欄位為純文字格式，防止 Excel 自動轉換為日期 (如 1-7 變成 1月7日)
             f'ws.Range("J37").Value = "{page_str}"'        # 頁數標記 (J37)
+        ])
+
+        # 方案 B：在每頁示圖正下方 (A37) 填入該工段對應之加工原點說明
+        stage_origin_text = ""
+        if stage_origins:
+            stage_origin_text = stage_origins.get(page_stage, "")
+            if not stage_origin_text:
+                stage_origin_text = stage_origins.get("通用工段", "")
+            if not stage_origin_text and len(stage_origins) == 1:
+                stage_origin_text = list(stage_origins.values())[0]
+
+        if not stage_origin_text:
+            stage_origin_text = "加工原點【G54】：X=MID, Y=MID, Z=TOP"
+
+        safe_origin_vbs = escape_vbs_str(stage_origin_text)
+        vbs_lines.extend([
+            f'ws.Range("A37").Value = "{safe_origin_vbs}"',
+            'ws.Range("A37").Font.Bold = True',
+            'ws.Range("A37").Font.Size = 10',
+            'ws.Range("A37").Font.Color = RGB(0, 51, 102)'
         ])
 
         start_row = 7
@@ -3457,7 +3494,8 @@ def main():
                 "holder_length": holder_length,
                 "time_seconds": op_seconds,
                 "time": op_time_str,
-                "note": rpm_feed_note
+                "note": rpm_feed_note,
+                "_nx_op_obj": op
             })
             total_op_count += 1
 
@@ -3625,12 +3663,24 @@ def main():
         f"[尺寸] {blank_size if blank_size else '(未設定素材大小，留空)'}"
     )
 
+    # 6.1 解析各工段之加工原點 (MCS / G54) 方位標註 (方案 B：呈現於每頁示圖下方)
+    stage_origins = {}
+    the_session.ListingWindow.WriteLine("----------------------------------------")
+    the_session.ListingWindow.WriteLine("【工段加工原點 (MCS) 方位標註解析】：")
+    for stg in distinct_stages:
+        stg_ops = stage_ops_map.get(stg, [])
+        origin_str = resolve_stage_mcs_origin_string(
+            stg_ops, work_part=work_part, cam_setup=work_part.CAMSetup if work_part else None, uf_session=uf_session
+        )
+        stage_origins[stg] = origin_str
+        the_session.ListingWindow.WriteLine(f"  - 工段【{stg}】：{origin_str}")
+
     # 7. 透過 VBS 多頁寫入 Excel 並內嵌加工示圖
     the_session.ListingWindow.WriteLine("正在產生多頁 Excel 工單與嵌入加工示圖...")
     if stage_images:
         the_session.ListingWindow.WriteLine(f"準備嵌入之加工示圖列表：{stage_images}")
     try:
-        export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=stage_images)
+        export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=stage_images, stage_origins=stage_origins)
         the_session.ListingWindow.WriteLine(f"工單建立完成！檔案路徑：{output_path}")
         the_session.ListingWindow.WriteLine("========================================")
         os.startfile(output_path)
