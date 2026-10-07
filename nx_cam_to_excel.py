@@ -1704,48 +1704,19 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
     except Exception:
         pass
 
-def get_45deg_craft_orientations():
+def get_standard_craft_orientations():
     """
-    定義空間中 26 個以 45° 為單位的標準工藝視向 (以視線法向量定義)
+    定義 NX 原生 8 大標準工藝視向 (6 大正交面 + 2 個等角/軸測向)
     """
     return [
-        # 6 大正交面
         {"name": "Top (正頂俯視)", "vec": (0.0, 0.0, 1.0), "canned": "Top"},
         {"name": "Bottom (正底仰視)", "vec": (0.0, 0.0, -1.0), "canned": "Bottom"},
         {"name": "Front (正前視)", "vec": (0.0, -1.0, 0.0), "canned": "Front"},
         {"name": "Back (正後視)", "vec": (0.0, 1.0, 0.0), "canned": "Back"},
         {"name": "Right (正右視)", "vec": (1.0, 0.0, 0.0), "canned": "Right"},
         {"name": "Left (正左視)", "vec": (-1.0, 0.0, 0.0), "canned": "Left"},
-
-        # 4 個水平 45° 斜平視向
-        {"name": "Front-Right 45°", "vec": (0.70710678, -0.70710678, 0.0), "base_canned": "Front", "z_rot": 45.0},
-        {"name": "Back-Right 45°", "vec": (0.70710678, 0.70710678, 0.0), "base_canned": "Right", "z_rot": 45.0},
-        {"name": "Back-Left 45°", "vec": (-0.70710678, 0.70710678, 0.0), "base_canned": "Back", "z_rot": 45.0},
-        {"name": "Front-Left 45°", "vec": (-0.70710678, -0.70710678, 0.0), "base_canned": "Left", "z_rot": 45.0},
-
-        # 4 個 45° 俯視正交棱向
-        {"name": "Top-Front 45°", "vec": (0.0, -0.70710678, 0.70710678), "base_canned": "Front", "x_rot": -45.0},
-        {"name": "Top-Back 45°", "vec": (0.0, 0.70710678, 0.70710678), "base_canned": "Back", "x_rot": -45.0},
-        {"name": "Top-Right 45°", "vec": (0.70710678, 0.0, 0.70710678), "base_canned": "Right", "x_rot": -45.0},
-        {"name": "Top-Left 45°", "vec": (-0.70710678, 0.0, 0.70710678), "base_canned": "Left", "x_rot": -45.0},
-
-        # 4 個 45° 俯視等角向 (Isometric 45°)
-        {"name": "Isometric Top-Front-Right", "vec": (0.57735027, -0.57735027, 0.57735027), "base_canned": "Front", "combo_rot": (45.0, -35.26)},
-        {"name": "Isometric Top-Back-Right", "vec": (0.57735027, 0.57735027, 0.57735027), "base_canned": "Right", "combo_rot": (45.0, -35.26)},
-        {"name": "Isometric Top-Back-Left", "vec": (-0.57735027, 0.57735027, 0.57735027), "base_canned": "Back", "combo_rot": (45.0, -35.26)},
-        {"name": "Isometric Top-Front-Left", "vec": (-0.57735027, -0.57735027, 0.57735027), "base_canned": "Left", "combo_rot": (45.0, -35.26)},
-
-        # 4 個 45° 仰視正交棱向
-        {"name": "Bottom-Front 45°", "vec": (0.0, -0.70710678, -0.70710678), "base_canned": "Front", "x_rot": 45.0},
-        {"name": "Bottom-Back 45°", "vec": (0.0, 0.70710678, -0.70710678), "base_canned": "Back", "x_rot": 45.0},
-        {"name": "Bottom-Right 45°", "vec": (0.70710678, 0.0, -0.70710678), "base_canned": "Right", "x_rot": 45.0},
-        {"name": "Bottom-Left 45°", "vec": (-0.70710678, 0.0, -0.70710678), "base_canned": "Left", "x_rot": 45.0},
-
-        # 4 個 45° 仰視等角向
-        {"name": "Isometric Bottom-Front-Right", "vec": (0.57735027, -0.57735027, -0.57735027), "base_canned": "Front", "combo_rot": (45.0, 35.26)},
-        {"name": "Isometric Bottom-Back-Right", "vec": (0.57735027, 0.57735027, -0.57735027), "base_canned": "Right", "combo_rot": (45.0, 35.26)},
-        {"name": "Isometric Bottom-Back-Left", "vec": (-0.57735027, 0.57735027, -0.57735027), "base_canned": "Back", "combo_rot": (45.0, 35.26)},
-        {"name": "Isometric Bottom-Front-Left", "vec": (-0.57735027, -0.57735027, -0.57735027), "base_canned": "Left", "combo_rot": (45.0, 35.26)}
+        {"name": "Isometric (俯視正等角)", "vec": (0.57735027, -0.57735027, 0.57735027), "canned": "Isometric"},
+        {"name": "Trimetric (俯視軸測向)", "vec": (0.57735027, 0.57735027, 0.57735027), "canned": "Trimetric"}
     ]
 
 def _safe_orient_canned_view(w_view, canned_name):
@@ -1775,55 +1746,13 @@ def _safe_orient_canned_view(w_view, canned_name):
         pass
     return False
 
-def compute_view_matrix_for_normal(normal):
-    """
-    依據目標視線法向量計算正交相機矩陣 (9 個元素之列表)
-    保證世界 Z 軸在螢幕上垂直向上 (無側傾 Roll 偏差)
-    """
-    nx, ny, nz = float(normal[0]), float(normal[1]), float(normal[2])
-    n_mag = (nx*nx + ny*ny + nz*nz) ** 0.5
-    if n_mag > 1e-6:
-        N = (nx/n_mag, ny/n_mag, nz/n_mag)
-    else:
-        N = (0.0, 0.0, 1.0)
-
-    # 頂部俯視 (Top) 或底部仰視 (Bottom)
-    if abs(N[0]) < 1e-4 and abs(N[1]) < 1e-4:
-        if N[2] > 0: # Top
-            R = (1.0, 0.0, 0.0)
-            U = (0.0, 1.0, 0.0)
-        else: # Bottom
-            R = (1.0, 0.0, 0.0)
-            U = (0.0, -1.0, 0.0)
-    else:
-        # 一般視向：R = normalize(Zw x N)，Zw = (0, 0, 1)
-        rx = -N[1]
-        ry = N[0]
-        rz = 0.0
-        r_mag = (rx*rx + ry*ry) ** 0.5
-        R = (rx/r_mag, ry/r_mag, 0.0)
-        # U = N x R
-        ux = N[1]*R[2] - N[2]*R[1]
-        uy = N[2]*R[0] - N[0]*R[2]
-        uz = N[0]*R[1] - N[1]*R[0]
-        u_mag = (ux*ux + uy*uy + uz*uz) ** 0.5
-        U = (ux/u_mag, uy/u_mag, uz/u_mag)
-
-    return [
-        float(R[0]), float(R[1]), float(R[2]),
-        float(U[0]), float(U[1]), float(U[2]),
-        float(N[0]), float(N[1]), float(N[2])
-    ]
-
 def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
     """
-    底層原生視圖擺正核心 (Snap to Closest 45° Craft Orientation / F8 功能)：
+    底層原生視圖擺正核心 (Snap to Closest Standard View / F8 功能)：
     1. 雙重途徑可靠取得當前活動工作視圖 Tag 與即時 3x3 視圖矩陣 (AskWorkView / AskViewMatrix)
-    2. 分析視線法向量 (View Normal)，在 26 個以 45° 為單位的全空間標準工藝視向中尋找最接近之方向
-    3. 計算目標正交相機矩陣，以 UFSession.View.SetViewMatrix 底層直接貼齊 (100% 精準生效)
-    4. 支援原生 Canned View、Matrix3x3 與 RotateView 多重容錯備援
-    5. 保證工件世界 Z 軸在螢幕上垂直向上 (無側傾 Roll 偏差)，視角工整整齊！
-    6. 即時觸發視圖更新 (UpdateView / Update) 與顯存再生 (RegenerateDisplay)！
+    2. 分析視線法向量 (View Normal)，在 NX 8 大標準工藝視向 (6 正交面 + 2 等角向) 中精準匹配最接近之方向
+    3. 調用 NX 原生 Canned View 進行 100% 絕對穩定之原生定向 (Top, Front, Right, Isometric 等)
+    4. 即時觸發視圖更新 (UpdateView / Update) 與顯存再生 (RegenerateDisplay)！
     """
     v_tag = None
     if uf_session is not None and hasattr(uf_session, "View"):
@@ -1840,7 +1769,7 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
         except Exception:
             pass
 
-    if work_part is not None and hasattr(work_part, "Views"):
+    if w_view is None and work_part is not None and hasattr(work_part, "Views"):
         try:
             fresh_v = work_part.Views.WorkView
             if fresh_v is not None:
@@ -1850,12 +1779,17 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
         except Exception:
             pass
 
+    if not v_tag and w_view is not None and hasattr(w_view, "Tag"):
+        try:
+            v_tag = w_view.Tag
+        except Exception:
+            pass
+
     if w_view is None and not v_tag:
         return False
 
-    orientations = get_45deg_craft_orientations()
+    orientations = get_standard_craft_orientations()
     best_cand = orientations[0] # 預設 Top
-    fallback_ortho_name = "Top"
 
     # 1. 取得當前即時視圖矩陣 (優先向 UFSession 查詢，備援從 w_view.Matrix 獲取)
     cur_mat = None
@@ -1872,7 +1806,7 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
         except Exception:
             pass
 
-    # 2. 分析視線法向量並匹配最接近的 45° 工藝視向
+    # 2. 分析視線法向量並匹配最接近的標準工藝視向
     if cur_mat and len(cur_mat) >= 9:
         try:
             vx, vy, vz = float(cur_mat[6]), float(cur_mat[7]), float(cur_mat[8])
@@ -1882,117 +1816,32 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
             else:
                 vx, vy, vz = 0.0, 0.0, 1.0
 
-            # 尋找 26 個 45° 方向中夾角最小 (Dot Product 最大) 者
+            # 尋找 8 個標準方向中夾角最小 (Dot Product 最大) 者
             best_dot = -999.0
             for cand in orientations:
                 d = vx*cand["vec"][0] + vy*cand["vec"][1] + vz*cand["vec"][2]
                 if d > best_dot:
                     best_dot = d
                     best_cand = cand
-
-            # 同步計算 6 大正交面作為備援基準
-            ortho_dots = {
-                "Top": vz,
-                "Bottom": -vz,
-                "Front": -vy,
-                "Back": vy,
-                "Right": vx,
-                "Left": -vx
-            }
-            fallback_ortho_name = max(ortho_dots.items(), key=lambda x: x[1])[0]
         except Exception:
             pass
 
     if listing:
         try:
-            listing.WriteLine(f"  [📐 視角吸附] 目標工藝視向 ➔ 【{best_cand['name']}】")
+            listing.WriteLine(f"  [📐 視角擺正] 自動吸附至最接近標準視向 ➔ 【{best_cand['name']}】")
         except Exception:
             pass
 
+    # 3. 調用 NX 原生 Canned View 進行 100% 絕對穩定之原生定向
     orient_success = False
-
-    # 方案 1 (針對 6 大標準正交面優先)：調用 NX 原生 Canned View (如 Top, Front, Right)
-    if "canned" in best_cand and w_view is not None:
+    if w_view is not None and "canned" in best_cand:
         orient_success = _safe_orient_canned_view(w_view, best_cand["canned"])
 
-    # 方案 2 (針對 45° 角度或 Canned 失敗)：直接計算並設定 3x3 正交相機矩陣
-    if not orient_success:
-        target_mat = compute_view_matrix_for_normal(best_cand["vec"])
-
-        # 方案 2A (最直接底層)：UFSession.View.SetViewMatrix 原生直寫
-        if uf_session is not None and hasattr(uf_session, "View") and v_tag:
-            try:
-                uf_session.View.SetViewMatrix(v_tag, target_mat)
-                orient_success = True
-            except Exception:
-                pass
-
-        # 方案 2B (次選物件模型)：建構 NXOpen.Matrix3x3 設定給 w_view.Matrix 或 Orient
-        if not orient_success and w_view is not None:
-            try:
-                import NXOpen
-                new_m = NXOpen.Matrix3x3()
-                new_m.Xx, new_m.Xy, new_m.Xz = float(target_mat[0]), float(target_mat[1]), float(target_mat[2])
-                new_m.Yx, new_m.Yy, new_m.Yz = float(target_mat[3]), float(target_mat[4]), float(target_mat[5])
-                new_m.Zx, new_m.Zy, new_m.Zz = float(target_mat[6]), float(target_mat[7]), float(target_mat[8])
-                try:
-                    scale_fit = getattr(NXOpen.View.ScaleAdjustment, "Fit", None)
-                    if scale_fit is not None:
-                        w_view.Orient(new_m, scale_fit)
-                    else:
-                        w_view.Orient(new_m)
-                    orient_success = True
-                except Exception:
-                    try:
-                        w_view.Matrix = new_m
-                        orient_success = True
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        # 方案 2C (三層備援)：基準 Canned View + RotateView
-        if not orient_success and uf_session is not None and hasattr(uf_session, "View") and v_tag and w_view is not None:
-            try:
-                base_canned = best_cand.get("base_canned") or fallback_ortho_name
-                if _safe_orient_canned_view(w_view, base_canned):
-                    rot_model_z = 6
-                    rot_view_x = 1
-                    try:
-                        import NXOpen.UF
-                        uf_c = getattr(NXOpen.UF, "UFConstants", None)
-                        if uf_c:
-                            rot_model_z = getattr(uf_c, "UF_VIEW_MODEL_Z", 6)
-                            rot_view_x = getattr(uf_c, "UF_VIEW_VIEW_X", 1)
-                    except Exception:
-                        pass
-
-                    def _do_rotate(rot_type, angle):
-                        try:
-                            uf_session.View.RotateView(v_tag, rot_type, float(angle))
-                        except Exception:
-                            fb_int = 6 if rot_type == rot_model_z else 1
-                            try:
-                                uf_session.View.RotateView(v_tag, int(fb_int), float(angle))
-                            except Exception:
-                                pass
-
-                    if "z_rot" in best_cand:
-                        _do_rotate(rot_model_z, best_cand["z_rot"])
-                    elif "x_rot" in best_cand:
-                        _do_rotate(rot_view_x, best_cand["x_rot"])
-                    elif "combo_rot" in best_cand:
-                        _do_rotate(rot_model_z, best_cand["combo_rot"][0])
-                        _do_rotate(rot_view_x, best_cand["combo_rot"][1])
-                    orient_success = True
-            except Exception:
-                pass
-
-    # 方案 3 (終極保底)：安全回退至最接近的 6 大正交 Canned View
+    # 備援保底：若特定視圖失敗，回退至 Top
     if not orient_success and w_view is not None:
-        orient_success = _safe_orient_canned_view(w_view, fallback_ortho_name) or _safe_orient_canned_view(w_view, "Top")
+        orient_success = _safe_orient_canned_view(w_view, "Top")
 
-    # 全面強制視圖重繪刷新 (保證 3D 繪圖區 100% 即時反應)
+    # 4. 全面強制視圖重繪刷新 (保證 3D 繪圖區 100% 即時反應)
     try:
         if v_tag and uf_session is not None and hasattr(uf_session, "View") and hasattr(uf_session.View, "UpdateView"):
             uf_session.View.UpdateView(v_tag)

@@ -58,8 +58,8 @@ def main():
     exit_code = [2] # 預設 2 為略過或取消
 
     def trigger_f8_snap(event=None):
-        """觸發 NX 畫面擺正 (F8 貼齊 45° 工藝視向)"""
-        # 寫入跨進程旗標，由 NX 主進程底層原生執行 45° 視圖吸附擺正 (100% 絕對生效且不干擾視窗)
+        """觸發 NX 畫面擺正 (F8 貼齊最接近之標準工藝視向)"""
+        # 寫入跨進程旗標，由 NX 主進程底層原生執行視圖擺正 (100% 絕對生效且不干擾視窗)
         if req_file:
             try:
                 with open(req_file, "w") as f:
@@ -69,8 +69,8 @@ def main():
         # 提供即時視覺反饋，讓使用者明確感知按鈕已觸發且小工具不關閉
         try:
             if 'btn_snap' in locals() or 'btn_snap' in globals():
-                btn_snap.config(text=" 📐 視角已吸附 ", bg="#004D40")
-                root.after(400, lambda: btn_snap.config(text=" 📐 45° 擺正 (F8) ", bg="#008080"))
+                btn_snap.config(text=" 📐 視角已擺正 ", bg="#004D40")
+                root.after(400, lambda: btn_snap.config(text=" 📐 視角擺正 (F8) ", bg="#008080"))
         except Exception:
             pass
 
@@ -95,7 +95,7 @@ def main():
     lbl_title.pack(pady=(10, 2))
 
     lbl_hint = tk.Label(
-        root, text="中鍵旋轉視圖 | 支援鍵盤 F8 或點擊下方 45° 擺正",
+        root, text="中鍵旋轉視圖 | 支援鍵盤 F8 或點擊下方擺正",
         font=("Microsoft JhengHei", 9), bg="#F0F4F8", fg="#555555"
     )
     lbl_hint.pack(pady=(0, 8))
@@ -106,7 +106,7 @@ def main():
 
     # 按鈕 1：畫面擺正 (F8)
     btn_snap = tk.Button(
-        btn_frame, text=" 📐 45° 擺正 (F8) ", command=trigger_f8_snap,
+        btn_frame, text=" 📐 視角擺正 (F8) ", command=trigger_f8_snap,
         bg="#008080", fg="white", activebackground="#006666", activeforeground="white",
         font=("Microsoft JhengHei", 9, "bold"), padx=8, pady=4, relief=tk.FLAT, cursor="hand2"
     )
