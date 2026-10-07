@@ -67,6 +67,22 @@ except ImportError:
         def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_session=None):
             return "加工原點【G54】：X=MID, Y=MID, Z=TOP"
 
+# 匯入刀具有效刃長與懸伸安全評估引擎 (支援本機與 Journal 動態加載)
+try:
+    from tool_safety_evaluator import evaluate_operations_tool_safety
+except ImportError:
+    import importlib.util
+    _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
+    _safety_path = os.path.join(_cur_dir, "tool_safety_evaluator.py")
+    if os.path.exists(_safety_path):
+        _spec = importlib.util.spec_from_file_location("tool_safety_evaluator", _safety_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        evaluate_operations_tool_safety = _mod.evaluate_operations_tool_safety
+    else:
+        def evaluate_operations_tool_safety(ops, cam_setup=None):
+            return []
+
 # ==================== 設定區 (參考 ExcelTool 規則) ====================
 ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
 EXCLUDE_KEYWORDS = ["NC_PROGRAM", "未用項"]  # 排除群組關鍵字
@@ -2643,10 +2659,15 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                         safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
                         safe_time = escape_vbs_str(d.get("time", ""))
                         
-                        # 備註欄與刀號衝突處理
+                        # 備註欄與刀號衝突、刀具安全評估處理
                         has_conflict = d.get("has_tool_conflict", False)
                         conflict_msg = d.get("tool_conflict_msg", "")
+                        safety_warn = d.get("tool_safety_warning", "")
                         note_val = str(d.get("note", "")).strip()
+
+                        if safety_warn and safety_warn not in note_val:
+                            note_val = f"{safety_warn} {note_val}".strip() if note_val else safety_warn
+
                         if has_conflict and conflict_msg:
                             if conflict_msg not in note_val:
                                 note_val = f"{conflict_msg} {note_val}".strip() if note_val else conflict_msg
@@ -3571,6 +3592,17 @@ def main():
     if total_conflicts_found > 0:
         the_session.ListingWindow.WriteLine("----------------------------------------")
         the_session.ListingWindow.WriteLine(f"[!] 警告：全工段共發現 {total_conflicts_found} 項刀號衝突，工單將以淡紅底色醒目標記！")
+
+    # 執行工段級刀具刃長與切深懸伸安全評估 (CutDepthChecker / 避空評估)
+    total_safety_warnings = 0
+    for stg, s_ops in stage_ops_map.items():
+        s_warns = evaluate_operations_tool_safety(s_ops, cam_setup=work_part.CAMSetup if work_part else None)
+        if s_warns:
+            total_safety_warnings += len(s_warns)
+            the_session.ListingWindow.WriteLine("----------------------------------------")
+            the_session.ListingWindow.WriteLine(f"【刀具安全提醒】工段 [{stg}] 發現 {len(s_warns)} 項切深與裝夾避空注意：")
+            for w_msg in s_warns:
+                the_session.ListingWindow.WriteLine(f"  [!] {w_msg}")
 
     # 3. 預先分析各工段工步數量與各模式下之預計頁數 (供使用者預覽與決策)
     stage_stats, total_extend_pages, total_paginate_pages, has_choice = preview_pagination_plan(
