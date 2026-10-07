@@ -16,6 +16,7 @@ Siemens NX CAM 加工工序單自動化匯出工具 (工業級分頁與智慧辨
 import os
 import sys
 import re
+import math
 import json
 import datetime
 import subprocess
@@ -1747,12 +1748,39 @@ def get_45deg_craft_orientations():
         {"name": "Isometric Bottom-Front-Left", "vec": (-0.57735027, -0.57735027, -0.57735027), "base_canned": "Left", "combo_rot": (45.0, 35.26)}
     ]
 
+def _safe_orient_canned_view(w_view, canned_name):
+    """
+    安全貼齊 NX 原生 Canned View (相容各版本 NX 之 ScaleAdjustment 參數簽章)
+    """
+    if not w_view or not canned_name:
+        return False
+    try:
+        import NXOpen
+        canned_enum = getattr(NXOpen.View.Canned, canned_name, None)
+        if canned_enum is None:
+            return False
+        scale_fit = getattr(NXOpen.View.ScaleAdjustment, "Fit", None)
+        if scale_fit is not None:
+            try:
+                w_view.Orient(canned_enum, scale_fit)
+                return True
+            except Exception:
+                pass
+        try:
+            w_view.Orient(canned_enum)
+            return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
 def snap_work_view_closest(work_part, w_view, uf_session=None):
     """
     底層原生視圖擺正核心 (Snap to Closest 45° Craft Orientation / F8 功能)：
     1. 透過 UFSession 取得當前視圖的 3x3 旋轉矩陣 (AskViewMatrix)
     2. 分析視線法向量 (View Normal)，在 26 個以 45° 為單位的全空間標準工藝視向中尋找最接近之方向
-    3. 優先嘗試建立 45° 正交相機矩陣直接貼齊，或先貼齊基準 Canned View 後以 RotateView 精準旋轉 45°
+    3. 優先調用 NX 原生 Canned View 與 UFSession.View.RotateView 精確旋轉 45°
     4. 保證工件世界 Z 軸在螢幕上垂直向上 (無側傾 Roll 偏差)，視角工整整齊！
     5. 即時觸發視圖更新 (Update) 與顯存再生 (RegenerateDisplay)！
     """
@@ -1763,9 +1791,11 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
         except Exception:
             pass
 
-    if w_view is None and work_part is not None and hasattr(work_part, "Views"):
+    if work_part is not None and hasattr(work_part, "Views"):
         try:
-            w_view = work_part.Views.WorkView
+            fresh_v = work_part.Views.WorkView
+            if fresh_v is not None:
+                w_view = fresh_v
         except Exception:
             pass
 
@@ -1781,8 +1811,8 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
         try:
             mat = uf_session.View.AskViewMatrix(w_view.Tag)
             if mat and len(mat) >= 9:
-                vx, vy, vz = mat[6], mat[7], mat[8]
-                v_mag = math.sqrt(vx*vx + vy*vy + vz*vz)
+                vx, vy, vz = float(mat[6]), float(mat[7]), float(mat[8])
+                v_mag = (vx*vx + vy*vy + vz*vz) ** 0.5
                 if v_mag > 1e-6:
                     vx, vy, vz = vx/v_mag, vy/v_mag, vz/v_mag
                 else:
@@ -1796,7 +1826,7 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
                         best_dot = d
                         best_cand = cand
 
-                # 同步計算 6 大正交面作為萬一回退之基準
+                # 同步計算 6 大正交面作為備援基準
                 ortho_dots = {
                     "Top": vz,
                     "Bottom": -vz,
@@ -1810,19 +1840,58 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
             pass
 
     orient_success = False
-    scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Saved", 0)
+    v_tag = getattr(w_view, "Tag", None)
 
-    # 方案 1 (優先)：若為標準正交面，直接調用原生的 Canned View (如 Top, Front, Right)
+    # 方案 1 (最優先)：若為標準正交面，直接調用原生的 Canned View (如 Top, Front, Right)
     if "canned" in best_cand:
-        canned_enum = getattr(NXOpen.View.Canned, best_cand["canned"], None)
-        if canned_enum is not None:
-            try:
-                w_view.Orient(canned_enum, scale_adj)
-                orient_success = True
-            except Exception:
-                pass
+        orient_success = _safe_orient_canned_view(w_view, best_cand["canned"])
 
-    # 方案 2 (次選)：若為 45° 斜角視向且支援 Matrix3x3，建構正交相機矩陣直接貼齊
+    # 方案 2 (次選)：若為 45° 角度，先貼齊基準正交面，再以 UFSession.View.RotateView 精確旋轉 45°
+    if not orient_success and uf_session is not None and hasattr(uf_session, "View") and v_tag:
+        try:
+            base_canned_name = best_cand.get("base_canned") or fallback_ortho_name
+            if _safe_orient_canned_view(w_view, base_canned_name):
+                # 取得 UF 旋轉常數 (UF_VIEW_MODEL_Z=6, UF_VIEW_VIEW_X=1)
+                rot_model_z = 6
+                rot_view_x = 1
+                try:
+                    import NXOpen.UF
+                    uf_c = getattr(NXOpen.UF, "UFConstants", None)
+                    if uf_c:
+                        rot_model_z = getattr(uf_c, "UF_VIEW_MODEL_Z", 6)
+                        rot_view_x = getattr(uf_c, "UF_VIEW_VIEW_X", 1)
+                except Exception:
+                    pass
+
+                def _do_rotate(rot_type, angle):
+                    try:
+                        uf_session.View.RotateView(v_tag, rot_type, float(angle))
+                        return True
+                    except Exception:
+                        fb_int = 6 if rot_type == rot_model_z else 1
+                        try:
+                            uf_session.View.RotateView(v_tag, int(fb_int), float(angle))
+                            return True
+                        except Exception:
+                            return False
+
+                if "z_rot" in best_cand:
+                    _do_rotate(rot_model_z, best_cand["z_rot"])
+                elif "x_rot" in best_cand:
+                    _do_rotate(rot_view_x, best_cand["x_rot"])
+                elif "combo_rot" in best_cand:
+                    _do_rotate(rot_model_z, best_cand["combo_rot"][0])
+                    _do_rotate(rot_view_x, best_cand["combo_rot"][1])
+
+                try:
+                    uf_session.View.UpdateView(v_tag)
+                except Exception:
+                    pass
+                orient_success = True
+        except Exception:
+            pass
+
+    # 方案 3 (三層防護)：若 RotateView 失敗，嘗試建立相機正交矩陣 (R, U, N) 直接貼齊
     if not orient_success:
         try:
             import NXOpen
@@ -1834,23 +1903,27 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
                 Rx = -N[1]
                 Ry = N[0]
                 Rz = 0.0
-                mag_r = math.sqrt(Rx*Rx + Ry*Ry)
+                mag_r = (Rx*Rx + Ry*Ry) ** 0.5
                 R = (Rx/mag_r, Ry/mag_r, 0.0)
                 Ux = N[1]*R[2] - N[2]*R[1]
                 Uy = N[2]*R[0] - N[0]*R[2]
                 Uz = N[0]*R[1] - N[1]*R[0]
-                mag_u = math.sqrt(Ux*Ux + Uy*Uy + Uz*Uz)
+                mag_u = (Ux*Ux + Uy*Uy + Uz*Uz) ** 0.5
                 U = (Ux/mag_u, Uy/mag_u, Uz/mag_u)
 
             new_m = NXOpen.Matrix3x3()
-            new_m.Xx, new_m.Xy, new_m.Xz = R[0], R[1], R[2]
-            new_m.Yx, new_m.Yy, new_m.Yz = U[0], U[1], U[2]
-            new_m.Zx, new_m.Zy, new_m.Zz = N[0], N[1], N[2]
+            new_m.Xx, new_m.Xy, new_m.Xz = float(R[0]), float(R[1]), float(R[2])
+            new_m.Yx, new_m.Yy, new_m.Yz = float(U[0]), float(U[1]), float(U[2])
+            new_m.Zx, new_m.Zy, new_m.Zz = float(N[0]), float(N[1]), float(N[2])
 
             try:
-                w_view.Orient(new_m, scale_adj)
+                scale_fit = getattr(NXOpen.View.ScaleAdjustment, "Fit", None)
+                if scale_fit is not None:
+                    w_view.Orient(new_m, scale_fit)
+                else:
+                    w_view.Orient(new_m)
                 orient_success = True
-            except TypeError:
+            except Exception:
                 try:
                     w_view.Orient(new_m)
                     orient_success = True
@@ -1860,37 +1933,16 @@ def snap_work_view_closest(work_part, w_view, uf_session=None):
         except Exception:
             pass
 
-    # 方案 3 (三層防護)：若 Orient 矩陣不可用，透過基準 Canned View + RotateView 精確旋轉 45°
-    if not orient_success and uf_session is not None and hasattr(uf_session, "View"):
-        try:
-            base_canned_name = best_cand.get("base_canned") or fallback_ortho_name
-            canned_enum = getattr(NXOpen.View.Canned, base_canned_name, None)
-            if canned_enum is not None:
-                w_view.Orient(canned_enum, scale_adj)
-                v_tag = getattr(w_view, "Tag", None)
-                if v_tag:
-                    if "z_rot" in best_cand:
-                        uf_session.View.RotateView(v_tag, 6, best_cand["z_rot"]) # 6 = UF_VIEW_MODEL_Z
-                    elif "x_rot" in best_cand:
-                        uf_session.View.RotateView(v_tag, 1, best_cand["x_rot"]) # 1 = UF_VIEW_VIEW_X
-                    elif "combo_rot" in best_cand:
-                        uf_session.View.RotateView(v_tag, 6, best_cand["combo_rot"][0])
-                        uf_session.View.RotateView(v_tag, 1, best_cand["combo_rot"][1])
-                orient_success = True
-        except Exception:
-            pass
-
     # 方案 4 (終極備援)：安全回退至最接近的 6 大正交 Canned View
     if not orient_success:
-        try:
-            canned_enum = getattr(NXOpen.View.Canned, fallback_ortho_name, None) or getattr(NXOpen.View.Canned, "Top", None)
-            if canned_enum:
-                w_view.Orient(canned_enum, scale_adj)
-                orient_success = True
-        except Exception:
-            pass
+        orient_success = _safe_orient_canned_view(w_view, fallback_ortho_name) or _safe_orient_canned_view(w_view, "Top")
 
-    # 強制視圖重繪刷新
+    # 強制視圖重繪刷新 (全面調用所有視圖更新 API，保證畫面 100% 即時重繪反應)
+    try:
+        if v_tag and uf_session is not None and hasattr(uf_session, "View") and hasattr(uf_session.View, "UpdateView"):
+            uf_session.View.UpdateView(v_tag)
+    except Exception:
+        pass
     try:
         if hasattr(w_view, "Update"):
             w_view.Update()
@@ -2002,14 +2054,21 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                 os.remove(req_file)
                             except Exception:
                                 pass
-                            snap_work_view_closest(work_part, w_view, uf_session)
+                            try:
+                                snap_work_view_closest(work_part, w_view, uf_session)
+                            except Exception as ex_snap:
+                                if listing:
+                                    listing.WriteLine(f"  [擺正例外防護] {str(ex_snap)}")
 
                         # 2. 視角擺正機制 B：硬體層即時偵測鍵盤 F8 鍵 (VK_F8 = 0x77)
                         # 無論焦點在 NX 主視窗、3D 繪圖區或小工具，只要按 F8 均保證 100% 原生擺正，且不碰訊息隊列
                         try:
                             if user32.GetAsyncKeyState(0x77) & 0x8000:
-                                snap_work_view_closest(work_part, w_view, uf_session)
-                                time.sleep(0.12) # 消除按鍵重複觸發
+                                try:
+                                    snap_work_view_closest(work_part, w_view, uf_session)
+                                except Exception:
+                                    pass
+                                time.sleep(0.15) # 消除按鍵重複觸發
                         except Exception:
                             pass
 

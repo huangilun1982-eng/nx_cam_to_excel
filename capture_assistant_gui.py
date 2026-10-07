@@ -58,24 +58,19 @@ def main():
     exit_code = [2] # 預設 2 為略過或取消
 
     def trigger_f8_snap(event=None):
-        """觸發 NX 畫面擺正 (F8 貼齊正交視圖)"""
-        # 1. 寫入跨進程旗標，直接由 NX 主進程底層執行原生視圖擺正 (100% 絕對生效)
+        """觸發 NX 畫面擺正 (F8 貼齊 45° 工藝視向)"""
+        # 寫入跨進程旗標，由 NX 主進程底層原生執行 45° 視圖吸附擺正 (100% 絕對生效且不干擾視窗)
         if req_file:
             try:
                 with open(req_file, "w") as f:
                     f.write("snap")
             except Exception:
                 pass
-
-        # 2. 備援：嘗試將焦點歸還給 NX 主視窗並模擬發送按鍵
-        if parent_hwnd and user32.IsWindow(parent_hwnd):
-            try:
-                user32.SetForegroundWindow(parent_hwnd)
-            except Exception:
-                pass
+        # 提供即時視覺反饋，讓使用者明確感知按鈕已觸發且小工具不關閉
         try:
-            user32.keybd_event(0x77, 0, 0, 0)
-            user32.keybd_event(0x77, 0, 2, 0)
+            if 'btn_snap' in locals() or 'btn_snap' in globals():
+                btn_snap.config(text=" 📐 視角已吸附 ", bg="#004D40")
+                root.after(400, lambda: btn_snap.config(text=" 📐 45° 擺正 (F8) ", bg="#008080"))
         except Exception:
             pass
 
