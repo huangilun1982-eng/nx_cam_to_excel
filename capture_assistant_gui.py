@@ -85,6 +85,7 @@ def main():
     # 圖層管理視窗
     layer_win_ref = [None]
     layer_vars = {}
+    work_layer_set = set()
 
     def notify_layer_changes():
         """收集勾選狀態並通知主進程即時刷新 NX 視圖"""
@@ -108,7 +109,7 @@ def main():
         top = tk.Toplevel(root)
         top.title("🗂 圖層可見性管理")
         top.attributes("-topmost", True)
-        top.geometry(f"310x380+{pos_x - 320}+{pos_y}")
+        top.geometry(f"340x440+{max(10, pos_x - 350)}+{pos_y}")
         top.configure(bg="#F9FAFB")
         layer_win_ref[0] = top
 
@@ -120,16 +121,19 @@ def main():
         lbl.pack(side=tk.LEFT)
 
         def set_all(val):
-            for v in layer_vars.values():
+            for l_k, v in layer_vars.items():
+                # 若為工作圖層 (通常為 1)，且要隱藏，則保留打勾
+                if not val and l_k in work_layer_set:
+                    continue
                 v.set(val)
             notify_layer_changes()
 
-        btn_all = tk.Button(f_top, text="全顯", font=("Microsoft JhengHei", 8), bg="#E5E7EB", relief=tk.FLAT, command=lambda: set_all(True), padx=6)
-        btn_all.pack(side=tk.RIGHT, padx=2)
-        btn_none = tk.Button(f_top, text="全隱", font=("Microsoft JhengHei", 8), bg="#E5E7EB", relief=tk.FLAT, command=lambda: set_all(False), padx=6)
+        btn_none = tk.Button(f_top, text="全隱", font=("Microsoft JhengHei", 8), bg="#E5E7EB", relief=tk.FLAT, command=lambda: set_all(False), padx=8)
         btn_none.pack(side=tk.RIGHT, padx=2)
+        btn_all = tk.Button(f_top, text="全顯", font=("Microsoft JhengHei", 8), bg="#E5E7EB", relief=tk.FLAT, command=lambda: set_all(True), padx=8)
+        btn_all.pack(side=tk.RIGHT, padx=2)
 
-        # 滾動區域
+        # 滾動區域 (自適應寬度 + 滾動條 + 滾輪支援)
         f_container = tk.Frame(top, bg="#FFFFFF", bd=1, relief=tk.SOLID)
         f_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
 
@@ -137,12 +141,26 @@ def main():
         scrollbar = tk.Scrollbar(f_container, orient="vertical", command=canvas.yview)
         scroll_frame = tk.Frame(canvas, bg="#FFFFFF")
 
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        win_id = canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
 
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        def on_canvas_configure(e):
+            canvas.itemconfig(win_id, width=e.width)
+        canvas.bind("<Configure>", on_canvas_configure)
+
+        def on_frame_configure(e):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+        scroll_frame.bind("<Configure>", on_frame_configure)
+
+        def on_mousewheel(event):
+            try:
+                canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+            except Exception:
+                pass
+        top.bind("<MouseWheel>", on_mousewheel)
+
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         # 讀取圖層資訊
         raw_layers = []
@@ -153,31 +171,44 @@ def main():
             except Exception:
                 pass
 
-        layer_vars.clear()
+        # 若讀取為空，給予常用加工圖層保底清單
         if not raw_layers:
-            tk.Label(scroll_frame, text="（未偵測到自訂物件圖層）", font=("Microsoft JhengHei", 9), bg="#FFFFFF", fg="#888888").pack(pady=20, padx=20)
-        else:
-            for item in raw_layers:
-                l_num = item["layer"]
-                l_name = item.get("name", "")
-                l_vis = item.get("visible", True)
-                l_cnt = item.get("count", 0)
+            default_layers = [1, 2, 3, 10, 20, 30, 50, 100, 200]
+            raw_layers = [
+                {
+                    "layer": dl,
+                    "name": f"圖層 {dl}" + (" (工作圖層)" if dl == 1 else (" (素材)" if dl in (10, 20) else "")),
+                    "count": 0,
+                    "visible": True if dl == 1 else False,
+                    "is_work": (dl == 1)
+                }
+                for dl in default_layers
+            ]
 
-                var = tk.BooleanVar(value=l_vis)
-                layer_vars[l_num] = var
+        layer_vars.clear()
+        work_layer_set.clear()
+        for item in raw_layers:
+            l_num = item["layer"]
+            l_name = item.get("name", f"圖層 {l_num}")
+            l_vis = item.get("visible", True)
+            l_cnt = item.get("count", 0)
+            is_wk = item.get("is_work", (l_num == 1))
+            if is_wk:
+                work_layer_set.add(l_num)
 
-                desc = f"圖層 {l_num}"
-                if l_name and l_name != desc:
-                    desc += f" ({l_name})"
-                if l_cnt > 0:
-                    desc += f" [{l_cnt}件]"
+            var = tk.BooleanVar(value=l_vis)
+            layer_vars[l_num] = var
 
-                cb = tk.Checkbutton(
-                    scroll_frame, text=desc, variable=var,
-                    font=("Microsoft JhengHei", 9), bg="#FFFFFF", activebackground="#FFFFFF",
-                    command=notify_layer_changes, anchor="w"
-                )
-                cb.pack(fill=tk.X, padx=8, pady=2)
+            desc = l_name
+            if l_cnt > 0:
+                desc += f"  [{l_cnt}件]"
+
+            cb = tk.Checkbutton(
+                scroll_frame, text=desc, variable=var,
+                font=("Microsoft JhengHei", 9), bg="#FFFFFF", activebackground="#F0F4F8",
+                command=notify_layer_changes, anchor="w", padx=6, pady=3
+            )
+            cb.pack(fill=tk.X, expand=True)
 
     def on_confirm():
         exit_code[0] = 0 # 0 代表確認拍照

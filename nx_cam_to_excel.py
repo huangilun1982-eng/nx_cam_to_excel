@@ -1704,241 +1704,200 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
     except Exception:
         pass
 
-def get_standard_craft_orientations():
+def calculate_closest_orthogonal_matrix(cur_matrix):
     """
-    定義 NX 原生 6 大標準工藝正交面 (100% 完全對齊 NX 原生 F8 Orient to Closest 行為)
+    底層三維幾何正交化吸附演算法 (Snap to Closest Orthogonal View)
+    輸入: 9 維視圖矩陣 (Xx, Xy, Xz, Yx, Yy, Yz, Zx, Zy, Zz)
+    輸出: 最接近的正交視角矩陣，100% 保持螢幕向上向量 (Up Vector)，絕無翻轉顛倒！
     """
-    return [
-        {"name": "Top (正頂俯視)", "vec": (0.0, 0.0, 1.0), "canned": "Top"},
-        {"name": "Bottom (正底仰視)", "vec": (0.0, 0.0, -1.0), "canned": "Bottom"},
-        {"name": "Front (正前視)", "vec": (0.0, -1.0, 0.0), "canned": "Front"},
-        {"name": "Back (正後視)", "vec": (0.0, 1.0, 0.0), "canned": "Back"},
-        {"name": "Right (正右視)", "vec": (1.0, 0.0, 0.0), "canned": "Right"},
-        {"name": "Left (正左視)", "vec": (-1.0, 0.0, 0.0), "canned": "Left"}
+    m = cur_matrix
+    cur_z = [float(m[6]), float(m[7]), float(m[8])]
+    cur_y = [float(m[3]), float(m[4]), float(m[5])]
+
+    # 6 大基準正交軸向
+    axes = [
+        (0.0, 0.0, 1.0),
+        (0.0, 0.0, -1.0),
+        (0.0, 1.0, 0.0),
+        (0.0, -1.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (-1.0, 0.0, 0.0)
     ]
 
-def _safe_orient_canned_view(w_view, canned_name):
-    """
-    安全貼齊 NX 原生 Canned View (相容各版本 NX 之 ScaleAdjustment 參數簽章)
-    """
-    if not w_view or not canned_name:
-        return False
-    try:
-        import NXOpen
-        canned_enum = getattr(NXOpen.View.Canned, canned_name, None)
-        if canned_enum is None:
-            return False
-        scale_fit = getattr(NXOpen.View.ScaleAdjustment, "Fit", None)
-        if scale_fit is not None:
-            try:
-                w_view.Orient(canned_enum, scale_fit)
-                return True
-            except Exception:
-                pass
-        try:
-            w_view.Orient(canned_enum)
-            return True
-        except Exception:
-            pass
-    except Exception:
-        pass
-    return False
+    def dot(v1, v2):
+        return v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]
+
+    # 1. 尋找與視線法向量 cur_z 最接近 (dot product 最大) 之目標軸向
+    best_z = max(axes, key=lambda a: dot(cur_z, a))
+
+    # 2. 尋找與當前向上向量 cur_y 最接近、且與 best_z 正交之目標向上方向 (Up Vector)
+    perp_axes = [a for a in axes if abs(dot(a, best_z)) < 1e-5]
+    best_y = max(perp_axes, key=lambda a: dot(cur_y, a))
+
+    # 3. 叉積計算水平向右向量 X_target = Y_target x Z_target
+    best_x = (
+        best_y[1]*best_z[2] - best_y[2]*best_z[1],
+        best_y[2]*best_z[0] - best_y[0]*best_z[2],
+        best_y[0]*best_z[1] - best_y[1]*best_z[0]
+    )
+
+    return (
+        best_x[0], best_x[1], best_x[2],
+        best_y[0], best_y[1], best_y[2],
+        best_z[0], best_z[1], best_z[2]
+    )
 
 def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
     """
     底層原生視圖擺正核心 (Snap to Closest Standard View / F8 功能)：
-    1. 雙重途徑可靠取得當前活動工作視圖 Tag 與即時 3x3 視圖矩陣 (AskWorkView / AskViewMatrix)
-    2. 分析視線法向量 (View Normal)，在 NX 8 大標準工藝視向 (6 正交面 + 2 等角向) 中精準匹配最接近之方向
-    3. 調用 NX 原生 Canned View 進行 100% 絕對穩定之原生定向 (Top, Front, Right, Isometric 等)
-    4. 即時觸發視圖更新 (UpdateView / Update) 與顯存再生 (RegenerateDisplay)！
+    1. 讀取當前視圖即時矩陣 work_view.Matrix
+    2. 調用 calculate_closest_orthogonal_matrix 精確吸附至最接近的正交基準坐標系
+    3. 調用 work_view.Orient(target_matrix) 原生定向：保持當前縮放與畫面中心，零翻轉！
+    4. 即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
     """
-    v_tag = None
-    if uf_session is not None and hasattr(uf_session, "View"):
-        try:
-            if hasattr(uf_session.View, "AskWorkView"):
-                v_tag = uf_session.View.AskWorkView()
-        except Exception:
-            v_tag = None
-
     if work_part is None:
         try:
+            import NXOpen
             the_sess = NXOpen.Session.GetSession()
-            work_part = the_sess.Parts.Work
+            work_part = getattr(the_sess.Parts, "Work", None)
+            if work_part is None:
+                work_part = getattr(the_sess.Parts, "Display", None)
         except Exception:
             pass
 
     if w_view is None and work_part is not None and hasattr(work_part, "Views"):
         try:
-            fresh_v = work_part.Views.WorkView
-            if fresh_v is not None:
-                w_view = fresh_v
-                if not v_tag and hasattr(w_view, "Tag"):
-                    v_tag = w_view.Tag
+            w_view = work_part.Views.WorkView
         except Exception:
             pass
 
-    if not v_tag and w_view is not None and hasattr(w_view, "Tag"):
-        try:
-            v_tag = w_view.Tag
-        except Exception:
-            pass
-
-    if w_view is None and not v_tag:
+    if w_view is None or not hasattr(w_view, "Matrix"):
         return False
 
-    orientations = get_standard_craft_orientations()
-    best_cand = orientations[0] # 預設 Top
+    try:
+        m = w_view.Matrix
+        cur_mat = (m.Xx, m.Xy, m.Xz, m.Yx, m.Yy, m.Yz, m.Zx, m.Zy, m.Zz)
+        target_tuple = calculate_closest_orthogonal_matrix(cur_mat)
 
-    # 1. 取得當前即時視圖矩陣 (優先向 UFSession 查詢，備援從 w_view.Matrix 獲取)
-    cur_mat = None
-    if uf_session is not None and hasattr(uf_session, "View") and v_tag:
-        try:
-            cur_mat = uf_session.View.AskViewMatrix(v_tag)
-        except Exception:
-            cur_mat = None
+        # 構造目標 Matrix3x3
+        m_target = w_view.Matrix
+        m_target.Xx, m_target.Xy, m_target.Xz = target_tuple[0], target_tuple[1], target_tuple[2]
+        m_target.Yx, m_target.Yy, m_target.Yz = target_tuple[3], target_tuple[4], target_tuple[5]
+        m_target.Zx, m_target.Zy, m_target.Zz = target_tuple[6], target_tuple[7], target_tuple[8]
 
-    if (not cur_mat or len(cur_mat) < 9) and w_view is not None and hasattr(w_view, "Matrix"):
+        # 執行原生矩陣定向
+        w_view.Orient(m_target)
+
+        # 全面強制顯存再生與視圖刷新
         try:
-            m = w_view.Matrix
-            cur_mat = (m.Xx, m.Xy, m.Xz, m.Yx, m.Yy, m.Yz, m.Zx, m.Zy, m.Zz)
+            if hasattr(w_view, "Tag") and uf_session is not None and hasattr(uf_session, "View"):
+                uf_session.View.UpdateView(w_view.Tag)
         except Exception:
             pass
-
-    # 2. 分析視線法向量並匹配最接近的標準工藝視向
-    if cur_mat and len(cur_mat) >= 9:
         try:
-            vx, vy, vz = float(cur_mat[6]), float(cur_mat[7]), float(cur_mat[8])
-            v_mag = (vx*vx + vy*vy + vz*vz) ** 0.5
-            if v_mag > 1e-6:
-                vx, vy, vz = vx/v_mag, vy/v_mag, vz/v_mag
-            else:
-                vx, vy, vz = 0.0, 0.0, 1.0
-
-            # 尋找 8 個標準方向中夾角最小 (Dot Product 最大) 者
-            best_dot = -999.0
-            for cand in orientations:
-                d = vx*cand["vec"][0] + vy*cand["vec"][1] + vz*cand["vec"][2]
-                if d > best_dot:
-                    best_dot = d
-                    best_cand = cand
-        except Exception:
-            pass
-
-    if listing:
-        try:
-            listing.WriteLine(f"  [📐 視角擺正] 自動吸附至最接近標準視向 ➔ 【{best_cand['name']}】")
-        except Exception:
-            pass
-
-    # 3. 調用 NX 原生 Canned View 進行 100% 絕對穩定之原生定向
-    orient_success = False
-    if w_view is not None and "canned" in best_cand:
-        orient_success = _safe_orient_canned_view(w_view, best_cand["canned"])
-
-    # 備援保底：若特定視圖失敗，回退至 Top
-    if not orient_success and w_view is not None:
-        orient_success = _safe_orient_canned_view(w_view, "Top")
-
-    # 4. 全面強制視圖重繪刷新 (保證 3D 繪圖區 100% 即時反應)
-    try:
-        if v_tag and uf_session is not None and hasattr(uf_session, "View") and hasattr(uf_session.View, "UpdateView"):
-            uf_session.View.UpdateView(v_tag)
-    except Exception:
-        pass
-    try:
-        if w_view is not None and hasattr(w_view, "Update"):
-            w_view.Update()
-    except Exception:
-        pass
-    try:
-        if uf_session is not None and hasattr(uf_session, "Disp"):
-            if hasattr(uf_session.Disp, "RegenerateDisplay"):
+            if uf_session is not None and hasattr(uf_session, "Disp"):
                 uf_session.Disp.RegenerateDisplay()
-            if hasattr(uf_session.Disp, "Refresh"):
                 uf_session.Disp.Refresh()
-    except Exception:
-        pass
+        except Exception:
+            pass
 
-    return orient_success
+        if listing:
+            try:
+                listing.WriteLine("  [📐 視角擺正] 已精確吸附至最近正交視角 (保持畫面中心與縮放，無翻轉)。")
+            except Exception:
+                pass
+        return True
+    except Exception as ex:
+        if listing:
+            try:
+                listing.WriteLine(f"  [📐 視角擺正例外] {str(ex)}")
+            except Exception:
+                pass
+        return False
 
 def get_part_layer_info(work_part, uf_session=None):
     """
-    掃描當前零件中有物件的圖層資訊清單
-    回傳: list of dict [{"layer": int, "name": str, "count": int, "visible": bool}]
+    掃描當前零件中包含幾何物件或啟用的圖層資訊清單
+    回傳: list of dict [{"layer": int, "name": str, "count": int, "visible": bool, "is_work": bool}]
     """
     layers_data = []
+
+    # 若 work_part 為 None，自動向 Session 取得 Work 或 Display Part
     if work_part is None:
-        return layers_data
-
-    # 途徑 1：優先使用 UFSession 快速高效掃描 1~256 圖層
-    if uf_session is not None and hasattr(uf_session, "Layer"):
         try:
-            for l_num in range(1, 257):
-                status = 4 # 預設隱藏
-                try:
-                    status = uf_session.Layer.AskStatus(l_num)
-                except Exception:
-                    continue
-
-                # 檢查是否有物件 (CycleByLayer 尋找首個物件)
-                has_obj = False
-                obj_count = 0
-                try:
-                    obj = uf_session.Layer.CycleByLayer(l_num, 0)
-                    while obj != 0:
-                        has_obj = True
-                        obj_count += 1
-                        if obj_count >= 100:
-                            break
-                        obj = uf_session.Layer.CycleByLayer(l_num, obj)
-                except Exception:
-                    pass
-
-                # 若該圖層有物件，或者狀態非隱藏，納入清單
-                if has_obj or status in (1, 2, 3):
-                    is_vis = (status != 4) # 4 為 UF_LAYER_INACTIVE_LAYER (Hidden)
-                    cat_name = ""
-                    try:
-                        cat_name = uf_session.Layer.AskCategoryName(l_num)
-                    except Exception:
-                        pass
-
-                    layers_data.append({
-                        "layer": l_num,
-                        "name": cat_name if cat_name else f"圖層 {l_num}",
-                        "count": obj_count,
-                        "visible": is_vis
-                    })
-            if layers_data:
-                return layers_data
+            import NXOpen
+            the_sess = NXOpen.Session.GetSession()
+            work_part = getattr(the_sess.Parts, "Work", None)
+            if work_part is None:
+                work_part = getattr(the_sess.Parts, "Display", None)
         except Exception:
             pass
 
-    # 途徑 2 (備援)：透過 NXOpen.LayerManager 掃描
-    try:
-        import NXOpen
-        for l_num in range(1, 257):
-            try:
-                state = work_part.Layers.GetState(l_num)
-                objs = work_part.Layers.GetAllObjectsOnLayer(l_num)
-                if (objs and len(objs) > 0) or state != NXOpen.Layer.State.Hidden:
-                    is_vis = (state != NXOpen.Layer.State.Hidden)
+    # 1. 優先透過 UFSession 掃描 1~256 圖層狀態與物件
+    if uf_session is not None and hasattr(uf_session, "Layer"):
+        try:
+            for l_num in range(1, 257):
+                try:
+                    st = uf_session.Layer.AskStatus(l_num)
+                except Exception:
+                    st = 4
+
+                # 快速查詢該圖層是否有物件
+                obj_count = 0
+                try:
+                    obj_tag = uf_session.Layer.CycleByLayer(l_num, 0)
+                    while obj_tag != 0:
+                        obj_count += 1
+                        if obj_count >= 50:
+                            break
+                        obj_tag = uf_session.Layer.CycleByLayer(l_num, obj_tag)
+                except Exception:
+                    pass
+
+                # 納入清單條件：
+                # (1) 該圖層有幾何物件
+                # (2) 目前處於非隱藏狀態 (工作層 1 或可選層 2 或可見層 3)
+                # (3) 常見工藝核心圖層 (1, 10, 20, 50, 100, 200) 即使為 0 件亦呈現
+                is_core = l_num in (1, 10, 20, 50, 100, 200)
+                if obj_count > 0 or st in (1, 2, 3) or is_core:
+                    is_vis = (st != 4)
+                    name_tag = f"圖層 {l_num}"
+                    if st == 1:
+                        name_tag += " (工作圖層)"
+                    elif l_num == 1:
+                        name_tag += " (工件/主要)"
+                    elif l_num in (10, 20):
+                        name_tag += " (素材/毛胚)"
+                    elif l_num in (50, 100):
+                        name_tag += " (夾具/壓板)"
+
                     layers_data.append({
                         "layer": l_num,
-                        "name": f"圖層 {l_num}",
-                        "count": len(objs) if objs else 0,
-                        "visible": is_vis
+                        "name": name_tag,
+                        "count": obj_count,
+                        "visible": is_vis,
+                        "is_work": (st == 1)
                     })
-            except Exception:
-                continue
-    except Exception:
-        pass
+        except Exception:
+            pass
+
+    # 2. 保底機制：若仍為空，提供預設加工標準圖層清單供開關
+    if not layers_data:
+        default_layers = [1, 2, 3, 10, 20, 30, 50, 100, 200]
+        for dl in default_layers:
+            layers_data.append({
+                "layer": dl,
+                "name": f"圖層 {dl}" + (" (工作圖層)" if dl == 1 else (" (素材)" if dl in (10, 20) else "")),
+                "count": 0,
+                "visible": True if dl == 1 else False,
+                "is_work": (dl == 1)
+            })
 
     return layers_data
 
 def apply_part_layer_states(work_part, uf_session, layer_states):
     """
-    套用圖層可見性變更字典 {layer_id: bool}
+    即時套用圖層可見性變更字典 {layer_id: bool}
     """
     if not layer_states:
         return False
