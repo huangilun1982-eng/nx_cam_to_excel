@@ -1706,7 +1706,7 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
 
 def get_standard_craft_orientations():
     """
-    定義 NX 原生 8 大標準工藝視向 (6 大正交面 + 2 個等角/軸測向)
+    定義 NX 原生 6 大標準工藝正交面 (100% 完全對齊 NX 原生 F8 Orient to Closest 行為)
     """
     return [
         {"name": "Top (正頂俯視)", "vec": (0.0, 0.0, 1.0), "canned": "Top"},
@@ -1714,9 +1714,7 @@ def get_standard_craft_orientations():
         {"name": "Front (正前視)", "vec": (0.0, -1.0, 0.0), "canned": "Front"},
         {"name": "Back (正後視)", "vec": (0.0, 1.0, 0.0), "canned": "Back"},
         {"name": "Right (正右視)", "vec": (1.0, 0.0, 0.0), "canned": "Right"},
-        {"name": "Left (正左視)", "vec": (-1.0, 0.0, 0.0), "canned": "Left"},
-        {"name": "Isometric (俯視正等角)", "vec": (0.57735027, -0.57735027, 0.57735027), "canned": "Isometric"},
-        {"name": "Trimetric (俯視軸測向)", "vec": (0.57735027, 0.57735027, 0.57735027), "canned": "Trimetric"}
+        {"name": "Left (正左視)", "vec": (-1.0, 0.0, 0.0), "canned": "Left"}
     ]
 
 def _safe_orient_canned_view(w_view, canned_name):
@@ -1863,16 +1861,154 @@ def snap_work_view_closest(work_part, w_view, uf_session=None, listing=None):
 
     return orient_success
 
+def get_part_layer_info(work_part, uf_session=None):
+    """
+    掃描當前零件中有物件的圖層資訊清單
+    回傳: list of dict [{"layer": int, "name": str, "count": int, "visible": bool}]
+    """
+    layers_data = []
+    if work_part is None:
+        return layers_data
+
+    # 途徑 1：優先使用 UFSession 快速高效掃描 1~256 圖層
+    if uf_session is not None and hasattr(uf_session, "Layer"):
+        try:
+            for l_num in range(1, 257):
+                status = 4 # 預設隱藏
+                try:
+                    status = uf_session.Layer.AskStatus(l_num)
+                except Exception:
+                    continue
+
+                # 檢查是否有物件 (CycleByLayer 尋找首個物件)
+                has_obj = False
+                obj_count = 0
+                try:
+                    obj = uf_session.Layer.CycleByLayer(l_num, 0)
+                    while obj != 0:
+                        has_obj = True
+                        obj_count += 1
+                        if obj_count >= 100:
+                            break
+                        obj = uf_session.Layer.CycleByLayer(l_num, obj)
+                except Exception:
+                    pass
+
+                # 若該圖層有物件，或者狀態非隱藏，納入清單
+                if has_obj or status in (1, 2, 3):
+                    is_vis = (status != 4) # 4 為 UF_LAYER_INACTIVE_LAYER (Hidden)
+                    cat_name = ""
+                    try:
+                        cat_name = uf_session.Layer.AskCategoryName(l_num)
+                    except Exception:
+                        pass
+
+                    layers_data.append({
+                        "layer": l_num,
+                        "name": cat_name if cat_name else f"圖層 {l_num}",
+                        "count": obj_count,
+                        "visible": is_vis
+                    })
+            if layers_data:
+                return layers_data
+        except Exception:
+            pass
+
+    # 途徑 2 (備援)：透過 NXOpen.LayerManager 掃描
+    try:
+        import NXOpen
+        for l_num in range(1, 257):
+            try:
+                state = work_part.Layers.GetState(l_num)
+                objs = work_part.Layers.GetAllObjectsOnLayer(l_num)
+                if (objs and len(objs) > 0) or state != NXOpen.Layer.State.Hidden:
+                    is_vis = (state != NXOpen.Layer.State.Hidden)
+                    layers_data.append({
+                        "layer": l_num,
+                        "name": f"圖層 {l_num}",
+                        "count": len(objs) if objs else 0,
+                        "visible": is_vis
+                    })
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    return layers_data
+
+def apply_part_layer_states(work_part, uf_session, layer_states):
+    """
+    套用圖層可見性變更字典 {layer_id: bool}
+    """
+    if not layer_states:
+        return False
+    changed = False
+
+    # 途徑 1 (優先 UFSession)
+    if uf_session is not None and hasattr(uf_session, "Layer"):
+        try:
+            for l_str, is_vis in layer_states.items():
+                l_num = int(l_str)
+                # 2 = UF_LAYER_ACTIVE_LAYER (顯示可選), 4 = UF_LAYER_INACTIVE_LAYER (隱藏)
+                new_status = 2 if is_vis else 4
+                try:
+                    cur_status = uf_session.Layer.AskStatus(l_num)
+                    if cur_status == 1 and not is_vis: # 1 為工作圖層，不隱藏
+                        continue
+                    uf_session.Layer.SetStatus(l_num, new_status)
+                    changed = True
+                except Exception:
+                    pass
+            if changed:
+                try:
+                    if hasattr(uf_session, "Disp"):
+                        uf_session.Disp.RegenerateDisplay()
+                        uf_session.Disp.Refresh()
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+
+    # 途徑 2 (備援 NXOpen)
+    try:
+        import NXOpen
+        for l_str, is_vis in layer_states.items():
+            l_num = int(l_str)
+            try:
+                cur_state = work_part.Layers.GetState(l_num)
+                if cur_state == NXOpen.Layer.State.Work and not is_vis:
+                    continue
+                new_state = NXOpen.Layer.State.Selectable if is_vis else NXOpen.Layer.State.Hidden
+                work_part.Layers.SetState(l_num, new_state)
+                changed = True
+            except Exception:
+                pass
+        if changed:
+            try:
+                if uf_session is not None and hasattr(uf_session, "Disp"):
+                    uf_session.Disp.RegenerateDisplay()
+                    uf_session.Disp.Refresh()
+            except Exception:
+                pass
+            return True
+    except Exception:
+        pass
+
+    return changed
+
 def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, listing=None, work_part=None):
     """
-    方案二：【無黑窗精緻置頂拍照精靈 + NX 視圖流暢旋轉 + 原生 F8 視角擺正】
+    方案二：【無黑窗精緻置頂拍照精靈 + NX 視圖流暢旋轉 + 原生 F8 視角擺正 + 即時圖層開關】
     技術核心：
     1. 採用跨機器直譯器探測與純淨環境變數隔離，徹底消除黑窗與直譯器崩潰。
     2. 採用 Popen 非阻塞進程 + Windows 原生訊息泵 (PeekMessage / DispatchMessage)，
        即時泵出滑鼠中鍵與視圖重繪訊息，讓 NX 主視窗在小工具懸浮時 100% 自由流暢旋轉縮放！
     3. 支援【雙重 F8 視角擺正】：
-       - 小工具點選【📐 擺正 (F8)】或小工具內按 F8：透過跨進程旗標通知主進程原生執行 snap_work_view_closest
-       - NX 主視窗內按 F8：訊息泵即時攔截 WM_KEYDOWN(VK_F8) 直接執行原生擺正！
+       - 小工具點選【📐 視角擺正 (F8)】或小工具內按 F8：透過跨進程旗標通知主進程原生執行 snap_work_view_closest
+       - NX 主視窗內按 F8：即時偵測 VK_F8 直接執行原生擺正，吸附角度與 NX 原生 100% 完全一致！
+    4. 支援【即時圖層可見性管理】：
+       - 小工具內建【🗂 圖層控制】面板，勾選即時切換工件、素材、夾具圖層，即時刷新 3D 畫面！
     """
     if not stages:
         return {}
@@ -1910,6 +2046,7 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
             import ctypes
             from ctypes import wintypes
             import time
+            import json
 
             user32 = ctypes.windll.user32
             msg = wintypes.MSG()
@@ -1926,6 +2063,19 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                     except Exception:
                         pass
 
+                # 圖層資訊通訊檔案
+                layer_info_file = os.path.join(temp_dir, f"_layer_info_{s_idx}.json")
+                layer_apply_file = os.path.join(temp_dir, f"_layer_apply_{s_idx}.json")
+                layer_flag_file = os.path.join(temp_dir, f"_layer_changed_{s_idx}.flag")
+
+                # 預先掃描當前圖層資訊並寫入 JSON
+                try:
+                    layer_data = get_part_layer_info(work_part, uf_session)
+                    with open(layer_info_file, "w", encoding="utf-8") as lf:
+                        json.dump(layer_data, lf, ensure_ascii=False)
+                except Exception:
+                    pass
+
                 nx_hwnd = user32.GetForegroundWindow()
                 cmd = list(interpreter_cmd) + [
                     assistant_script,
@@ -1933,11 +2083,14 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                     "--index", str(s_idx + 1),
                     "--total", str(total_stages),
                     "--parent-hwnd", str(nx_hwnd),
-                    "--req-file", req_file
+                    "--req-file", req_file,
+                    "--layer-file", layer_info_file,
+                    "--layer-apply-file", layer_apply_file,
+                    "--layer-flag-file", layer_flag_file
                 ]
 
                 if listing:
-                    listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正)...")
+                    listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正與圖層控制)...")
 
                 proc = None
                 ret_code = -1
@@ -1976,7 +2129,24 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                         except Exception:
                             pass
 
-                        # 3. 滑鼠旋轉與畫面重繪：精確派發當前執行緒之滑鼠互動 (0x0200~0x020E) 與重繪訊息 (WM_PAINT 0x000F)
+                        # 3. 圖層可見性即時切換機制：檢查來自小工具的圖層開關變更請求
+                        if os.path.exists(layer_flag_file):
+                            try:
+                                os.remove(layer_flag_file)
+                            except Exception:
+                                pass
+                            if os.path.exists(layer_apply_file):
+                                try:
+                                    with open(layer_apply_file, "r", encoding="utf-8") as lf:
+                                        layer_dict = json.load(lf)
+                                    apply_part_layer_states(work_part, uf_session, layer_dict)
+                                    if listing:
+                                        listing.WriteLine(f"  [🗂 圖層控制] 圖層可見性已即時更新並刷新 3D 畫面。")
+                                except Exception as ex_layer:
+                                    if listing:
+                                        listing.WriteLine(f"  [🗂 圖層控制例外] {str(ex_layer)}")
+
+                        # 4. 滑鼠旋轉與畫面重繪：精確派發當前執行緒之滑鼠互動 (0x0200~0x020E) 與重繪訊息 (WM_PAINT 0x000F)
                         # 嚴格限定訊息類型，絕不碰觸 Qt / QtWebEngine 私有 IPC 訊息 (0x8000+ 或 WM_USER)，確保記憶體穩定零洩漏！
                         while user32.PeekMessageW(ctypes.byref(msg), 0, 0x0200, 0x020E, PM_REMOVE):
                             user32.DispatchMessageW(ctypes.byref(msg))
@@ -2006,12 +2176,13 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                         except Exception:
                             pass
 
-                # 清理旗標檔案
-                if os.path.exists(req_file):
-                    try:
-                        os.remove(req_file)
-                    except Exception:
-                        pass
+                # 清理旗標與圖層暫存檔案
+                for f_temp in [req_file, layer_info_file, layer_apply_file, layer_flag_file]:
+                    if os.path.exists(f_temp):
+                        try:
+                            os.remove(f_temp)
+                        except Exception:
+                            pass
 
                 # 狀態代碼精確分流判定：
                 if ret_code == 0:
