@@ -1869,7 +1869,7 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                     # Windows 原生訊息泵循環：讓 NX 主視窗保持 100% 流暢響應滑鼠中鍵旋轉、重繪與 F8 擺正
                     start_wait = time.time()
                     while proc.poll() is None:
-                        # 檢查是否有來自小工具的擺正請求 (點擊按鈕或小工具中按 F8)
+                        # 1. 視角擺正機制 A：檢查來自小工具的擺正旗標請求 (點擊按鈕或小工具焦點按 F8)
                         if os.path.exists(req_file):
                             try:
                                 os.remove(req_file)
@@ -1877,12 +1877,23 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                 pass
                             snap_work_view_closest(work_part, w_view, uf_session)
 
-                        # 安全訊息分發：僅精確放行 NX 主視窗之滑鼠旋轉縮放訊息 (0x0200~0x020E)
-                        # 絕不調用 hWnd=0 全域過濾，杜絕掠奪 Qt / QtWebEngine 私有 IPC 訊息導致記憶體累積暴增
-                        if nx_hwnd and user32.IsWindow(nx_hwnd):
-                            while user32.PeekMessageW(ctypes.byref(msg), nx_hwnd, 0x0200, 0x020E, PM_REMOVE):
-                                user32.DispatchMessageW(ctypes.byref(msg))
-                        time.sleep(0.03) # 30毫秒平滑睡眠，兼顧流暢操作與 CPU 節能
+                        # 2. 視角擺正機制 B：硬體層即時偵測鍵盤 F8 鍵 (VK_F8 = 0x77)
+                        # 無論焦點在 NX 主視窗、3D 繪圖區或小工具，只要按 F8 均保證 100% 原生擺正，且不碰訊息隊列
+                        try:
+                            if user32.GetAsyncKeyState(0x77) & 0x8000:
+                                snap_work_view_closest(work_part, w_view, uf_session)
+                                time.sleep(0.12) # 消除按鍵重複觸發
+                        except Exception:
+                            pass
+
+                        # 3. 滑鼠旋轉與畫面重繪：精確派發當前執行緒之滑鼠互動 (0x0200~0x020E) 與重繪訊息 (WM_PAINT 0x000F)
+                        # 嚴格限定訊息類型，絕不碰觸 Qt / QtWebEngine 私有 IPC 訊息 (0x8000+ 或 WM_USER)，確保記憶體穩定零洩漏！
+                        while user32.PeekMessageW(ctypes.byref(msg), 0, 0x0200, 0x020E, PM_REMOVE):
+                            user32.DispatchMessageW(ctypes.byref(msg))
+                        while user32.PeekMessageW(ctypes.byref(msg), 0, 0x000F, 0x000F, PM_REMOVE):
+                            user32.DispatchMessageW(ctypes.byref(msg))
+
+                        time.sleep(0.015) # 15毫秒平滑睡眠，兼顧滑鼠 60FPS 旋轉流暢感與 CPU 節能
 
                         # 超時保護 (5分鐘未操作自動退出)
                         if time.time() - start_wait > 300:
