@@ -1704,25 +1704,6 @@ def restore_triad_and_wcs(the_session=None, work_part=None, w_view=None, uf_sess
     except Exception:
         pass
 
-def get_nx_standard_canned_views():
-    """
-    定義 NX 原生 6 大標準工藝視向 (完全遵循 NX 官方 Canned View 標準坐標系定義)
-    視線法向向量 (View Normal) 均依 NX 官方標準矩陣精確測量：
-      Top:    ( 0,  0,  1) -> NX 官方固態坐標系 (X 向右, Y 向上)
-      Bottom: ( 0,  0, -1) -> NX 官方固態坐標系 (X 向右, -Y 向上)
-      Front:  ( 0, -1,  0) -> NX 官方固態坐標系 (X 向右, Z 向上)
-      Back:   ( 0,  1,  0) -> NX 官方固態坐標系 (-X 向右, Z 向上)
-      Right:  ( 1,  0,  0) -> NX 官方固態坐標系 (Y 向右, Z 向上)
-      Left:   (-1,  0,  0) -> NX 官方固態坐標系 (-Y 向右, Z 向上)
-    """
-    return [
-        {"name": "Top",    "vec": ( 0.0,  0.0,  1.0), "canned": "Top"},
-        {"name": "Bottom", "vec": ( 0.0,  0.0, -1.0), "canned": "Bottom"},
-        {"name": "Front",  "vec": ( 0.0, -1.0,  0.0), "canned": "Front"},
-        {"name": "Back",   "vec": ( 0.0,  1.0,  0.0), "canned": "Back"},
-        {"name": "Right",  "vec": ( 1.0,  0.0,  0.0), "canned": "Right"},
-        {"name": "Left",   "vec": (-1.0,  0.0,  0.0), "canned": "Left"}
-    ]
 
 def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing=None):
     """
