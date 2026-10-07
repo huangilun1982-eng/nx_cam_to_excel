@@ -1829,29 +1829,68 @@ def get_part_layer_info(work_part, uf_session=None):
 
     return layers_data
 
-def apply_part_layer_states(work_part, uf_session, layer_states):
+def apply_part_layer_states(work_part, uf_session, layer_states, orig_work_layer=None):
     """
     即時套用圖層可見性變更字典 {layer_id: bool}
+    底層原生邏輯：
+    1. 當使用者要求隱藏當前工作圖層時，安全切換暫存工作圖層 (空圖層 256)，確保當前工作圖層亦能 100% 成功關閉！
+    2. 當使用者重新顯示原工作圖層時，安全切回原工作圖層。
+    3. 同步觸發顯存再生 (RegenerateDisplay / Refresh) 確保 3D 繪圖區即時重繪。
     """
     if not layer_states:
         return False
     changed = False
 
+    # 若 work_part 為 None，自動向 Session 取得 Work 或 Display Part
+    if work_part is None:
+        try:
+            import NXOpen
+            the_sess = NXOpen.Session.GetSession()
+            work_part = getattr(the_sess.Parts, "Work", None)
+            if work_part is None:
+                work_part = getattr(the_sess.Parts, "Display", None)
+        except Exception:
+            pass
+
     # 途徑 1 (優先 UFSession)
     if uf_session is not None and hasattr(uf_session, "Layer"):
         try:
+            cur_work = uf_session.Layer.AskWorkLayer()
+            # 檢查當前工作圖層是否被要求隱藏
+            need_hide_cur_work = (layer_states.get(str(cur_work)) is False or layer_states.get(cur_work) is False)
+            if need_hide_cur_work:
+                # 尋找一個無物件之空圖層作為暫存工作圖層 (優先由 256 倒序尋找)
+                temp_work = 256
+                for cand in range(256, 0, -1):
+                    if cand not in [int(k) for k, v in layer_states.items() if v]:
+                        try:
+                            if uf_session.Layer.CycleByLayer(cand, 0) == 0:
+                                temp_work = cand
+                                break
+                        except Exception:
+                            pass
+                uf_session.Layer.SetStatus(temp_work, 1) # 1 = UF_LAYER_WORK_LAYER
+                changed = True
+
             for l_str, is_vis in layer_states.items():
                 l_num = int(l_str)
-                # 2 = UF_LAYER_ACTIVE_LAYER (顯示可選), 4 = UF_LAYER_INACTIVE_LAYER (隱藏)
-                new_status = 2 if is_vis else 4
                 try:
-                    cur_status = uf_session.Layer.AskStatus(l_num)
-                    if cur_status == 1 and not is_vis: # 1 為工作圖層，不隱藏
-                        continue
-                    uf_session.Layer.SetStatus(l_num, new_status)
-                    changed = True
+                    cur_st = uf_session.Layer.AskStatus(l_num)
+                    if is_vis:
+                        # 若為原初始工作圖層且要求可見，且當前工作圖層是臨時空圖層，還原其為工作圖層
+                        if orig_work_layer is not None and l_num == orig_work_layer and uf_session.Layer.AskWorkLayer() != orig_work_layer:
+                            uf_session.Layer.SetStatus(l_num, 1)
+                        elif cur_st != 1:
+                            uf_session.Layer.SetStatus(l_num, 2) # 2 = UF_LAYER_ACTIVE_LAYER (顯示可選)
+                        changed = True
+                    else:
+                        # 隱藏非工作圖層 (若為工作圖層上面已切換)
+                        if cur_st != 1:
+                            uf_session.Layer.SetStatus(l_num, 4) # 4 = UF_LAYER_INACTIVE_LAYER (隱藏)
+                            changed = True
                 except Exception:
                     pass
+
             if changed:
                 try:
                     if hasattr(uf_session, "Disp"):
@@ -1866,25 +1905,36 @@ def apply_part_layer_states(work_part, uf_session, layer_states):
     # 途徑 2 (備援 NXOpen)
     try:
         import NXOpen
-        for l_str, is_vis in layer_states.items():
-            l_num = int(l_str)
-            try:
-                cur_state = work_part.Layers.GetState(l_num)
-                if cur_state == NXOpen.Layer.State.Work and not is_vis:
-                    continue
-                new_state = NXOpen.Layer.State.Selectable if is_vis else NXOpen.Layer.State.Hidden
-                work_part.Layers.SetState(l_num, new_state)
+        if work_part is not None and hasattr(work_part, "Layers"):
+            cur_work = work_part.Layers.WorkLayer
+            need_hide_cur_work = (layer_states.get(str(cur_work)) is False or layer_states.get(cur_work) is False)
+            if need_hide_cur_work:
+                work_part.Layers.WorkLayer = 256
                 changed = True
-            except Exception:
-                pass
-        if changed:
-            try:
-                if uf_session is not None and hasattr(uf_session, "Disp"):
-                    uf_session.Disp.RegenerateDisplay()
-                    uf_session.Disp.Refresh()
-            except Exception:
-                pass
-            return True
+            for l_str, is_vis in layer_states.items():
+                l_num = int(l_str)
+                try:
+                    cur_state = work_part.Layers.GetState(l_num)
+                    if is_vis:
+                        if orig_work_layer is not None and l_num == orig_work_layer and work_part.Layers.WorkLayer != orig_work_layer:
+                            work_part.Layers.WorkLayer = l_num
+                        elif cur_state != NXOpen.Layer.State.Work:
+                            work_part.Layers.SetState(l_num, NXOpen.Layer.State.Selectable)
+                        changed = True
+                    else:
+                        if cur_state != NXOpen.Layer.State.Work:
+                            work_part.Layers.SetState(l_num, NXOpen.Layer.State.Hidden)
+                            changed = True
+                except Exception:
+                    pass
+            if changed:
+                try:
+                    if uf_session is not None and hasattr(uf_session, "Disp"):
+                        uf_session.Disp.RegenerateDisplay()
+                        uf_session.Disp.Refresh()
+                except Exception:
+                    pass
+                return True
     except Exception:
         pass
 
@@ -1919,6 +1969,17 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
 
     orig_view_triad = getattr(w_view, "TriadVisibility", None) if w_view else None
     orig_view_wcs = getattr(w_view, "WcsVisibility", None) if w_view else None
+
+    # 記錄進入拍照精靈前的原始工作圖層與全圖層狀態，確保拍照完全結束後 100% 還原
+    initial_work_layer = None
+    initial_layer_statuses = {}
+    if uf_session is not None and hasattr(uf_session, "Layer"):
+        try:
+            initial_work_layer = uf_session.Layer.AskWorkLayer()
+            for l_idx in range(1, 257):
+                initial_layer_statuses[l_idx] = uf_session.Layer.AskStatus(l_idx)
+        except Exception:
+            pass
 
     # 1. 尋找精緻置頂拍照組件 capture_assistant_gui.py
     the_session = None
@@ -2032,7 +2093,7 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                 try:
                                     with open(layer_apply_file, "r", encoding="utf-8") as lf:
                                         layer_dict = json.load(lf)
-                                    apply_part_layer_states(work_part, uf_session, layer_dict)
+                                    apply_part_layer_states(work_part, uf_session, layer_dict, orig_work_layer=initial_work_layer)
                                     if listing:
                                         listing.WriteLine(f"  [🗂 圖層控制] 圖層可見性已即時更新並刷新 3D 畫面。")
                                 except Exception as ex_layer:
@@ -2164,6 +2225,20 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
         )
     except Exception:
         pass
+
+    # 拍照流程完全結束，100% 恢復進入拍照精靈前的原始工作圖層與所有圖層狀態
+    if uf_session is not None and hasattr(uf_session, "Layer") and initial_layer_statuses:
+        try:
+            if initial_work_layer:
+                uf_session.Layer.SetStatus(initial_work_layer, 1) # 先恢復工作圖層
+            for l_idx, st_val in initial_layer_statuses.items():
+                if l_idx != initial_work_layer:
+                    uf_session.Layer.SetStatus(l_idx, st_val)
+            if hasattr(uf_session, "Disp"):
+                uf_session.Disp.RegenerateDisplay()
+                uf_session.Disp.Refresh()
+        except Exception:
+            pass
 
     return captured_images
 

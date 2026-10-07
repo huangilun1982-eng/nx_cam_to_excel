@@ -124,9 +124,6 @@ def main():
 
         def set_all(val):
             for l_k, v in layer_vars.items():
-                # 若為工作圖層 (通常為 1)，且要隱藏，則保留打勾
-                if not val and l_k in work_layer_set:
-                    continue
                 v.set(val)
             notify_layer_changes()
 
