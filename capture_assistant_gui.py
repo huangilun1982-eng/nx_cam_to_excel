@@ -112,6 +112,7 @@ def main():
         top.attributes("-topmost", True)
         top.geometry(f"340x440+{max(10, pos_x - 350)}+{pos_y}")
         top.configure(bg="#F9FAFB")
+        top.bind("<F8>", trigger_f8_snap)
         layer_win_ref[0] = top
 
         # 頂部快捷控制列
@@ -163,7 +164,7 @@ def main():
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # 讀取圖層資訊
+        # 讀取圖層資訊 (嚴格只列出包含物件之圖層)
         raw_layers = []
         if layer_file and os.path.exists(layer_file):
             try:
@@ -172,44 +173,36 @@ def main():
             except Exception:
                 pass
 
-        # 若讀取為空，給予常用加工圖層保底清單
-        if not raw_layers:
-            default_layers = [1, 2, 3, 10, 20, 30, 50, 100, 200]
-            raw_layers = [
-                {
-                    "layer": dl,
-                    "name": f"圖層 {dl}" + (" (工作圖層)" if dl == 1 else (" (素材)" if dl in (10, 20) else "")),
-                    "count": 0,
-                    "visible": True if dl == 1 else False,
-                    "is_work": (dl == 1)
-                }
-                for dl in default_layers
-            ]
-
         layer_vars.clear()
         work_layer_set.clear()
-        for item in raw_layers:
-            l_num = item["layer"]
-            l_name = item.get("name", f"圖層 {l_num}")
-            l_vis = item.get("visible", True)
-            l_cnt = item.get("count", 0)
-            is_wk = item.get("is_work", (l_num == 1))
-            if is_wk:
-                work_layer_set.add(l_num)
 
-            var = tk.BooleanVar(value=l_vis)
-            layer_vars[l_num] = var
+        # 若無任何包含物件之圖層，顯示清楚提示，不假造空圖層清單
+        if not raw_layers:
+            lbl_empty = tk.Label(scroll_frame, text="（當前零件中無包含幾何物件之圖層）", font=("Microsoft JhengHei", 9), bg="#FFFFFF", fg="#888888", pady=25)
+            lbl_empty.pack(fill=tk.X, expand=True)
+        else:
+            for item in raw_layers:
+                l_num = item["layer"]
+                l_name = item.get("name", f"圖層 {l_num}")
+                l_vis = item.get("visible", True)
+                l_cnt = item.get("count", 0)
+                is_wk = item.get("is_work", (l_num == 1))
+                if is_wk:
+                    work_layer_set.add(l_num)
 
-            desc = l_name
-            if l_cnt > 0:
-                desc += f"  [{l_cnt}件]"
+                var = tk.BooleanVar(value=l_vis)
+                layer_vars[l_num] = var
 
-            cb = tk.Checkbutton(
-                scroll_frame, text=desc, variable=var,
-                font=("Microsoft JhengHei", 9), bg="#FFFFFF", activebackground="#F0F4F8",
-                command=notify_layer_changes, anchor="w", padx=6, pady=3
-            )
-            cb.pack(fill=tk.X, expand=True)
+                desc = l_name
+                if l_cnt > 0:
+                    desc += f"  [{l_cnt}件]"
+
+                cb = tk.Checkbutton(
+                    scroll_frame, text=desc, variable=var,
+                    font=("Microsoft JhengHei", 9), bg="#FFFFFF", activebackground="#F0F4F8",
+                    command=notify_layer_changes, anchor="w", padx=6, pady=3
+                )
+                cb.pack(fill=tk.X, expand=True)
 
     def on_confirm():
         exit_code[0] = 0 # 0 代表確認拍照

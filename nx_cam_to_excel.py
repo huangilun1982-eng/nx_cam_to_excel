@@ -1726,12 +1726,9 @@ def get_nx_standard_canned_views():
 
 def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing=None):
     """
-    底層原生視圖擺正核心 (100% 遵循 NX 原生 F8 Orient to Closest 行為)：
-    1. 強制向當前 Session 即時獲取最新的 WorkPart 與 WorkView (確保滑鼠旋轉後取得即時視圖矩陣)
-    2. 讀取即時視線法向 (m.Zx, m.Zy, m.Zz)
-    3. 比對與 NX 6 大標準工藝視向之夾角，吸附至最近之標準視圖 (Top, Bottom, Front, Back, Right, Left)
-    4. 調用 NX 原生 w_view.Orient(canned_enum, ScaleAdjustment.Current) 原生切換
-    5. 保持當前視圖縮放 (Current)，即時觸發 UpdateView 與 RegenerateDisplay 顯存刷新！
+    底層原生視圖擺正核心 (100% 呼叫 NX 官方原廠 F8 核心 API)：
+    直接調用 w_view.SnapToClosestCannedOrientation()，
+    完全與 NX 工具未啟動時按下鍵盤 F8 的官方行為 100% 一致，絕不進行任何自作主張的向量計算！
     """
     try:
         import NXOpen
@@ -1748,37 +1745,17 @@ def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing
     except Exception:
         pass
 
-    if w_view is None or not hasattr(w_view, "Matrix"):
+    if w_view is None:
         return False
 
     try:
-        import NXOpen
-
-        m = w_view.Matrix
-        vx, vy, vz = float(m.Zx), float(m.Zy), float(m.Zz)
-        v_mag = (vx*vx + vy*vy + vz*vz) ** 0.5
-        if v_mag > 1e-6:
-            vx, vy, vz = vx/v_mag, vy/v_mag, vz/v_mag
+        # 直接調用 NX 官方 F8 專屬原生核心方法
+        if hasattr(w_view, "SnapToClosestCannedOrientation"):
+            w_view.SnapToClosestCannedOrientation()
+        elif hasattr(w_view, "SnapToVariantCannedOrientation"):
+            w_view.SnapToVariantCannedOrientation()
         else:
-            vx, vy, vz = 0.0, 0.0, 1.0
-
-        canned_views = get_nx_standard_canned_views()
-        best_cand = max(canned_views, key=lambda c: vx*c["vec"][0] + vy*c["vec"][1] + vz*c["vec"][2])
-        canned_name = best_cand["canned"]
-
-        canned_enum = getattr(NXOpen.View.Canned, canned_name, None)
-        if canned_enum is None:
             return False
-
-        # 保持當前視圖縮放比例 (ScaleAdjustment.Current)
-        scale_adj = getattr(NXOpen.View.ScaleAdjustment, "Current", None)
-        if scale_adj is not None:
-            try:
-                w_view.Orient(canned_enum, scale_adj)
-            except Exception:
-                w_view.Orient(canned_enum)
-        else:
-            w_view.Orient(canned_enum)
 
         # 顯存再生與視圖刷新
         try:
@@ -1795,7 +1772,7 @@ def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing
 
         if listing:
             try:
-                listing.WriteLine(f"  [📐 視角擺正] 已吸附至 NX 原生標準視向 ➔ 【{canned_name}】。")
+                listing.WriteLine("  [📐 視角擺正] 已調用 NX 原生 SnapToClosestCannedOrientation 擺正完成。")
             except Exception:
                 pass
         return True
@@ -1809,7 +1786,8 @@ def snap_work_view_closest(work_part=None, w_view=None, uf_session=None, listing
 
 def get_part_layer_info(work_part, uf_session=None):
     """
-    掃描當前零件中包含幾何物件或啟用的圖層資訊清單
+    掃描當前零件中包含幾何物件之圖層資訊清單
+    嚴格遵循使用者指示：只要列出有物件的圖層 (obj_count > 0)
     回傳: list of dict [{"layer": int, "name": str, "count": int, "visible": bool, "is_work": bool}]
     """
     layers_data = []
@@ -1825,33 +1803,28 @@ def get_part_layer_info(work_part, uf_session=None):
         except Exception:
             pass
 
-    # 1. 優先透過 UFSession 掃描 1~256 圖層狀態與物件
+    # 透過 UFSession 掃描 1~256 圖層是否有物件
     if uf_session is not None and hasattr(uf_session, "Layer"):
         try:
             for l_num in range(1, 257):
-                try:
-                    st = uf_session.Layer.AskStatus(l_num)
-                except Exception:
-                    st = 4
-
-                # 快速查詢該圖層是否有物件
+                # 查詢該圖層物件數量
                 obj_count = 0
                 try:
                     obj_tag = uf_session.Layer.CycleByLayer(l_num, 0)
                     while obj_tag != 0:
                         obj_count += 1
-                        if obj_count >= 50:
-                            break
                         obj_tag = uf_session.Layer.CycleByLayer(l_num, obj_tag)
                 except Exception:
                     pass
 
-                # 納入清單條件：
-                # (1) 該圖層有幾何物件
-                # (2) 目前處於非隱藏狀態 (工作層 1 或可選層 2 或可見層 3)
-                # (3) 常見工藝核心圖層 (1, 10, 20, 50, 100, 200) 即使為 0 件亦呈現
-                is_core = l_num in (1, 10, 20, 50, 100, 200)
-                if obj_count > 0 or st in (1, 2, 3) or is_core:
+                # 嚴格篩選：只有該圖層有幾何物件 (obj_count > 0) 才列入！
+                if obj_count > 0:
+                    try:
+                        st = uf_session.Layer.AskStatus(l_num)
+                    except Exception:
+                        st = 4
+
+                    # 1 = 工作圖層, 2 = 可選, 3 = 僅可見, 4 = 隱藏
                     is_vis = (st != 4)
                     name_tag = f"圖層 {l_num}"
                     if st == 1:
@@ -1872,18 +1845,6 @@ def get_part_layer_info(work_part, uf_session=None):
                     })
         except Exception:
             pass
-
-    # 2. 保底機制：若仍為空，提供預設加工標準圖層清單供開關
-    if not layers_data:
-        default_layers = [1, 2, 3, 10, 20, 30, 50, 100, 200]
-        for dl in default_layers:
-            layers_data.append({
-                "layer": dl,
-                "name": f"圖層 {dl}" + (" (工作圖層)" if dl == 1 else (" (素材)" if dl in (10, 20) else "")),
-                "count": 0,
-                "visible": True if dl == 1 else False,
-                "is_work": (dl == 1)
-            })
 
     return layers_data
 
