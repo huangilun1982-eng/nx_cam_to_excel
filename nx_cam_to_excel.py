@@ -35,6 +35,22 @@ try:
 except Exception:
     pass
 
+# 匯入刀具 T 號重複性衝突檢驗引擎 (支援本機與 Journal 動態加載)
+try:
+    from tool_conflict_detector import detect_tool_conflicts_for_operations
+except ImportError:
+    import importlib.util
+    _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
+    _detector_path = os.path.join(_cur_dir, "tool_conflict_detector.py")
+    if os.path.exists(_detector_path):
+        _spec = importlib.util.spec_from_file_location("tool_conflict_detector", _detector_path)
+        _mod = importlib.util.module_from_spec(_spec)
+        _spec.loader.exec_module(_mod)
+        detect_tool_conflicts_for_operations = _mod.detect_tool_conflicts_for_operations
+    else:
+        def detect_tool_conflicts_for_operations(ops):
+            return []
+
 # ==================== 設定區 (參考 ExcelTool 規則) ====================
 ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
 EXCLUDE_KEYWORDS = ["NC_PROGRAM", "未用項"]  # 排除群組關鍵字
@@ -2589,7 +2605,15 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                         safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
                         safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
                         safe_time = escape_vbs_str(d.get("time", ""))
-                        safe_note = escape_vbs_str(d.get("note", ""))
+                        
+                        # 備註欄與刀號衝突處理
+                        has_conflict = d.get("has_tool_conflict", False)
+                        conflict_msg = d.get("tool_conflict_msg", "")
+                        note_val = str(d.get("note", "")).strip()
+                        if has_conflict and conflict_msg:
+                            if conflict_msg not in note_val:
+                                note_val = f"{conflict_msg} {note_val}".strip() if note_val else conflict_msg
+                        safe_note = escape_vbs_str(note_val)
 
                         vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
                         vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
@@ -2599,6 +2623,15 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                         vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
                         vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
                         vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
+
+                        if has_conflict:
+                            # 刀號儲存格高亮標記：淡紅底色 (RGB: 255, 204, 204) + 深紅粗體字 (RGB: 180, 0, 0)
+                            vbs_lines.extend([
+                                f'ws.Cells({curr_r}, 3).Interior.Color = RGB(255, 204, 204)',
+                                f'ws.Cells({curr_r}, 3).Font.Color = RGB(180, 0, 0)',
+                                f'ws.Cells({curr_r}, 3).Font.Bold = True'
+                            ])
+
                         page_seq += 1
                 else:
                     # 未填滿的列位：清空範本預設的工站數字，保持頁面乾淨
@@ -3478,6 +3511,28 @@ def main():
     the_session.ListingWindow.WriteLine(
         f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
     )
+
+    # 執行工段級刀具 T 號重複性衝突檢驗 (同工段內相同 T 號指派給不同刀具規格判定)
+    stage_ops_map = {}
+    for chunk in processed_chunks:
+        stg = chunk.get("stage", "通用工段")
+        if stg not in stage_ops_map:
+            stage_ops_map[stg] = []
+        stage_ops_map[stg].extend(chunk.get("operations", []))
+
+    total_conflicts_found = 0
+    for stg, s_ops in stage_ops_map.items():
+        conflicts = detect_tool_conflicts_for_operations(s_ops)
+        if conflicts:
+            total_conflicts_found += len(conflicts)
+            the_session.ListingWindow.WriteLine("----------------------------------------")
+            the_session.ListingWindow.WriteLine(f"【刀具安全警告】工段 [{stg}] 偵測到 {len(conflicts)} 項 T 號重複性衝突：")
+            for c_msg in conflicts:
+                the_session.ListingWindow.WriteLine(f"  [!] {c_msg}")
+
+    if total_conflicts_found > 0:
+        the_session.ListingWindow.WriteLine("----------------------------------------")
+        the_session.ListingWindow.WriteLine(f"[!] 警告：全工段共發現 {total_conflicts_found} 項刀號衝突，工單將以淡紅底色醒目標記！")
 
     # 3. 預先分析各工段工步數量與各模式下之預計頁數 (供使用者預覽與決策)
     stage_stats, total_extend_pages, total_paginate_pages, has_choice = preview_pagination_plan(
