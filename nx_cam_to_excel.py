@@ -322,10 +322,10 @@ def collect_cam_hierarchy(obj, target_chunks, extracted_info, current_group_name
             next_stage = current_stage
             next_parent = parent_program
         elif detected_stage or not parent_program:
-            # 頂層父資料夾 (如 MK-1-M1, MK-2-M2)
+            # 程式群組起點 (如選取之頂層母資料夾 MK-1-M1 或獨立選取之子資料夾 E20-125L，程式檔名 100% 與選取名稱一致)
             next_group_name = grp_name
             next_stage = detected_stage if detected_stage else t_stage
-            next_parent = t_top if t_top != "DEFAULT" else grp_name
+            next_parent = grp_name
         else:
             # 已經在某個母群組內部之子資料夾 (如 E20-125L)：
             # current_group_name 設為該子資料夾以維持各子資料夾獨立 Chunk (不跨組合併)，母程式父資料夾名稱向下維持！
@@ -3082,8 +3082,23 @@ def main():
     directly_selected_tags = {obj.Tag for obj in selected_objects if isinstance(obj, NXOpen.CAM.Operation)}
     visited_tags = set()
 
+    # 濾除已有祖先被選取之子物件，確保工單生成範圍與 NC 後處理轉出任務邊界 100% 對齊
+    selected_set = set(selected_objects)
+    def _has_selected_ancestor_node(node):
+        curr = node
+        while curr is not None:
+            try:
+                curr = curr.GetParent(NXOpen.CAM.CAMSetup.View.ProgramOrder)
+            except Exception:
+                curr = None
+            if curr and curr in selected_set:
+                return True
+        return False
+
+    top_selected_objects = [obj for obj in selected_objects if not _has_selected_ancestor_node(obj)]
+
     raw_chunks = []
-    for tagged_obj in selected_objects:
+    for tagged_obj in top_selected_objects:
         collect_cam_hierarchy(
             tagged_obj, raw_chunks, extracted_info,
             tree_map=cam_tree_map, visited_tags=visited_tags, directly_selected_tags=directly_selected_tags
