@@ -15,6 +15,8 @@ for mod in ["NXOpen", "NXOpen.CAM", "NXOpen.UF"]:
 from mcs_origin_detector import (
     parse_fixture_offset_to_gcode,
     determine_axis_orientation,
+    project_point_to_csys,
+    extract_mcs_bounding_box_for_entities,
     extract_target_bounding_box,
     resolve_stage_mcs_origin_string
 )
@@ -217,5 +219,88 @@ class TestMCSOriginDetector(unittest.TestCase):
         self.assertEqual(b_min, [-30.0, -30.0, -10.0])
         self.assertEqual(b_max, [30.0, 30.0, 0.0])
 
+    def test_project_point_to_csys_standard(self):
+        # 標準正交 (無旋轉)
+        origin = [100.0, 200.0, 300.0]
+        x_vec = [1.0, 0.0, 0.0]
+        y_vec = [0.0, 1.0, 0.0]
+        z_vec = [0.0, 0.0, 1.0]
+
+        # 頂面上的點 (100, 200, 300)
+        px, py, pz = project_point_to_csys([100.0, 200.0, 300.0], origin, x_vec, y_vec, z_vec)
+        self.assertAlmostEqual(px, 0.0)
+        self.assertAlmostEqual(py, 0.0)
+        self.assertAlmostEqual(pz, 0.0)
+
+        # 零件底部的點 (100, 200, 250) -> 在 MCS 中 Z' = -50
+        px, py, pz = project_point_to_csys([100.0, 200.0, 250.0], origin, x_vec, y_vec, z_vec)
+        self.assertAlmostEqual(pz, -50.0)
+
+    def test_horizontal_machine_mcs_z_is_world_y(self):
+        """
+        臥式機台測試：MCS 的 Z 軸 (主軸刀具向) 是世界座標系的 +Y 軸！
+        """
+        origin = [0.0, 150.0, 25.0]
+        x_vec = [1.0, 0.0, 0.0]
+        y_vec = [0.0, 0.0, 1.0]
+        z_vec = [0.0, 1.0, 0.0] # 臥式主軸朝向世界 +Y！
+
+        # 頂面點 (0, 150, 25) 投影到 MCS:
+        px, py, pz = project_point_to_csys([0.0, 150.0, 25.0], origin, x_vec, y_vec, z_vec)
+        self.assertAlmostEqual(pz, 0.0)
+
+        # 模擬實體角點投影
+        mock_ent = MagicMock()
+        mock_ent.Tag = 999
+        mock_uf = MagicMock()
+        mock_uf.ModlGeneral.AskBoundingBox.return_value = [-50.0, 100.0, 0.0, 50.0, 150.0, 50.0]
+
+        found, b_min, b_max = extract_mcs_bounding_box_for_entities(
+            [mock_ent], mock_uf, origin, x_vec, y_vec, z_vec
+        )
+        self.assertTrue(found)
+        # 在 MCS 局部空間中：min_z' = -50, max_z' = 0
+        self.assertAlmostEqual(b_min[2], -50.0)
+        self.assertAlmostEqual(b_max[2], 0.0)
+
+        z_orient = determine_axis_orientation(0.0, b_min[2], b_max[2], is_z_axis=True)
+        self.assertEqual(z_orient, "TOP")
+
+    def test_flipped_setup_op20_upside_down(self):
+        """
+        翻面加工 (OP20) 測試：MCS Z 軸朝下 (0, 0, -1)！
+        """
+        origin = [0.0, 0.0, 0.0]
+        x_vec = [1.0, 0.0, 0.0]
+        y_vec = [0.0, -1.0, 0.0]
+        z_vec = [0.0, 0.0, -1.0]
+
+        mock_ent = MagicMock()
+        mock_ent.Tag = 888
+        mock_uf = MagicMock()
+        mock_uf.ModlGeneral.AskBoundingBox.return_value = [-50.0, -50.0, 0.0, 50.0, 50.0, 50.0]
+
+        found, b_min, b_max = extract_mcs_bounding_box_for_entities(
+            [mock_ent], mock_uf, origin, x_vec, y_vec, z_vec
+        )
+        self.assertTrue(found)
+        self.assertAlmostEqual(b_min[2], -50.0)
+        self.assertAlmostEqual(b_max[2], 0.0)
+
+        z_orient = determine_axis_orientation(0.0, b_min[2], b_max[2], is_z_axis=True)
+        self.assertEqual(z_orient, "TOP")
+
+    def test_cutting_stock_tolerance_absorption(self):
+        """
+        現場加工實務測試：預留切削量 (原點高於素材頂面 0.2mm)
+        """
+        z_orient = determine_axis_orientation(0.0, -50.2, -0.2, is_z_axis=True, tol=0.5)
+        self.assertEqual(z_orient, "TOP")
+
+        # 床台碰刀 (原點低於工件底面 0.3mm)
+        z_bot = determine_axis_orientation(0.0, 0.3, 50.3, is_z_axis=True, tol=0.5)
+        self.assertEqual(z_bot, "0")
+
 if __name__ == "__main__":
     unittest.main()
+

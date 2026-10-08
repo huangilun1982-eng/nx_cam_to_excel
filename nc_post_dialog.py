@@ -128,6 +128,7 @@ class NcPostDialogApp:
         self.result = {
             "action": "cancel",
             "postprocessor_name": "",
+            "machine_profile": "fanuc_horizontal",
             "custom_post_path": "",
             "output_dir": config.get("output_dir", ""),
             "extension": ".nc"
@@ -144,15 +145,15 @@ class NcPostDialogApp:
         self.master.resizable(True, True)
         self.master.configure(bg="#F4F6F9")
 
-        # 視窗初始尺寸與置中
-        win_w = 620
-        win_h = 560
+        # 視窗初始尺寸與置中 (容納機型規格與四動作按鈕)
+        win_w = 640
+        win_h = 600
         screen_w = self.master.winfo_screenwidth()
         screen_h = self.master.winfo_screenheight()
         pos_x = max(20, (screen_w - win_w) // 2)
         pos_y = max(20, (screen_h - win_h) // 2)
         self.master.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        self.master.minsize(560, 480)
+        self.master.minsize(600, 520)
 
         # 頂部提示標題欄
         top_frame = tk.Frame(self.master, bg="#004B87", padx=16, pady=12)
@@ -277,6 +278,42 @@ class NcPostDialogApp:
         )
         btn_browse_post.pack(side=tk.RIGHT)
 
+        # 機型檔頭規格下拉選單列
+        row_prof = tk.Frame(post_frame, bg="#F4F6F9")
+        row_prof.pack(fill=tk.X, pady=(6, 0))
+
+        tk.Label(
+            row_prof,
+            text="機型檔頭：",
+            font=("Microsoft JhengHei", 9),
+            bg="#F4F6F9",
+            width=10,
+            anchor="w"
+        ).pack(side=tk.LEFT)
+
+        self.profile_var = tk.StringVar()
+        self.profile_display_map = {
+            "Fanuc 臥式機 (B0/G30/四軸專用)": "fanuc_horizontal",
+            "Fanuc 立式機 (標準三軸)": "fanuc_vertical",
+            "BROTHER 機台 (攻牙機/小型加工中心)": "brother",
+            "原始輸出 (不套用檔頭替換)": "raw"
+        }
+        self.profile_reverse_map = {v: k for k, v in self.profile_display_map.items()}
+
+        profile_display_names = list(self.profile_display_map.keys())
+        self.combo_profile = ttk.Combobox(
+            row_prof,
+            textvariable=self.profile_var,
+            values=profile_display_names,
+            font=("Microsoft JhengHei", 9),
+            state="readonly"
+        )
+        self.combo_profile.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        default_prof_id = self.config.get("default_machine_profile", "fanuc_horizontal")
+        default_prof_label = self.profile_reverse_map.get(default_prof_id, profile_display_names[0])
+        self.combo_profile.set(default_prof_label)
+
         # 3. 輸出設定區塊 (目錄與副檔名)
         out_frame = tk.LabelFrame(
             main_frame,
@@ -346,44 +383,61 @@ class NcPostDialogApp:
         combo_ext.pack(side=tk.LEFT)
 
         # 底部動作按鈕列
-        btn_bar = tk.Frame(self.master, bg="#EAEEF3", padx=16, pady=10)
+        btn_bar = tk.Frame(self.master, bg="#EAEEF3", padx=14, pady=10)
         btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
 
         # 按鈕 1：轉出 NC 碼並匯出工單
         btn_post_export = tk.Button(
             btn_bar,
             text=" 🚀 轉出 NC 碼並匯出工單 ",
-            font=("Microsoft JhengHei", 10, "bold"),
+            font=("Microsoft JhengHei", 9, "bold"),
             bg="#0078D7",
             fg="white",
             activebackground="#005A9E",
             activeforeground="white",
-            padx=12,
+            padx=8,
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
             command=self.on_post_and_export
         )
-        btn_post_export.pack(side=tk.LEFT, padx=(0, 8))
+        btn_post_export.pack(side=tk.LEFT, padx=(0, 6))
 
-        # 按鈕 2：僅匯出工單 (不轉 NC)
+        # 按鈕 2：只轉 NC 碼 (不轉工單)
+        btn_post_only = tk.Button(
+            btn_bar,
+            text=" ⚡ 只轉 NC 碼 (不轉工單) ",
+            font=("Microsoft JhengHei", 9, "bold"),
+            bg="#00838F",
+            fg="white",
+            activebackground="#006064",
+            activeforeground="white",
+            padx=8,
+            pady=6,
+            relief=tk.FLAT,
+            cursor="hand2",
+            command=self.on_post_only
+        )
+        btn_post_only.pack(side=tk.LEFT, padx=(0, 6))
+
+        # 按鈕 3：僅匯出工單 (不轉 NC)
         btn_export_only = tk.Button(
             btn_bar,
             text=" 📋 僅匯出工單 (不轉 NC) ",
-            font=("Microsoft JhengHei", 10, "bold"),
+            font=("Microsoft JhengHei", 9, "bold"),
             bg="#28A745",
             fg="white",
             activebackground="#218838",
             activeforeground="white",
-            padx=12,
+            padx=8,
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
             command=self.on_export_only
         )
-        btn_export_only.pack(side=tk.LEFT, padx=(0, 8))
+        btn_export_only.pack(side=tk.LEFT, padx=(0, 6))
 
-        # 按鈕 3：取消
+        # 按鈕 4：取消
         btn_cancel = tk.Button(
             btn_bar,
             text=" ❌ 取消 ",
@@ -392,7 +446,7 @@ class NcPostDialogApp:
             fg="#333333",
             activebackground="#B0B5BD",
             activeforeground="black",
-            padx=10,
+            padx=8,
             pady=6,
             relief=tk.FLAT,
             cursor="hand2",
@@ -430,8 +484,31 @@ class NcPostDialogApp:
             messagebox.showwarning("提示", "請選擇或輸入後處理機台名稱！", parent=self.master)
             return
 
+        prof_label = self.profile_var.get().strip()
+        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
+
         self.result["action"] = "post_and_export"
         self.result["postprocessor_name"] = selected_post
+        self.result["machine_profile"] = prof_id
+        self.result["output_dir"] = self.dir_var.get().strip()
+        self.result["extension"] = self.ext_var.get().strip()
+        if not self.result["extension"].startswith("."):
+            self.result["extension"] = "." + self.result["extension"]
+        self.master.destroy()
+
+    def on_post_only(self):
+        """使用者選擇【⚡ 只轉 NC 碼 (不轉工單)】"""
+        selected_post = self.post_var.get().strip()
+        if not selected_post:
+            messagebox.showwarning("提示", "請選擇或輸入後處理機台名稱！", parent=self.master)
+            return
+
+        prof_label = self.profile_var.get().strip()
+        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
+
+        self.result["action"] = "post_only"
+        self.result["postprocessor_name"] = selected_post
+        self.result["machine_profile"] = prof_id
         self.result["output_dir"] = self.dir_var.get().strip()
         self.result["extension"] = self.ext_var.get().strip()
         if not self.result["extension"].startswith("."):
@@ -440,7 +517,10 @@ class NcPostDialogApp:
 
     def on_export_only(self):
         """使用者選擇僅匯出工單 (不轉 NC)"""
+        prof_label = self.profile_var.get().strip()
+        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
         self.result["action"] = "export_only"
+        self.result["machine_profile"] = prof_id
         self.master.destroy()
 
     def on_cancel(self):
@@ -453,7 +533,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="NX CAM 後處理確認對話視窗")
     parser.add_argument("--cfg-file", type=str, default="", help="輸入設定檔 (JSON 格式)")
     parser.add_argument("--res-file", type=str, default="", help="輸出結果檔 (JSON 格式)")
-    parser.add_argument("--auto-action", type=str, default="", help="自動觸發動作 (供單元測試: post_and_export, export_only, cancel)")
+    parser.add_argument("--auto-action", type=str, default="", help="自動觸發動作 (供單元測試: post_and_export, post_only, export_only, cancel)")
     return parser.parse_args()
 
 
@@ -475,6 +555,8 @@ def main():
         # 單元測試自動模式
         if args.auto_action == "post_and_export":
             root.after(50, app.on_post_and_export)
+        elif args.auto_action == "post_only":
+            root.after(50, app.on_post_only)
         elif args.auto_action == "export_only":
             root.after(50, app.on_export_only)
         elif args.auto_action == "cancel":

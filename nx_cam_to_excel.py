@@ -3476,14 +3476,21 @@ def main():
     if action == "cancel":
         the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消操作，流程中止。")
         return
-    elif action == "post_and_export":
-        the_session.ListingWindow.WriteLine("使用者選擇【轉出 NC 碼並匯出工單】。")
-        try:
-            execute_nc_postprocessing(cam_setup, nc_tasks, post_config, listing=the_session.ListingWindow)
-        except Exception as ex:
-            the_session.ListingWindow.WriteLine(f"執行後處理轉出時發生例外：{str(ex)}")
+
+    chosen_post = post_config.get("postprocessor_name", "Fanuc_2026")
+    chosen_profile = post_config.get("machine_profile", "fanuc_horizontal")
+    chosen_out_dir = post_config.get("output_dir", target_folder)
+    chosen_ext = post_config.get("extension", ".nc")
+
+    if action == "post_and_export":
+        the_session.ListingWindow.WriteLine("使用者選擇【🚀 轉出 NC 碼並匯出工單】。")
+        task_run_mode = "POST_AND_EXPORT"
+    elif action == "post_only":
+        the_session.ListingWindow.WriteLine("使用者選擇【⚡ 只轉 NC 碼 (不轉工單)】。")
+        task_run_mode = "NC_ONLY"
     else:
-        the_session.ListingWindow.WriteLine("使用者選擇【僅匯出工單 (不轉 NC 碼)】。")
+        the_session.ListingWindow.WriteLine("使用者選擇【📋 僅匯出工單 (不轉 NC 碼)】。")
+        task_run_mode = "EXPORT_ONLY"
 
     # 2. 逐一萃取工序資訊並執行群組內刀具合併 (各子資料夾獨立合併，不跨子資料夾合併！)
     processed_chunks = []
@@ -3633,6 +3640,54 @@ def main():
             for w_msg in s_warns:
                 the_session.ListingWindow.WriteLine(f"  [!] {w_msg}")
 
+    # =========================================================================
+    # 若使用者選擇【⚡ 只轉 NC 碼 (不轉工單)】：直接執行背景後處理與檔頭置換後快速返回，跳過分頁與拍照
+    # =========================================================================
+    if task_run_mode == "NC_ONLY":
+        the_session.ListingWindow.WriteLine("========================================")
+        the_session.ListingWindow.WriteLine(f"【⚡ 只轉 NC 碼模式】正在背景執行後處理與機型檔頭置換 (目標機型: {chosen_profile})...")
+
+        distinct_stages_nc = get_distinct_stages(processed_chunks)
+        drawing_name_nc = part_name
+        drawing_number_nc = extract_14_digit_drawing_number(part_name)
+        blank_size_nc = determine_blank_size(work_part, uf_session, raw_chunks, extracted_info)
+        header_info_nc = {
+            "drawing_name": drawing_name_nc,
+            "drawing_number": drawing_number_nc,
+            "blank_size": blank_size_nc,
+            "part_number": extracted_info.get("part_number", ""),
+            "holes": extracted_info.get("holes", ""),
+            "thickness": extracted_info.get("thickness", "")
+        }
+
+        stage_origins_nc = {}
+        for stg in distinct_stages_nc:
+            stg_ops = stage_ops_map.get(stg, [])
+            origin_str = resolve_stage_mcs_origin_string(
+                stg_ops, work_part=work_part, cam_setup=work_part.CAMSetup if work_part else None, uf_session=uf_session
+            )
+            stage_origins_nc[stg] = origin_str
+
+        succ_cnt, fail_cnt = process_and_export_nc_tasks(
+            cam_setup=work_part.CAMSetup if work_part else None,
+            processed_chunks=processed_chunks,
+            profile_id=chosen_profile,
+            header_info=header_info_nc,
+            stage_origins=stage_origins_nc,
+            output_dir=chosen_out_dir,
+            listing=the_session.ListingWindow,
+            default_post=chosen_post,
+            extension=chosen_ext
+        )
+        the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_cnt} 筆，失敗 {fail_cnt} 筆。輸出目錄：{chosen_out_dir}")
+        the_session.ListingWindow.WriteLine("========================================")
+        if os.path.exists(chosen_out_dir):
+            try:
+                os.startfile(chosen_out_dir)
+            except Exception:
+                pass
+        return
+
     # 3. 預先分析各工段工步數量與各模式下之預計頁數 (供使用者預覽與決策)
     stage_stats, total_extend_pages, total_paginate_pages, has_choice = preview_pagination_plan(
         processed_chunks, rows_per_page=ROWS_PER_PAGE
@@ -3736,27 +3791,6 @@ def main():
         stage_origins[stg] = origin_str
         the_session.ListingWindow.WriteLine(f"  - 工段【{stg}】：{origin_str}")
 
-    nc_output_dir = os.path.join(target_folder, "NC")
-
-    # 若使用者選擇【快速模式：僅轉出 NC 碼 (不開 Excel 工單)】
-    if task_run_mode == "NC_ONLY":
-        the_session.ListingWindow.WriteLine("========================================")
-        the_session.ListingWindow.WriteLine(f"【快速模式：僅轉出 NC 碼】正在背景執行後處理與機型檔頭置換 [{target_profile_id}]...")
-        process_and_export_nc_tasks(
-            cam_setup=work_part.CAMSetup if work_part else None,
-            processed_chunks=processed_chunks,
-            profile_id=target_profile_id,
-            header_info=header_info,
-            stage_origins=stage_origins,
-            output_dir=nc_output_dir,
-            listing=the_session.ListingWindow
-        )
-        the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！輸出目錄：{nc_output_dir}")
-        the_session.ListingWindow.WriteLine("========================================")
-        if os.path.exists(nc_output_dir):
-            os.startfile(nc_output_dir)
-        return
-
     # 7. 透過 VBS 多頁寫入 Excel 並內嵌加工示圖
     the_session.ListingWindow.WriteLine("正在產生多頁 Excel 工單與嵌入加工示圖...")
     if stage_images:
@@ -3767,17 +3801,22 @@ def main():
         the_session.ListingWindow.WriteLine("========================================")
         os.startfile(output_path)
 
-        # 完整模式同步產出 NC 碼與機型檔頭置換
-        the_session.ListingWindow.WriteLine("正在同步執行 NC 碼背景後處理與機型檔頭置換...")
-        process_and_export_nc_tasks(
-            cam_setup=work_part.CAMSetup if work_part else None,
-            processed_chunks=processed_chunks,
-            profile_id=target_profile_id,
-            header_info=header_info,
-            stage_origins=stage_origins,
-            output_dir=nc_output_dir,
-            listing=the_session.ListingWindow
-        )
+        # 完整模式同步產出 NC 碼與機型檔頭置換 (僅當使用者選擇 POST_AND_EXPORT 時)
+        if task_run_mode == "POST_AND_EXPORT":
+            the_session.ListingWindow.WriteLine("正在同步執行 NC 碼背景後處理與機型檔頭置換...")
+            succ_nc, fail_nc = process_and_export_nc_tasks(
+                cam_setup=work_part.CAMSetup if work_part else None,
+                processed_chunks=processed_chunks,
+                profile_id=chosen_profile,
+                header_info=header_info,
+                stage_origins=stage_origins,
+                output_dir=chosen_out_dir,
+                listing=the_session.ListingWindow,
+                default_post=chosen_post,
+                extension=chosen_ext
+            )
+            the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_nc} 筆，失敗 {fail_nc} 筆。輸出目錄：{chosen_out_dir}")
+            the_session.ListingWindow.WriteLine("========================================")
     except Exception as ex:
         the_session.ListingWindow.WriteLine(f"匯出失敗：{str(ex)}")
     finally:
