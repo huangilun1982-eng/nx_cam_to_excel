@@ -83,6 +83,25 @@ except ImportError:
         def evaluate_operations_tool_safety(ops, cam_setup=None):
             return []
 
+# 匯入 NC 程式後處理與機型檔頭轉換引擎 (支援本機與 Journal 動態加載)
+try:
+    from nc_processor import prompt_machine_selection_gui, process_and_export_nc_tasks
+except ImportError:
+    import importlib.util
+    _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
+    _nc_path = os.path.join(_cur_dir, "nc_processor.py")
+    if os.path.exists(_nc_path):
+        _spec_nc = importlib.util.spec_from_file_location("nc_processor", _nc_path)
+        _mod_nc = importlib.util.module_from_spec(_spec_nc)
+        _spec_nc.loader.exec_module(_mod_nc)
+        prompt_machine_selection_gui = _mod_nc.prompt_machine_selection_gui
+        process_and_export_nc_tasks = _mod_nc.process_and_export_nc_tasks
+    else:
+        def prompt_machine_selection_gui():
+            return {"action": "ok", "profile_id": "FANUC_HORIZONTAL", "run_mode": "FULL_DOC_AND_NC"}
+        def process_and_export_nc_tasks(*args, **kwargs):
+            return 0, 0
+
 # ==================== 設定區 (參考 ExcelTool 規則) ====================
 ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
 EXCLUDE_KEYWORDS = ["NC_PROGRAM", "未用項"]  # 排除群組關鍵字
@@ -3351,13 +3370,23 @@ def main():
     target_folder = os.path.dirname(full_part_path)
     part_name = work_part.Leaf
 
+    # 彈出目標機型與任務模式選擇視窗 (Zero-Debug 子進程隔離)
+    user_choice = prompt_machine_selection_gui()
+    if user_choice.get("action") == "cancel":
+        the_session.ListingWindow.WriteLine("提示：操作已由使用者取消。")
+        return
+
+    target_profile_id = user_choice.get("profile_id", "FANUC_HORIZONTAL")
+    task_run_mode = user_choice.get("run_mode", "FULL_DOC_AND_NC")
+
     template_path = resolve_asset_file("ShopDoc_Template.xlsx", the_session=the_session, work_part=work_part)
-    if not os.path.exists(template_path):
+    if not os.path.exists(template_path) and task_run_mode == "FULL_DOC_AND_NC":
         the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
         return
     output_path = os.path.join(target_folder, f"{part_name}_選定工序工單.xlsx")
 
     the_session.ListingWindow.WriteLine("========================================")
+    the_session.ListingWindow.WriteLine(f"已選定機型檔頭：[{target_profile_id}] | 執行模式：[{task_run_mode}]")
     the_session.ListingWindow.WriteLine("開始分析 CAM 導覽器結構與工藝數據...")
 
     # 1. 遞迴收集並按群組分塊 (Chunks)，同時過濾排除群組與提取資訊群組
@@ -3707,6 +3736,27 @@ def main():
         stage_origins[stg] = origin_str
         the_session.ListingWindow.WriteLine(f"  - 工段【{stg}】：{origin_str}")
 
+    nc_output_dir = os.path.join(target_folder, "NC")
+
+    # 若使用者選擇【快速模式：僅轉出 NC 碼 (不開 Excel 工單)】
+    if task_run_mode == "NC_ONLY":
+        the_session.ListingWindow.WriteLine("========================================")
+        the_session.ListingWindow.WriteLine(f"【快速模式：僅轉出 NC 碼】正在背景執行後處理與機型檔頭置換 [{target_profile_id}]...")
+        process_and_export_nc_tasks(
+            cam_setup=work_part.CAMSetup if work_part else None,
+            processed_chunks=processed_chunks,
+            profile_id=target_profile_id,
+            header_info=header_info,
+            stage_origins=stage_origins,
+            output_dir=nc_output_dir,
+            listing=the_session.ListingWindow
+        )
+        the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！輸出目錄：{nc_output_dir}")
+        the_session.ListingWindow.WriteLine("========================================")
+        if os.path.exists(nc_output_dir):
+            os.startfile(nc_output_dir)
+        return
+
     # 7. 透過 VBS 多頁寫入 Excel 並內嵌加工示圖
     the_session.ListingWindow.WriteLine("正在產生多頁 Excel 工單與嵌入加工示圖...")
     if stage_images:
@@ -3716,6 +3766,18 @@ def main():
         the_session.ListingWindow.WriteLine(f"工單建立完成！檔案路徑：{output_path}")
         the_session.ListingWindow.WriteLine("========================================")
         os.startfile(output_path)
+
+        # 完整模式同步產出 NC 碼與機型檔頭置換
+        the_session.ListingWindow.WriteLine("正在同步執行 NC 碼背景後處理與機型檔頭置換...")
+        process_and_export_nc_tasks(
+            cam_setup=work_part.CAMSetup if work_part else None,
+            processed_chunks=processed_chunks,
+            profile_id=target_profile_id,
+            header_info=header_info,
+            stage_origins=stage_origins,
+            output_dir=nc_output_dir,
+            listing=the_session.ListingWindow
+        )
     except Exception as ex:
         the_session.ListingWindow.WriteLine(f"匯出失敗：{str(ex)}")
     finally:
