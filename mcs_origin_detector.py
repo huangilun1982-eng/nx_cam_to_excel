@@ -263,24 +263,32 @@ def extract_target_bounding_box(work_part, cam_setup, uf_session, first_op_obj=N
 
     # -------------------------------------------------------------
     # 階梯 2：圖面當前顯示實體 (Visible Bodies in Current Display)
-    # 條件：所屬圖層不是隱藏 (Layer Status != 4) 且 物件非 Blanked
+    # 條件：物件非 Blanked 且 所屬圖層為合法工作圖層 (1~256 且 Layer Status != 4)
     # -------------------------------------------------------------
     if work_part and hasattr(work_part, "Bodies"):
         try:
             visible_bodies = []
             for b in work_part.Bodies:
                 try:
-                    # 圖層狀態檢查：4 代表隱藏/不可見 (UF_LAYER_INACTIVE / INVIS)
-                    layer_st = 1
+                    # 1. 優先檢查物件是否被隱藏 (IsBlanked)
+                    if getattr(b, "IsBlanked", False):
+                        continue
+
+                    # 2. 圖層範圍與狀態檢查 (NX 合法圖層為 1~256，4 代表隱藏)
+                    b_layer = getattr(b, "Layer", 1)
+                    if not (1 <= b_layer <= 256):
+                        # 超出 1~256 之非標準圖層實體不視為可見顯示物件
+                        continue
+
                     if uf_session and hasattr(uf_session, "Layer"):
-                        b_layer = getattr(b, "Layer", 1)
                         layer_st = uf_session.Layer.AskStatus(b_layer)
-                    
-                    is_blanked = getattr(b, "IsBlanked", False)
-                    if layer_st != 4 and not is_blanked:
-                        visible_bodies.append(b)
-                except Exception:
+                        if layer_st == 4:
+                            continue
+
                     visible_bodies.append(b)
+                except Exception:
+                    # 發生異常時安全略過，絕不將不明或異常實體誤判為可見物件
+                    continue
 
             if visible_bodies:
                 found, b_min, b_max = extract_bounding_box_for_entities(visible_bodies, uf_session)

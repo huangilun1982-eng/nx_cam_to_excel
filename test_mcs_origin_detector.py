@@ -126,10 +126,11 @@ class TestMCSOriginDetector(unittest.TestCase):
         mock_root.GetMembers.return_value = []
         mock_setup.GetRoot.return_value = mock_root
 
-        # 模擬 3 個實體：
+        # 模擬 4 個實體：
         # b1: 圖層 1 (正常顯示)
         # b2: 圖層 4 (隱藏圖層)
         # b3: 圖層 1 但 IsBlanked = True (隱藏)
+        # b4: 圖層 257 (超出 NX 範圍且 AskStatus 拋出異常，IsBlanked = True)
         b1 = MagicMock()
         b1.Layer = 1
         b1.IsBlanked = False
@@ -145,11 +146,18 @@ class TestMCSOriginDetector(unittest.TestCase):
         b3.IsBlanked = True
         b3.Tag = 2003
 
-        mock_wp.Bodies = [b1, b2, b3]
+        b4 = MagicMock()
+        b4.Layer = 257
+        b4.IsBlanked = True
+        b4.Tag = 2004
+
+        mock_wp.Bodies = [b1, b2, b3, b4]
 
         def ask_status_side_effect(layer):
             if layer == 4:
                 return 4  # 隱藏圖層
+            elif layer > 256:
+                raise Exception("The first parameter passed in was invalid")
             return 1      # 正常工作圖層
 
         mock_uf.Layer.AskStatus.side_effect = ask_status_side_effect
@@ -158,10 +166,11 @@ class TestMCSOriginDetector(unittest.TestCase):
             if tag == 2001:
                 return [-10.0, -10.0, -5.0, 10.0, 10.0, 0.0]
             elif tag == 2002:
-                # 若抓到 b2 則範圍會被擴大到 999
                 return [-999.0, -999.0, -999.0, 999.0, 999.0, 999.0]
             elif tag == 2003:
                 return [-888.0, -888.0, -888.0, 888.0, 888.0, 888.0]
+            elif tag == 2004:
+                return [-777.0, -777.0, -777.0, 777.0, 777.0, 777.0]
             return [0, 0, 0, 0, 0, 0]
 
         mock_uf.ModlGeneral.AskBoundingBox.side_effect = ask_bbox_side_effect
@@ -172,7 +181,7 @@ class TestMCSOriginDetector(unittest.TestCase):
 
         self.assertTrue(found)
         self.assertEqual(source, "DISPLAY_BODIES")
-        # 驗證只有 b1 被納入，b2 與 b3 被成功過濾排除！
+        # 驗證只有 b1 被納入，b2、b3、b4 全數被成功排除！
         self.assertEqual(b_min, [-10.0, -10.0, -5.0])
         self.assertEqual(b_max, [10.0, 10.0, 0.0])
 
