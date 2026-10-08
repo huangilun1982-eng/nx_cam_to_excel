@@ -301,6 +301,85 @@ class TestMCSOriginDetector(unittest.TestCase):
         z_bot = determine_axis_orientation(0.0, 0.3, 50.3, is_z_axis=True, tol=0.5)
         self.assertEqual(z_bot, "0")
 
+    def test_multi_stage_same_body_flip_processing(self):
+        """
+        現場實務核心：同一個實體在不同工段進行正面 (M1 / G54) 與反面翻面 (M2 / G55) 加工測試
+        驗證 M1 與 M2 能各自正確穿透 WORKPIECE 節點回溯至各自獨立的 OrientGeometry，
+        並依據各自的姿態與碰刀點精準判定方位！
+        """
+        import NXOpen.CAM
+
+        mock_wp = MagicMock()
+        mock_setup = MagicMock()
+        mock_uf = MagicMock()
+
+        # 同一個實體：世界座標範圍 X: [-50, 50], Y: [-50, 50], Z: [0, 50]
+        mock_body = MagicMock()
+        mock_body.IsBlanked = False
+        mock_body.Layer = 1
+        mock_body.Tag = 9001
+        mock_wp.Bodies = [mock_body]
+        mock_uf.Layer.AskStatus.return_value = 1
+        mock_uf.ModlGeneral.AskBoundingBox.return_value = [-50.0, -50.0, 0.0, 50.0, 50.0, 50.0]
+
+        # --- 構建 M1 (正面加工 / G54 / 頂面碰刀 Z=50) ---
+        mock_mcs_m1 = MagicMock(spec=["Name", "GetMembers"])
+        mock_mcs_m1.Name = "MCS_M1"
+        mock_mcs_m1.GetMembers.return_value = []
+
+        mock_wp_node_m1 = MagicMock()
+        mock_wp_node_m1.Name = "WORKPIECE_M1"
+        mock_wp_node_m1.GetParent.return_value = mock_mcs_m1
+
+        mock_op_m1 = MagicMock()
+        mock_op_m1.Name = "FACE_MILLING_M1"
+        mock_op_m1.GetParent.return_value = mock_wp_node_m1
+
+        # --- 構建 M2 (反面翻面加工 / G55 / 翻面後頂面碰刀 Z=0, Z軸朝下 -1) ---
+        mock_mcs_m2 = MagicMock(spec=["Name", "GetMembers"])
+        mock_mcs_m2.Name = "MCS_M2"
+        mock_mcs_m2.GetMembers.return_value = []
+
+        mock_wp_node_m2 = MagicMock()
+        mock_wp_node_m2.Name = "WORKPIECE_M2"
+        mock_wp_node_m2.GetParent.return_value = mock_mcs_m2
+
+        mock_op_m2 = MagicMock()
+        mock_op_m2.Name = "FACE_MILLING_M2"
+        mock_op_m2.GetParent.return_value = mock_wp_node_m2
+
+        # 模擬 CreateMillOrientGeomBuilder 分別回傳 M1 與 M2 的設定
+        def mock_builder_side_effect(mcs_node):
+            b = MagicMock()
+            if mcs_node == mock_mcs_m1:
+                b.FixtureOffsetBuilder.Value = 54
+                b.Mcs.Origin.X = 0.0; b.Mcs.Origin.Y = 0.0; b.Mcs.Origin.Z = 50.0 # 正面碰刀
+                b.Mcs.Orientation.Xx = 1.0; b.Mcs.Orientation.Xy = 0.0; b.Mcs.Orientation.Xz = 0.0
+                b.Mcs.Orientation.Yx = 0.0; b.Mcs.Orientation.Yy = 1.0; b.Mcs.Orientation.Yz = 0.0
+                b.Mcs.Orientation.Zx = 0.0; b.Mcs.Orientation.Zy = 0.0; b.Mcs.Orientation.Zz = 1.0 # 朝上
+            elif mcs_node == mock_mcs_m2:
+                b.FixtureOffsetBuilder.Value = 55
+                b.Mcs.Origin.X = 0.0; b.Mcs.Origin.Y = 0.0; b.Mcs.Origin.Z = 0.0 # 翻面後碰刀
+                b.Mcs.Orientation.Xx = 1.0; b.Mcs.Orientation.Xy = 0.0; b.Mcs.Orientation.Xz = 0.0
+                b.Mcs.Orientation.Yx = 0.0; b.Mcs.Orientation.Yy = -1.0; b.Mcs.Orientation.Yz = 0.0
+                b.Mcs.Orientation.Zx = 0.0; b.Mcs.Orientation.Zy = 0.0; b.Mcs.Orientation.Zz = -1.0 # 翻轉朝下
+            return b
+
+        mock_setup.CAMGroupCollection.CreateMillOrientGeomBuilder.side_effect = mock_builder_side_effect
+
+        # 1. 執行 M1 工段方位解析
+        res_m1 = resolve_stage_mcs_origin_string(
+            raw_ops=[mock_op_m1], work_part=mock_wp, cam_setup=mock_setup, uf_session=mock_uf
+        )
+        self.assertEqual(res_m1, "加工原點【G54】：X=MID, Y=MID, Z=TOP")
+
+        # 2. 執行 M2 工段方位解析 (面對同一個實體，翻面後依然精準判定為 TOP！)
+        res_m2 = resolve_stage_mcs_origin_string(
+            raw_ops=[mock_op_m2], work_part=mock_wp, cam_setup=mock_setup, uf_session=mock_uf
+        )
+        self.assertEqual(res_m2, "加工原點【G55】：X=MID, Y=MID, Z=TOP")
+
 if __name__ == "__main__":
     unittest.main()
+
 

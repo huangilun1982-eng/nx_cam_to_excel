@@ -309,10 +309,15 @@ def find_associated_workpiece_node(first_op_obj, cam_setup):
             depth += 1
             try:
                 import NXOpen.CAM
-                if isinstance(curr, NXOpen.CAM.Operation):
-                    parent = curr.GetParent(NXOpen.CAM.CAMSetup.View.Geometry)
-                else:
-                    parent = curr.GetParent()
+                view_geom = NXOpen.CAM.CAMSetup.View.Geometry
+                parent = None
+                try:
+                    parent = curr.GetParent(view_geom)
+                except Exception:
+                    try:
+                        parent = curr.GetParent()
+                    except Exception:
+                        parent = None
 
                 if not parent:
                     break
@@ -490,6 +495,28 @@ def extract_target_bounding_box(work_part, cam_setup, uf_session, origin=None, x
     )
 
 
+def is_mcs_geometry_node(node):
+    """
+    判定一個 CAM 幾何節點是否為加工座標系節點 (OrientGeometry / MCS)。
+    支援原生型別判定、名稱識別 (MCS_*) 與子型別相容。
+    """
+    if node is None:
+        return False
+    try:
+        import NXOpen.CAM
+        if isinstance(node, NXOpen.CAM.OrientGeometry):
+            return True
+    except Exception:
+        pass
+    type_name = type(node).__name__.upper()
+    if "ORIENT" in type_name or "MCS" in type_name:
+        return True
+    node_name = str(getattr(node, "Name", "")).upper()
+    if node_name.startswith("MCS") or "_MCS" in node_name or "MCS_" in node_name:
+        return True
+    return False
+
+
 def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_session=None):
     """
     解析工段對應之加工原點說明字串 (100% 基於加工座標系 MCS 幾何轉換)。
@@ -508,46 +535,51 @@ def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_
     if not work_part or not cam_setup:
         return fallback_result
 
-    # 1. 從該工段工步中尋找有效的 NX CAM Operation 物件
-    first_op_obj = None
-    if raw_ops:
-        for op_item in raw_ops:
-            op_candidate = op_item.get("_nx_op_obj") if isinstance(op_item, dict) else op_item
-            if op_candidate is not None:
-                first_op_obj = op_candidate
-                break
-
-    # 2. 向上回溯幾何父節點尋找 OrientGeometry (MCS 節點)
+    # 1. 向上回溯幾何父節點尋找該工段專屬之 OrientGeometry (MCS 節點)
     mcs_node = None
-    if first_op_obj is not None:
-        curr = first_op_obj
+    first_op_obj = None
+    for op_item in (raw_ops or []):
+        op_obj = op_item.get("_nx_op_obj") if isinstance(op_item, dict) else op_item
+        if op_obj is None:
+            continue
+        if first_op_obj is None:
+            first_op_obj = op_obj
+
+        curr = op_obj
         depth = 0
         while curr and depth < 10:
             depth += 1
             try:
                 import NXOpen.CAM
-                if isinstance(curr, NXOpen.CAM.Operation):
-                    parent = curr.GetParent(NXOpen.CAM.CAMSetup.View.Geometry)
-                else:
-                    parent = curr.GetParent()
+                view_geom = NXOpen.CAM.CAMSetup.View.Geometry
+                parent = None
+                try:
+                    parent = curr.GetParent(view_geom)
+                except Exception:
+                    try:
+                        parent = curr.GetParent()
+                    except Exception:
+                        parent = None
 
                 if not parent:
                     break
-                if isinstance(parent, NXOpen.CAM.OrientGeometry):
+                if is_mcs_geometry_node(parent):
                     mcs_node = parent
                     break
                 curr = parent
             except Exception:
                 break
+        if mcs_node is not None:
+            break
 
-    # 備援：若無工步回溯，自 Geometry Root 直接搜尋第一個 OrientGeometry
+    # 備援：若無工步回溯，自 Geometry Root 搜尋第一個 OrientGeometry
     if not mcs_node:
         try:
             import NXOpen.CAM
             geom_root = cam_setup.GetRoot(NXOpen.CAM.CAMSetup.View.Geometry)
             if geom_root:
                 def scan_mcs(node):
-                    if isinstance(node, NXOpen.CAM.OrientGeometry):
+                    if is_mcs_geometry_node(node):
                         return node
                     try:
                         for m in node.GetMembers():
