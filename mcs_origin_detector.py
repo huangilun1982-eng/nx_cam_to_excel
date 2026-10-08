@@ -48,48 +48,69 @@ def parse_fixture_offset_to_gcode(val):
 
 def determine_axis_orientation(origin_val, min_val, max_val, is_z_axis=False, tol=0.1):
     """
-    比對原點座標與幾何邊界盒 (Bounding Box)，判定方位標籤。
+    比對原點座標與幾何邊界盒 (Bounding Box)，依據相對空間位置與特徵距離判定方位標籤。
     
     規則：
-      X/Y 軸：0, MID, MAX
-      Z 軸：0, MID, TOP
+      X/Y 軸：0 (最小側邊緣), MID (中心分中), MAX (最大側邊緣)
+      Z 軸：0 (底面碰刀/台面基準), MID (厚度分中), TOP (頂面碰刀/上表面基準)
+      
+    設計重點：
+      1. 禁用絕對座標數值為0強制判定為0的錯誤邏輯，100% 依據原點相對於目標外包盒的空間位置決定。
+      2. 支援原點高於頂面 (預留切削量)、低於底面 (台面下偏置) 的邊界吸附。
+      3. 在實體厚度內部時，以最近特徵距離 (Nearest Distance) 判定歸屬區域。
     """
+    # 安全防護：若邊界盒無效或顛倒，自動修正
+    if min_val > max_val:
+        min_val, max_val = max_val, min_val
+
     mid_val = (min_val + max_val) / 2.0
 
     if is_z_axis:
         # Z 軸判定 (0, MID, TOP)
-        if abs(origin_val - max_val) <= tol:
+        # 1. 頂面邊界與上方區域吸附
+        if origin_val >= (max_val - tol):
             return "TOP"
-        elif abs(origin_val - mid_val) <= tol:
-            return "MID"
-        elif abs(origin_val - min_val) <= tol or abs(origin_val - 0.0) <= tol:
+        # 2. 底面邊界與下方區域吸附
+        if origin_val <= (min_val + tol):
             return "0"
-        elif origin_val >= max_val:
-            return "TOP"
-        elif origin_val <= min_val:
-            return "0"
-        else:
-            return "MID"
-    else:
-        # X / Y 軸判定 (0, MID, MAX)
+        # 3. 中心位置吸附 (中心公差內)
         if abs(origin_val - mid_val) <= tol:
             return "MID"
-        elif abs(origin_val - min_val) <= tol or (abs(origin_val - 0.0) <= tol and abs(min_val - 0.0) <= tol):
+        
+        # 4. 厚度內部依最近距離判定歸屬區域
+        dist_top = abs(origin_val - max_val)
+        dist_mid = abs(origin_val - mid_val)
+        dist_bot = abs(origin_val - min_val)
+
+        if dist_top <= dist_mid and dist_top <= dist_bot:
+            return "TOP"
+        elif dist_mid <= dist_top and dist_mid <= dist_bot:
+            return "MID"
+        else:
             return "0"
-        elif abs(origin_val - max_val) <= tol:
+    else:
+        # X / Y 軸判定 (0, MID, MAX)
+        # 1. 中心分中吸附
+        if abs(origin_val - mid_val) <= tol:
+            return "MID"
+        # 2. 最小側邊緣吸附
+        if origin_val <= (min_val + tol):
+            return "0"
+        # 3. 最大側邊緣吸附
+        if origin_val >= (max_val - tol):
             return "MAX"
-        elif abs(origin_val - 0.0) <= tol:
+        
+        # 4. 內部依最近距離判定
+        dist_min = abs(origin_val - min_val)
+        dist_mid = abs(origin_val - mid_val)
+        dist_max = abs(origin_val - max_val)
+
+        if dist_mid <= dist_min and dist_mid <= dist_max:
+            return "MID"
+        elif dist_min <= dist_max:
             return "0"
         else:
-            dist_min = abs(origin_val - min_val)
-            dist_mid = abs(origin_val - mid_val)
-            dist_max = abs(origin_val - max_val)
-            if dist_mid <= dist_min and dist_mid <= dist_max:
-                return "MID"
-            elif dist_min <= dist_max:
-                return "0"
-            else:
-                return "MAX"
+            return "MAX"
 
 def extract_bounding_box_for_entities(entities, uf_session):
     """

@@ -47,18 +47,29 @@ class TestMCSOriginDetector(unittest.TestCase):
         self.assertEqual(determine_axis_orientation(200.0, 0.0, 200.0, is_z_axis=False), "MAX")
 
     def test_z_axis_orientations(self):
-        # 零件 Z: [-50, 0]
-        # 頂面 0 -> TOP
+        # 1. 零件頂面為絕對 0: [-50, 0]，原點在頂面 0 -> TOP
         self.assertEqual(determine_axis_orientation(0.0, -50.0, 0.0, is_z_axis=True), "TOP")
-        # 底面 -50 -> 0
-        self.assertEqual(determine_axis_orientation(-50.0, -50.0, 0.0, is_z_axis=True), "0")
-        # 中間 -25 -> MID
+        # 2. 零件頂面為 0，原點高於頂面 (預留切削量 0.5mm) -> TOP
+        self.assertEqual(determine_axis_orientation(0.5, -50.0, 0.0, is_z_axis=True), "TOP")
+        # 3. 素材頂面為 0.5，原點在工件頂面 0 (靠近頂面 0.5mm，遠離中心 24.75mm) -> TOP
+        self.assertEqual(determine_axis_orientation(0.0, -50.0, 0.5, is_z_axis=True), "TOP")
+        # 4. 原點在頂面偏下一點點台階面 -0.2mm (靠近頂面) -> TOP
+        self.assertEqual(determine_axis_orientation(-0.2, -50.0, 0.0, is_z_axis=True), "TOP")
+
+        # 5. 零件底面為絕對 0: [0, 50]，原點在底面 0 -> 0
+        self.assertEqual(determine_axis_orientation(0.0, 0.0, 50.0, is_z_axis=True), "0")
+        # 6. 原點低於底面 (台面碰刀 -5mm) -> 0
+        self.assertEqual(determine_axis_orientation(-5.0, 0.0, 50.0, is_z_axis=True), "0")
+
+        # 7. 中心厚度分中: [-25, 25]，原點在 0 -> MID
+        self.assertEqual(determine_axis_orientation(0.0, -25.0, 25.0, is_z_axis=True), "MID")
+        # 8. 中心偏厚度: [-50, 0]，中心 -25 -> MID
         self.assertEqual(determine_axis_orientation(-25.0, -50.0, 0.0, is_z_axis=True), "MID")
 
-        # 零件 Z: [-20, 20]
-        self.assertEqual(determine_axis_orientation(20.0, -20.0, 20.0, is_z_axis=True), "TOP")
-        self.assertEqual(determine_axis_orientation(0.0, -20.0, 20.0, is_z_axis=True), "MID")
-        self.assertEqual(determine_axis_orientation(-20.0, -20.0, 20.0, is_z_axis=True), "0")
+        # 9. 零件厚度很薄 (如 1mm 薄板): [-1.0, 0.0]，原點在 0.0 -> TOP
+        self.assertEqual(determine_axis_orientation(0.0, -1.0, 0.0, is_z_axis=True), "TOP")
+        # 10. 薄板底面: [-1.0, 0.0]，原點在 -1.0 -> 0
+        self.assertEqual(determine_axis_orientation(-1.0, -1.0, 0.0, is_z_axis=True), "0")
 
     def test_extract_target_bounding_box_scheme2_cam_priority(self):
         """
