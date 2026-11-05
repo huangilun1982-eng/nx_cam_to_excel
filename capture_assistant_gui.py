@@ -24,6 +24,10 @@ import json
 def parse_args():
     parser = argparse.ArgumentParser(description="CNC 加工示圖精緻拍照小工具")
     parser.add_argument("--stage", type=str, default="通用工段", help="當前工段名稱")
+    parser.add_argument("--target-op", type=str, default="", help="該截圖所屬目標工序名稱")
+    parser.add_argument("--tools", type=str, default="", help="該工序所屬刀具說明")
+    parser.add_argument("--placement", type=str, default="", help="該截圖在工單中的版面位置")
+    parser.add_argument("--custom-seq", type=str, default="", help="工段自訂標記")
     parser.add_argument("--index", type=int, default=1, help="當前工段序號")
     parser.add_argument("--total", type=int, default=1, help="總工段數")
     parser.add_argument("--parent-hwnd", type=int, default=0, help="NX 主視窗句柄")
@@ -36,6 +40,13 @@ def parse_args():
 def main():
     args = parse_args()
     stage_name = args.stage
+    target_op = args.target_op.strip() if args.target_op else ""
+    if not target_op:
+        target_op = stage_name if stage_name != "通用工段" else "加工全貌"
+    tools_summary = args.tools.strip()
+    placement = args.placement.strip()
+    custom_seq = args.custom_seq.strip()
+
     curr_idx = args.index
     total_stages = args.total
     parent_hwnd = args.parent_hwnd
@@ -48,23 +59,26 @@ def main():
     if parent_hwnd == 0:
         parent_hwnd = user32.GetForegroundWindow()
 
-    display_name = stage_name if stage_name != "通用工段" else "加工全貌"
+    display_name = target_op
 
     root = tk.Tk()
-    root.title(f"📷 拍照引導 ({curr_idx}/{total_stages})")
+    root.title(f"📷 拍照引導 ({curr_idx}/{total_stages}) - 工序【{target_op}】")
     root.attributes("-topmost", True)
     root.resizable(False, False)
     root.configure(bg="#F0F4F8")
 
-    # 精緻小尺寸，置於螢幕右上角 (避免遮擋工作區)
-    win_w = 425
-    win_h = 135
+    # 精緻尺寸，置於螢幕右上角 (高度 170 像素清楚呈現工序詳細資訊與 5 個操作按鈕)
+    win_w = 520
+    win_h = 170
     screen_w = root.winfo_screenwidth()
     pos_x = max(10, screen_w - win_w - 30)
     pos_y = 60
     root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
 
     exit_code = [2] # 預設 2 為略過或取消
+
+    # 按鈕引用容器 (支援閉包跨作用域即時反饋，統一專案 ref 風格)
+    btn_snap_ref = [None]
 
     def trigger_f8_snap(event=None):
         """觸發 NX 畫面擺正 (F8 貼齊最接近之標準工藝視向)"""
@@ -77,9 +91,9 @@ def main():
                 pass
         # 提供即時視覺反饋，讓使用者明確感知按鈕已觸發且小工具不關閉
         try:
-            if 'btn_snap' in locals() or 'btn_snap' in globals():
-                btn_snap.config(text=" 📐 視角已擺正 ", bg="#004D40")
-                root.after(400, lambda: btn_snap.config(text=" 📐 視角擺正 (F8) ", bg="#008080"))
+            if btn_snap_ref[0] is not None:
+                btn_snap_ref[0].config(text=" 📐 視角已擺正 ", bg="#004D40")
+                root.after(400, lambda: btn_snap_ref[0].config(text=" 📐 視角擺正 (F8) ", bg="#008080") if btn_snap_ref[0] else None)
         except Exception:
             pass
 
@@ -209,23 +223,54 @@ def main():
         exit_code[0] = 2 # 2 代表略過
         root.destroy()
 
+    def on_back():
+        """回到上一步：若為首工序則返回分頁排版編輯器；若為後續工序則返回上一工序重拍"""
+        exit_code[0] = 3 # 3 代表回到上一步
+        root.destroy()
+
     root.protocol("WM_DELETE_WINDOW", on_skip)
 
-    # 視窗全域監聽鍵盤 F8 鍵
+    # 視窗全域監聽鍵盤 F8 鍵與 Alt+左鍵 (快捷返回上一步)
     root.bind("<F8>", trigger_f8_snap)
+    root.bind("<Alt-Left>", lambda e: on_back())
 
-    # 標題與工段標籤
+    # 標題列：指明當前拍照步驟
     lbl_title = tk.Label(
-        root, text=f"📷 工段示圖 ({curr_idx}/{total_stages})：{display_name}",
+        root, text=f"📷 示圖拍照引導 ({curr_idx}/{total_stages})",
         font=("Microsoft JhengHei", 10, "bold"), bg="#F0F4F8", fg="#004B87"
     )
-    lbl_title.pack(pady=(10, 2))
+    lbl_title.pack(pady=(6, 2))
+
+    # 工序用途與所屬刀具詳細資訊卡 (清楚顯示該截圖用於哪一個工序)
+    info_card = tk.Frame(root, bg="#E8F1F8", bd=1, relief=tk.SOLID, padx=8, pady=4)
+    info_card.pack(fill=tk.X, padx=12, pady=(0, 4))
+
+    # 第一行：目標工序名稱與工單版面位置
+    target_line = f"🎯 此截圖用於工序：【{target_op}】"
+    if custom_seq:
+        target_line += f" (標記: {custom_seq})"
+    if placement:
+        target_line += f"  |  📄 {placement}"
+
+    lbl_target_info = tk.Label(
+        info_card, text=target_line,
+        font=("Microsoft JhengHei", 9, "bold"), bg="#E8F1F8", fg="#0F4C81", anchor="w"
+    )
+    lbl_target_info.pack(fill=tk.X)
+
+    # 第二行：所屬刀具規格
+    tools_line = f"🔧 包含刀具：{tools_summary}" if tools_summary else f"🔧 包含刀具：工序【{target_op}】所有加工刀軌"
+    lbl_tools_info = tk.Label(
+        info_card, text=tools_line,
+        font=("Microsoft JhengHei", 8), bg="#E8F1F8", fg="#334155", anchor="w"
+    )
+    lbl_tools_info.pack(fill=tk.X)
 
     lbl_hint = tk.Label(
-        root, text="中鍵旋轉視圖 | 支援鍵盤 F8 擺正與圖層開關",
-        font=("Microsoft JhengHei", 9), bg="#F0F4F8", fg="#555555"
+        root, text="中鍵旋轉視圖 | 支援 F8 擺正與圖層開關 | ⬅ 可隨時返回上一步",
+        font=("Microsoft JhengHei", 8), bg="#F0F4F8", fg="#64748B"
     )
-    lbl_hint.pack(pady=(0, 8))
+    lbl_hint.pack(pady=(0, 5))
 
     # 按鈕列
     btn_frame = tk.Frame(root, bg="#F0F4F8")
@@ -238,16 +283,27 @@ def main():
         font=("Microsoft JhengHei", 9, "bold"), padx=6, pady=4, relief=tk.FLAT, cursor="hand2"
     )
     btn_snap.pack(side=tk.LEFT, padx=3)
+    btn_snap_ref[0] = btn_snap
 
     # 按鈕 2：圖層控制
     btn_layer = tk.Button(
         btn_frame, text=" 🗂 圖層控制 ", command=open_layer_manager,
         bg="#4A5568", fg="white", activebackground="#2D3748", activeforeground="white",
-        font=("Microsoft JhengHei", 9, "bold"), padx=6, pady=4, relief=tk.FLAT, cursor="hand2"
+        font=("Microsoft JhengHei", 9, "bold"), padx=5, pady=4, relief=tk.FLAT, cursor="hand2"
     )
     btn_layer.pack(side=tk.LEFT, padx=3)
 
-    # 按鈕 3：立即拍照
+    # 按鈕 3：回到上一步 (依使用者指示置於「立即拍照」左側)
+    # 第一工序顯示「⬅ 返回排版」，後續工序顯示「⬅ 上一步」
+    back_btn_text = " ⬅ 返回排版 " if curr_idx == 1 else " ⬅ 上一步 "
+    btn_back = tk.Button(
+        btn_frame, text=back_btn_text, command=on_back,
+        bg="#475569", fg="white", activebackground="#334155", activeforeground="white",
+        font=("Microsoft JhengHei", 9, "bold"), padx=6, pady=4, relief=tk.FLAT, cursor="hand2"
+    )
+    btn_back.pack(side=tk.LEFT, padx=3)
+
+    # 按鈕 4：立即拍照
     btn_confirm = tk.Button(
         btn_frame, text=" 📸 立即拍照 ", command=on_confirm,
         bg="#0078D7", fg="white", activebackground="#005A9E", activeforeground="white",

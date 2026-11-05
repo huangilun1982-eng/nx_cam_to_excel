@@ -379,6 +379,53 @@ class TestMCSOriginDetector(unittest.TestCase):
         )
         self.assertEqual(res_m2, "加工原點【G55】：X=MID, Y=MID, Z=TOP")
 
+    def test_strategy_a_bounding_box_exact_projection(self):
+        """
+        驗證策略 A (AskBoundingBoxExact) 回傳世界坐標時，能精確展開 8 個角點並投影至 MCS，
+        絕不將世界坐標誤當成局部坐標，確保頂面碰刀精確判定為 TOP。
+        """
+        mock_ent = MagicMock()
+        mock_ent.Tag = 7777
+
+        mock_uf = MagicMock()
+        # 模擬 AskBoundingBoxExact：世界坐標下工件 Z: 0~50, min_corner=[ -50, -50, 0 ]
+        min_corner = [-50.0, -50.0, 0.0]
+        directions = [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0]
+        ]
+        distances = [100.0, 100.0, 50.0]
+        mock_uf.Modl.AskBoundingBoxExact.return_value = (min_corner, directions, distances)
+
+        # MCS 原點在頂面碰刀點 (0, 0, 50)
+        origin = [0.0, 0.0, 50.0]
+        x_vec = [1.0, 0.0, 0.0]
+        y_vec = [0.0, 1.0, 0.0]
+        z_vec = [0.0, 0.0, 1.0]
+        csys_tag = 8888
+
+        found, b_min, b_max = extract_mcs_bounding_box_for_entities(
+            [mock_ent], mock_uf, origin, x_vec, y_vec, z_vec, csys_tag=csys_tag
+        )
+
+        self.assertTrue(found)
+        # 驗證局部空間 Z' 必須精確落在 [-50, 0]，底面為 -50，頂面為 0！
+        self.assertAlmostEqual(b_min[0], -50.0)
+        self.assertAlmostEqual(b_max[0], 50.0)
+        self.assertAlmostEqual(b_min[1], -50.0)
+        self.assertAlmostEqual(b_max[1], 50.0)
+        self.assertAlmostEqual(b_min[2], -50.0)
+        self.assertAlmostEqual(b_max[2], 0.0)
+
+        # 原點 0.0 比對 [-50.0, 0.0]，必須精確判定為 TOP，絕不可誤判為 0！
+        z_orient = determine_axis_orientation(0.0, b_min[2], b_max[2], is_z_axis=True)
+        self.assertEqual(z_orient, "TOP")
+        x_orient = determine_axis_orientation(0.0, b_min[0], b_max[0], is_z_axis=False)
+        self.assertEqual(x_orient, "MID")
+        y_orient = determine_axis_orientation(0.0, b_min[1], b_max[1], is_z_axis=False)
+        self.assertEqual(y_orient, "MID")
+
 if __name__ == "__main__":
     unittest.main()
 

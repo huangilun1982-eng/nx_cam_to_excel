@@ -94,25 +94,44 @@ def load_machine_profiles():
             pass
     return profiles
 
-def get_last_selected_profile_id():
+def get_post_settings():
     """
-    讀取上次工程師選取的機台 ID，預設為 FANUC_HORIZONTAL。
+    讀取上次工程師選取的機台與後處理器設定，包含機型檔頭 ID、後處理器名稱與自訂路徑。
+    回傳字典：
+    {
+        "last_selected_id": "FANUC_HORIZONTAL",
+        "last_selected_post": "Fanuc_2026",
+        "last_custom_post_path": ""
+    }
     """
     cfg_path = get_settings_path()
+    res = {
+        "last_selected_id": "FANUC_HORIZONTAL",
+        "last_selected_post": "Fanuc_2026",
+        "last_custom_post_path": ""
+    }
     if os.path.exists(cfg_path):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                last_id = data.get("last_selected_id", "FANUC_HORIZONTAL")
-                if last_id in DEFAULT_PROFILES:
-                    return last_id
+                if isinstance(data, dict):
+                    last_id = data.get("last_selected_id")
+                    if last_id and last_id in DEFAULT_PROFILES:
+                        res["last_selected_id"] = last_id
+                    last_post = data.get("last_selected_post")
+                    if last_post and isinstance(last_post, str):
+                        res["last_selected_post"] = last_post
+                    last_cust = data.get("last_custom_post_path")
+                    if last_cust and isinstance(last_cust, str):
+                        res["last_custom_post_path"] = last_cust
         except Exception:
             pass
-    return "FANUC_HORIZONTAL"
+    return res
 
-def save_last_selected_profile_id(profile_id):
+def save_post_settings(profile_id=None, post_name=None, custom_post_path=None):
     """
-    保存本次工程師選取的機台 ID。
+    保存本次工程師選取的機台設定 (機型檔頭、後處理器名稱、自訂後處理路徑)。
+    採用 Zero-Debug 原子寫入 (.tmp + fsync + replace)，防止斷電或衝突損毀。
     """
     cfg_path = get_settings_path()
     data = {}
@@ -120,10 +139,17 @@ def save_last_selected_profile_id(profile_id):
         try:
             with open(cfg_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
         except Exception:
             data = {}
 
-    data["last_selected_id"] = profile_id
+    if profile_id is not None:
+        data["last_selected_id"] = str(profile_id)
+    if post_name is not None:
+        data["last_selected_post"] = str(post_name)
+    if custom_post_path is not None:
+        data["last_custom_post_path"] = str(custom_post_path)
 
     # Zero-Debug 原子寫入
     tmp_path = cfg_path + ".tmp"
@@ -132,12 +158,27 @@ def save_last_selected_profile_id(profile_id):
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        if os.path.exists(cfg_path):
-            os.remove(cfg_path)
-        os.rename(tmp_path, cfg_path)
+        try:
+            os.replace(tmp_path, cfg_path)
+        except OSError:
+            if os.path.exists(cfg_path):
+                os.remove(cfg_path)
+            os.rename(tmp_path, cfg_path)
     except Exception:
         if os.path.exists(tmp_path):
             try:
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+def get_last_selected_profile_id():
+    """
+    讀取上次工程師選取的機台 ID，預設為 FANUC_HORIZONTAL。
+    """
+    return get_post_settings().get("last_selected_id", "FANUC_HORIZONTAL")
+
+def save_last_selected_profile_id(profile_id):
+    """
+    保存本次工程師選取的機台 ID。
+    """
+    save_post_settings(profile_id=profile_id)

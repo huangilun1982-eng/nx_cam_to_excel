@@ -17,7 +17,9 @@ from nc_processor import (
 from machine_profile_manager import (
     load_machine_profiles,
     get_last_selected_profile_id,
-    save_last_selected_profile_id
+    save_last_selected_profile_id,
+    get_post_settings,
+    save_post_settings
 )
 
 class TestNCProcessor(unittest.TestCase):
@@ -171,6 +173,84 @@ M30
 
         # 復原預設
         save_last_selected_profile_id("FANUC_HORIZONTAL")
+
+    def test_post_settings_persistence(self):
+        """
+        驗證機台後處理器設定完整持久化：包含機型、後處理名稱與自訂路徑
+        """
+        # 保存前狀態讀取
+        orig_settings = get_post_settings()
+
+        try:
+            # 1. 寫入完整自訂設定
+            save_post_settings(
+                profile_id="RAW",
+                post_name="Mazak_AC",
+                custom_post_path="C:/custom/my_post.tcl"
+            )
+            settings = get_post_settings()
+            self.assertEqual(settings["last_selected_id"], "RAW")
+            self.assertEqual(settings["last_selected_post"], "Mazak_AC")
+            self.assertEqual(settings["last_custom_post_path"], "C:/custom/my_post.tcl")
+
+            # 2. 部分更新 (僅更新後處理器名稱，保留其他欄位)
+            save_post_settings(post_name="YCM_noCheck")
+            settings2 = get_post_settings()
+            self.assertEqual(settings2["last_selected_id"], "RAW")
+            self.assertEqual(settings2["last_selected_post"], "YCM_noCheck")
+            self.assertEqual(settings2["last_custom_post_path"], "C:/custom/my_post.tcl")
+
+            # 3. 驗證 get_last_selected_profile_id 同步相容
+            self.assertEqual(get_last_selected_profile_id(), "RAW")
+        finally:
+            # 復原原始設定
+            save_post_settings(
+                profile_id=orig_settings.get("last_selected_id", "FANUC_HORIZONTAL"),
+                post_name=orig_settings.get("last_selected_post", "Fanuc_2026"),
+                custom_post_path=orig_settings.get("last_custom_post_path", "")
+            )
+
+    def test_nc_post_dialog_settings_restoration(self):
+        """
+        驗證 nc_post_dialog 視窗能自動自持久化設定恢復上次選擇的機台與後處理器
+        """
+        import tkinter as tk
+        from nc_post_dialog import NcPostDialogApp
+
+        orig_settings = get_post_settings()
+
+        try:
+            # 設定模擬上次選擇：BROTHER + YCM_noCheck
+            save_post_settings(
+                profile_id="BROTHER",
+                post_name="YCM_noCheck",
+                custom_post_path=""
+            )
+
+            root = tk.Tk()
+            root.withdraw()
+            try:
+                # 不傳遞 default_post 與 default_machine_profile，驗證自動載入持久化值
+                app = NcPostDialogApp(root, config={"nc_tasks": []})
+                self.assertEqual(app.combo_post.get(), "YCM_noCheck")
+                self.assertEqual(app.profile_var.get(), "BROTHER 機台 (攻牙機/小型加工中心)")
+
+                # 測試自動觸發 export_only，應再次更新並記住當前設定
+                app.on_export_only()
+                self.assertEqual(app.result["action"], "export_only")
+                self.assertEqual(app.result["machine_profile"], "BROTHER")
+                self.assertEqual(app.result["postprocessor_name"], "YCM_noCheck")
+            finally:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+        finally:
+            save_post_settings(
+                profile_id=orig_settings.get("last_selected_id", "FANUC_HORIZONTAL"),
+                post_name=orig_settings.get("last_selected_post", "Fanuc_2026"),
+                custom_post_path=orig_settings.get("last_custom_post_path", "")
+            )
 
 if __name__ == "__main__":
     unittest.main()

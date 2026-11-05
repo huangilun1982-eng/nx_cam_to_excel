@@ -8,6 +8,7 @@ __pycache__/
 _capture_debug.log
 ~$*.xlsx
 ~$*.xls
+*.bak*
 
 # OS generated files
 Thumbs.db

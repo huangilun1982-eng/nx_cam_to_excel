@@ -225,14 +225,52 @@ def extract_mcs_bounding_box_for_entities(entities, uf_session, origin, x_vec, y
                 # res 格式通常為 (min_corner, directions, distances)
                 if res and len(res) >= 3:
                     min_c, dirs, dists = res[0], res[1], res[2]
-                    # 若已直接取得局部尺寸
                     if len(min_c) >= 3 and len(dists) >= 3:
-                        c_min = [float(min_c[0]), float(min_c[1]), float(min_c[2])]
-                        c_max = [c_min[0] + float(dists[0]), c_min[1] + float(dists[1]), c_min[2] + float(dists[2])]
-                        for i in range(3):
-                            if c_min[i] < all_min[i]: all_min[i] = c_min[i]
-                            if c_max[i] > all_max[i]: all_max[i] = c_max[i]
-                        found = True
+                        # 兼容 directions 為 3x3 矩陣或 9 元素扁平列表
+                        d_matrix = []
+                        if len(dirs) == 3 and hasattr(dirs[0], "__len__") and len(dirs[0]) == 3:
+                            d_matrix = [
+                                [float(dirs[0][0]), float(dirs[0][1]), float(dirs[0][2])],
+                                [float(dirs[1][0]), float(dirs[1][1]), float(dirs[1][2])],
+                                [float(dirs[2][0]), float(dirs[2][1]), float(dirs[2][2])],
+                            ]
+                        elif len(dirs) >= 9:
+                            d_matrix = [
+                                [float(dirs[0]), float(dirs[1]), float(dirs[2])],
+                                [float(dirs[3]), float(dirs[4]), float(dirs[5])],
+                                [float(dirs[6]), float(dirs[7]), float(dirs[8])],
+                            ]
+                        else:
+                            d_matrix = [
+                                [1.0, 0.0, 0.0],
+                                [0.0, 1.0, 0.0],
+                                [0.0, 0.0, 1.0],
+                            ]
+
+                        dx0, dy0, dz0 = float(dists[0]), float(dists[1]), float(dists[2])
+                        mc_x, mc_y, mc_z = float(min_c[0]), float(min_c[1]), float(min_c[2])
+
+                        # UF_MODL_ask_bounding_box_exact 回傳之 min_corner 為世界絕對坐標點
+                        # 展開 8 個角點並精確投影至 MCS 局部坐標系中，確保相對於加工原點之方位判定 100% 正確
+                        box_corners = []
+                        for i in (0.0, 1.0):
+                            for j in (0.0, 1.0):
+                                for k in (0.0, 1.0):
+                                    pt_x = mc_x + i * dx0 * d_matrix[0][0] + j * dy0 * d_matrix[1][0] + k * dz0 * d_matrix[2][0]
+                                    pt_y = mc_y + i * dx0 * d_matrix[0][1] + j * dy0 * d_matrix[1][1] + k * dz0 * d_matrix[2][1]
+                                    pt_z = mc_z + i * dx0 * d_matrix[0][2] + j * dy0 * d_matrix[1][2] + k * dz0 * d_matrix[2][2]
+                                    box_corners.append([pt_x, pt_y, pt_z])
+
+                        for cpt in box_corners:
+                            px, py, pz = project_point_to_csys(cpt, origin, x_vec, y_vec, z_vec)
+                            found = True
+                            if px < all_min[0]: all_min[0] = px
+                            if px > all_max[0]: all_max[0] = px
+                            if py < all_min[1]: all_min[1] = py
+                            if py > all_max[1]: all_max[1] = py
+                            if pz < all_min[2]: all_min[2] = pz
+                            if pz > all_max[2]: all_max[2] = pz
+
                         ent_found = True
             except Exception:
                 pass
@@ -517,6 +555,14 @@ def is_mcs_geometry_node(node):
     return False
 
 
+_STAGE_MCS_CACHE = {}
+
+def clear_mcs_origin_cache():
+    """清空 MCS 原點解析快取"""
+    global _STAGE_MCS_CACHE
+    _STAGE_MCS_CACHE.clear()
+
+
 def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_session=None):
     """
     解析工段對應之加工原點說明字串 (100% 基於加工座標系 MCS 幾何轉換)。
@@ -596,6 +642,23 @@ def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_
     if not mcs_node:
         return fallback_result
 
+    # 區域快取機制：相同零件與相同 MCS 節點直接重用已計算方位，避免重複呼叫 C++ 底層量測
+    mcs_tag = getattr(mcs_node, "Tag", None)
+    if mcs_tag is None or not isinstance(mcs_tag, (int, str)):
+        mcs_key = id(mcs_node)
+    else:
+        mcs_key = mcs_tag
+
+    part_tag = getattr(work_part, "Tag", None)
+    if part_tag is None or not isinstance(part_tag, (int, str)):
+        part_key = id(work_part)
+    else:
+        part_key = part_tag
+
+    cache_key = (part_key, mcs_key)
+    if cache_key in _STAGE_MCS_CACHE:
+        return _STAGE_MCS_CACHE[cache_key]
+
     # 3. 讀取 MCS 資訊 (原點向量、姿態軸向與夾具偏置值)
     g_code = "G54"
     origin = [0.0, 0.0, 0.0]
@@ -633,7 +696,9 @@ def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_
         pass
 
     if not has_origin:
-        return f"加工原點【{g_code}】：X=MID, Y=MID, Z=TOP"
+        res_str = f"加工原點【{g_code}】：X=MID, Y=MID, Z=TOP"
+        _STAGE_MCS_CACHE[cache_key] = res_str
+        return res_str
 
     # 4. 依照方案 2 階梯引擎將目標實體投影至加工座標系 (MCS)
     found_box, local_min, local_max, source = extract_target_bounding_box_in_mcs(
@@ -651,7 +716,9 @@ def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_
 
     if not found_box or not local_min or not local_max:
         # 若無法讀取邊界盒，預設四面分中頂面碰刀
-        return f"加工原點【{g_code}】：X=MID, Y=MID, Z=TOP"
+        res_str = f"加工原點【{g_code}】：X=MID, Y=MID, Z=TOP"
+        _STAGE_MCS_CACHE[cache_key] = res_str
+        return res_str
 
     # 5. 加工座標系局部幾何比對運算
     # 在 MCS 局部空間中，原點自身的坐標永遠是 (0.0, 0.0, 0.0)！
@@ -660,4 +727,6 @@ def resolve_stage_mcs_origin_string(raw_ops, work_part=None, cam_setup=None, uf_
     y_orient = determine_axis_orientation(0.0, local_min[1], local_max[1], is_z_axis=False)
     z_orient = determine_axis_orientation(0.0, local_min[2], local_max[2], is_z_axis=True)
 
-    return f"加工原點【{g_code}】：X={x_orient}, Y={y_orient}, Z={z_orient}"
+    res_str = f"加工原點【{g_code}】：X={x_orient}, Y={y_orient}, Z={z_orient}"
+    _STAGE_MCS_CACHE[cache_key] = res_str
+    return res_str

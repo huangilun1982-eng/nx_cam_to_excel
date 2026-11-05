@@ -125,11 +125,27 @@ class NcPostDialogApp:
     def __init__(self, master, config):
         self.master = master
         self.config = config
+
+        persisted_settings = {}
+        try:
+            from machine_profile_manager import get_post_settings
+            persisted_settings = get_post_settings()
+        except Exception:
+            pass
+
+        def_post = config.get("default_post") or persisted_settings.get("last_selected_post", "Fanuc_2026")
+        def_profile = config.get("default_machine_profile") or persisted_settings.get("last_selected_id", "FANUC_HORIZONTAL")
+        def_custom_path = config.get("custom_post_path") or persisted_settings.get("last_custom_post_path", "")
+
+        self.default_post = str(def_post).strip()
+        self.default_machine_profile = str(def_profile).strip()
+        self.custom_post_path = str(def_custom_path).strip()
+
         self.result = {
             "action": "cancel",
             "postprocessor_name": "",
-            "machine_profile": "fanuc_horizontal",
-            "custom_post_path": "",
+            "machine_profile": self.default_machine_profile,
+            "custom_post_path": self.custom_post_path,
             "output_dir": config.get("output_dir", ""),
             "extension": ".nc"
         }
@@ -251,6 +267,16 @@ class NcPostDialogApp:
         if not post_names:
             post_names = ["Fanuc_2026", "YCM_noCheck", "840D_3axis", "Mazak_AC"]
 
+        # 檢驗並恢復上次自訂後處理路徑
+        if self.custom_post_path and os.path.exists(self.custom_post_path):
+            post_base = os.path.splitext(os.path.basename(self.custom_post_path))[0]
+            custom_label = f"[自訂] {post_base}"
+            if custom_label not in post_names:
+                post_names.insert(0, custom_label)
+
+        if self.default_post and self.default_post not in post_names:
+            post_names.insert(0, self.default_post)
+
         self.combo_post = ttk.Combobox(
             row_post,
             textvariable=self.post_var,
@@ -260,10 +286,9 @@ class NcPostDialogApp:
         )
         self.combo_post.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
-        # 預設選中 Fanuc_2026 或第一項
-        default_post = self.config.get("default_post", "Fanuc_2026")
-        if default_post in post_names:
-            self.combo_post.set(default_post)
+        # 預設選中上次選定後處理器、Fanuc_2026 或第一項
+        if self.default_post in post_names:
+            self.combo_post.set(self.default_post)
         elif post_names:
             self.combo_post.set(post_names[0])
 
@@ -293,12 +318,16 @@ class NcPostDialogApp:
 
         self.profile_var = tk.StringVar()
         self.profile_display_map = {
-            "Fanuc 臥式機 (B0/G30/四軸專用)": "fanuc_horizontal",
-            "Fanuc 立式機 (標準三軸)": "fanuc_vertical",
-            "BROTHER 機台 (攻牙機/小型加工中心)": "brother",
-            "原始輸出 (不套用檔頭替換)": "raw"
+            "Fanuc 臥式機 (B0/G30/四軸專用)": "FANUC_HORIZONTAL",
+            "Fanuc 立式機 (標準三軸)": "FANUC_VERTICAL",
+            "BROTHER 機台 (攻牙機/小型加工中心)": "BROTHER",
+            "原始輸出 (不套用檔頭替換)": "RAW"
         }
-        self.profile_reverse_map = {v: k for k, v in self.profile_display_map.items()}
+        # 同時建立大寫與小寫鍵值的反向映射，確保 100% 雙向相容
+        self.profile_reverse_map = {}
+        for k, v in self.profile_display_map.items():
+            self.profile_reverse_map[v] = k
+            self.profile_reverse_map[v.lower()] = k
 
         profile_display_names = list(self.profile_display_map.keys())
         self.combo_profile = ttk.Combobox(
@@ -310,7 +339,7 @@ class NcPostDialogApp:
         )
         self.combo_profile.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        default_prof_id = self.config.get("default_machine_profile", "fanuc_horizontal")
+        default_prof_id = self.default_machine_profile
         default_prof_label = self.profile_reverse_map.get(default_prof_id, profile_display_names[0])
         self.combo_profile.set(default_prof_label)
 
@@ -464,9 +493,26 @@ class NcPostDialogApp:
         )
         if path:
             post_base = os.path.splitext(os.path.basename(path))[0]
+            custom_label = f"[自訂] {post_base}"
             # 存入自訂路徑
             self.result["custom_post_path"] = path
-            self.post_var.set(f"[自訂] {post_base}")
+            vals = list(self.combo_post["values"])
+            if custom_label not in vals:
+                vals.insert(0, custom_label)
+                self.combo_post["values"] = vals
+            self.post_var.set(custom_label)
+
+    def _save_current_settings(self, prof_id, post_name):
+        """持久化儲存當前設定至 nc_machine_settings.json"""
+        try:
+            from machine_profile_manager import save_post_settings
+            save_post_settings(
+                profile_id=prof_id,
+                post_name=post_name if post_name else None,
+                custom_post_path=self.result.get("custom_post_path", "")
+            )
+        except Exception:
+            pass
 
     def browse_output_dir(self):
         """選擇 NC 檔案輸出目錄"""
@@ -485,7 +531,7 @@ class NcPostDialogApp:
             return
 
         prof_label = self.profile_var.get().strip()
-        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
+        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
 
         self.result["action"] = "post_and_export"
         self.result["postprocessor_name"] = selected_post
@@ -494,6 +540,7 @@ class NcPostDialogApp:
         self.result["extension"] = self.ext_var.get().strip()
         if not self.result["extension"].startswith("."):
             self.result["extension"] = "." + self.result["extension"]
+        self._save_current_settings(prof_id, selected_post)
         self.master.destroy()
 
     def on_post_only(self):
@@ -504,7 +551,7 @@ class NcPostDialogApp:
             return
 
         prof_label = self.profile_var.get().strip()
-        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
+        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
 
         self.result["action"] = "post_only"
         self.result["postprocessor_name"] = selected_post
@@ -513,14 +560,20 @@ class NcPostDialogApp:
         self.result["extension"] = self.ext_var.get().strip()
         if not self.result["extension"].startswith("."):
             self.result["extension"] = "." + self.result["extension"]
+        self._save_current_settings(prof_id, selected_post)
         self.master.destroy()
 
     def on_export_only(self):
         """使用者選擇僅匯出工單 (不轉 NC)"""
         prof_label = self.profile_var.get().strip()
-        prof_id = self.profile_display_map.get(prof_label, "fanuc_horizontal")
+        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
+        selected_post = self.post_var.get().strip()
+
         self.result["action"] = "export_only"
         self.result["machine_profile"] = prof_id
+        if selected_post:
+            self.result["postprocessor_name"] = selected_post
+        self._save_current_settings(prof_id, selected_post)
         self.master.destroy()
 
     def on_cancel(self):

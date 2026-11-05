@@ -219,44 +219,7 @@ def transform_nc_content_by_profile(original_nc, profile_id, header_info, mcs_or
         # RAW 模式
         return sanitized_original
 
-def prompt_machine_selection_gui():
-    """
-    透過獨立子進程啟動機型與任務模式選擇視窗 (Zero-Debug 進程隔離)。
-    回傳 dict: {"action": "ok"|"cancel", "profile_id": "...", "run_mode": "FULL_DOC_AND_NC"|"NC_ONLY"}
-    """
-    import subprocess
-    import json
-    from machine_profile_manager import get_last_selected_profile_id
 
-    cur_dir = os.path.dirname(os.path.abspath(__file__))
-    ui_script = os.path.join(cur_dir, "nc_machine_selector_ui.py")
-    last_id = get_last_selected_profile_id()
-
-    fallback_res = {
-        "action": "ok",
-        "profile_id": last_id,
-        "run_mode": "FULL_DOC_AND_NC"
-    }
-
-    if not os.path.exists(ui_script):
-        return fallback_res
-
-    try:
-        # 使用外部 Python 3.13 執行 UI 視窗
-        proc = subprocess.run(
-            ["py", "-3.13", ui_script],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
-        for line in proc.stdout.splitlines():
-            if line.startswith("__JSON_RESULT__:"):
-                json_str = line.replace("__JSON_RESULT__:", "").strip()
-                return json.loads(json_str)
-    except Exception:
-        pass
-
-    return fallback_res
 
 def run_nx_postprocess(cam_setup, cam_objects, post_name, output_file):
     """

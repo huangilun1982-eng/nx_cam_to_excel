@@ -85,7 +85,7 @@ except ImportError:
 
 # 匯入 NC 程式後處理與機型檔頭轉換引擎 (支援本機與 Journal 動態加載)
 try:
-    from nc_processor import prompt_machine_selection_gui, process_and_export_nc_tasks
+    from nc_processor import process_and_export_nc_tasks
 except ImportError:
     import importlib.util
     _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
@@ -94,13 +94,40 @@ except ImportError:
         _spec_nc = importlib.util.spec_from_file_location("nc_processor", _nc_path)
         _mod_nc = importlib.util.module_from_spec(_spec_nc)
         _spec_nc.loader.exec_module(_mod_nc)
-        prompt_machine_selection_gui = _mod_nc.prompt_machine_selection_gui
         process_and_export_nc_tasks = _mod_nc.process_and_export_nc_tasks
     else:
-        def prompt_machine_selection_gui():
-            return {"action": "ok", "profile_id": "FANUC_HORIZONTAL", "run_mode": "FULL_DOC_AND_NC"}
         def process_and_export_nc_tasks(*args, **kwargs):
             return 0, 0
+
+# 匯入機型配置記憶管理器 (支援本機與 Journal 動態加載)
+try:
+    from machine_profile_manager import (
+        get_last_selected_profile_id,
+        save_last_selected_profile_id,
+        get_post_settings,
+        save_post_settings
+    )
+except ImportError:
+    import importlib.util
+    _cur_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in locals() else r"c:\NX_Standard\Template"
+    _mpm_path = os.path.join(_cur_dir, "machine_profile_manager.py")
+    if os.path.exists(_mpm_path):
+        _spec_mpm = importlib.util.spec_from_file_location("machine_profile_manager", _mpm_path)
+        _mod_mpm = importlib.util.module_from_spec(_spec_mpm)
+        _spec_mpm.loader.exec_module(_mod_mpm)
+        get_last_selected_profile_id = _mod_mpm.get_last_selected_profile_id
+        save_last_selected_profile_id = _mod_mpm.save_last_selected_profile_id
+        get_post_settings = _mod_mpm.get_post_settings
+        save_post_settings = _mod_mpm.save_post_settings
+    else:
+        def get_last_selected_profile_id():
+            return "FANUC_HORIZONTAL"
+        def save_last_selected_profile_id(pid):
+            pass
+        def get_post_settings():
+            return {"last_selected_id": "FANUC_HORIZONTAL", "last_selected_post": "Fanuc_2026", "last_custom_post_path": ""}
+        def save_post_settings(profile_id=None, post_name=None, custom_post_path=None):
+            pass
 
 # ==================== 設定區 (參考 ExcelTool 規則) ====================
 ROWS_PER_PAGE = 10                  # ShopDoc_Template.xlsx 每頁工步上限 (Row 7 ~ Row 16)
@@ -962,6 +989,7 @@ def get_distinct_stages(chunks):
 # ==================== 跨機器環境與組件智慧解析引擎 ====================
 _CACHED_PYTHON_RUNTIME_GUI = None
 _CACHED_PYTHON_RUNTIME_NOGUI = None
+_CACHED_PYTHON_RUNTIME_PILLOW = None
 
 def resolve_project_root_dir(the_session=None, work_part=None):
     """
@@ -1080,31 +1108,76 @@ def resolve_asset_file(filename, the_session=None, work_part=None):
 
     return target_path
 
-def resolve_python_runtime(require_gui=True):
+def is_valid_external_python(exe_path):
+    """嚴格校驗是否為合法外部獨立 Python 直譯器 (絕不誤判 ugraf.exe 或 NX 內建環境)"""
+    if not exe_path or not os.path.exists(exe_path):
+        return False
+    bname = os.path.basename(exe_path).lower()
+    if not (bname.startswith("python") or bname.startswith("py")):
+        return False
+    p_lower = exe_path.lower()
+    if "ugraf" in p_lower or "nxbin" in p_lower or "siemens" in p_lower:
+        return False
+    return True
+
+def resolve_python_runtime(require_gui=True, require_pillow=False):
     """
     全方位跨機器 Python 直譯器智慧探測與純淨環境建構器
     支援：
     1. Windows 註冊表掃描 (Python 3.8 ~ 3.14+)
     2. 常見安裝目錄列舉 (AppData, ProgramFiles, Anaconda, Miniconda)
     3. Windows Python Launcher (pyw.exe / py.exe -3)
-    4. 系統 PATH 探測 (安全排除 WindowsApps 微軟商店假捷徑)
-    5. 當前直譯器 sys.executable
-    6. 針對 GUI 對話框進行輕量級 Tkinter 可用性快速校驗
-    7. 徹底隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl/Tk 版本衝突
+    4. 系統 PATH 探測 (安全排除 WindowsApps 微軟商店假捷徑與 NX ugraf.exe)
+    5. 嚴格隔離 NX 專屬的 PYTHONHOME / PYTHONPATH 與 Tcl/Tk 版本衝突
+    6. 支援 require_gui (Tkinter 校驗) 與 require_pillow (Pillow 影像庫校驗)
     回傳: (interpreter_cmd_list, clean_env)
     """
-    global _CACHED_PYTHON_RUNTIME_GUI, _CACHED_PYTHON_RUNTIME_NOGUI
+    global _CACHED_PYTHON_RUNTIME_GUI, _CACHED_PYTHON_RUNTIME_NOGUI, _CACHED_PYTHON_RUNTIME_PILLOW
 
     if require_gui and _CACHED_PYTHON_RUNTIME_GUI is not None:
         cmd, env = _CACHED_PYTHON_RUNTIME_GUI
-        return list(cmd), env.copy()
-    if not require_gui and _CACHED_PYTHON_RUNTIME_NOGUI is not None:
+        return (list(cmd), env.copy()) if cmd else (None, env.copy())
+    if require_pillow and _CACHED_PYTHON_RUNTIME_PILLOW is not None:
+        cmd, env = _CACHED_PYTHON_RUNTIME_PILLOW
+        return (list(cmd), env.copy()) if cmd else (None, env.copy())
+    if not require_gui and not require_pillow and _CACHED_PYTHON_RUNTIME_NOGUI is not None:
         cmd, env = _CACHED_PYTHON_RUNTIME_NOGUI
-        return list(cmd), env.copy()
+        return (list(cmd), env.copy()) if cmd else (None, env.copy())
 
     candidates = []
 
-    # 1. 掃描 Windows 註冊表 (HKCU 與 HKLM)
+    # Fast-Path 1. 當前直譯器 (僅當真正為獨立 Python 時納入，絕對排除 ugraf.exe 與 nxbin)
+    if sys.executable and is_valid_external_python(sys.executable):
+        candidates.append([sys.executable])
+
+    # Fast-Path 2. 掃描 Windows Python Launcher (pyw.exe / py.exe -3)
+    py_launcher = shutil.which("pyw") or shutil.which("py")
+    if not py_launcher:
+        for p_cand in [
+            r"C:\Windows\pyw.exe",
+            r"C:\Windows\py.exe",
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\pyw.exe"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\py.exe")
+        ]:
+            try:
+                if is_valid_external_python(p_cand):
+                    py_launcher = p_cand
+                    break
+            except Exception:
+                pass
+    if py_launcher:
+        candidates.append([py_launcher, "-3"])
+
+    # Fast-Path 3. 掃描 PATH (排除 WindowsApps 假捷徑與 NX)
+    for cmd in ["pythonw", "python"]:
+        try:
+            found = shutil.which(cmd)
+            if is_valid_external_python(found) and "windowsapps" not in found.lower():
+                candidates.append([found])
+        except Exception:
+            pass
+
+    # 4. 掃描 Windows 註冊表 (HKCU 與 HKLM) - 深度回退備援
     if winreg:
         for root in [winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE]:
             for key_path in [r"Software\Python\PythonCore", r"Software\WOW6432Node\Python\PythonCore"]:
@@ -1121,16 +1194,16 @@ def resolve_python_runtime(require_gui=True):
                                     if install_dir and os.path.isdir(install_dir):
                                         pw = os.path.join(install_dir, "pythonw.exe")
                                         p = os.path.join(install_dir, "python.exe")
-                                        if os.path.exists(pw):
+                                        if is_valid_external_python(pw):
                                             candidates.append([pw])
-                                        if os.path.exists(p):
+                                        if is_valid_external_python(p):
                                             candidates.append([p])
                             except Exception:
                                 pass
                 except Exception:
                     pass
 
-    # 2. 智慧列舉常見安裝目錄
+    # 5. 智慧列舉常見安裝目錄 - 深度回退備援
     patterns = [
         os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Python3*"),
         os.path.join(os.environ.get("ProgramFiles", ""), r"Python3*"),
@@ -1148,46 +1221,21 @@ def resolve_python_runtime(require_gui=True):
                 if os.path.isdir(p_dir):
                     pw = os.path.join(p_dir, "pythonw.exe")
                     p = os.path.join(p_dir, "python.exe")
-                    if os.path.exists(pw):
+                    if is_valid_external_python(pw):
                         candidates.append([pw])
-                    if os.path.exists(p):
+                    if is_valid_external_python(p):
                         candidates.append([p])
         except Exception:
             pass
 
-    # 3. 掃描 Windows Python Launcher (pyw.exe / py.exe)
-    py_launcher = shutil.which("pyw") or shutil.which("py")
-    if not py_launcher:
-        for p_cand in [
-            r"C:\Windows\pyw.exe",
-            r"C:\Windows\py.exe",
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\pyw.exe"),
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), r"Programs\Python\Launcher\py.exe")
-        ]:
-            try:
-                if os.path.exists(p_cand):
-                    py_launcher = p_cand
-                    break
-            except Exception:
-                pass
-    if py_launcher:
-        candidates.append([py_launcher, "-3"])
-
-    # 4. 掃描 PATH (排除 WindowsApps 假捷徑)
-    for cmd in ["pythonw", "python"]:
-        try:
-            found = shutil.which(cmd)
-            if found and "windowsapps" not in found.lower():
-                candidates.append([found])
-        except Exception:
-            pass
-
-    # 5. 當前直譯器 (若是 NX 內建 Python 或系統 Python)
-    if sys.executable and os.path.exists(sys.executable):
-        candidates.append([sys.executable])
-
     seen_keys = set()
     CREATE_NO_WINDOW = 0x08000000
+
+    test_snippet = "import sys"
+    if require_gui:
+        test_snippet = "import tkinter"
+    elif require_pillow:
+        test_snippet = "from PIL import Image"
 
     for cand_cmd in candidates:
         cand_key = tuple(cand_cmd)
@@ -1217,27 +1265,28 @@ def resolve_python_runtime(require_gui=True):
 
             py_dlls = os.path.join(py_dir, "DLLs")
             py_scripts = os.path.join(py_dir, "Scripts")
-            filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin\\python" not in p.lower()]
+            filtered_paths = [p for p in clean_env.get("PATH", "").split(";") if p and "nxbin" not in p.lower() and "siemens" not in p.lower()]
             clean_env["PATH"] = ";".join([py_dlls, py_dir, py_scripts] + filtered_paths)
 
-        if require_gui:
-            test_cmd = list(cand_cmd) + ["-c", "import tkinter"]
-            try:
-                res = subprocess.run(
-                    test_cmd,
-                    capture_output=True,
-                    timeout=2,
-                    env=clean_env,
-                    creationflags=CREATE_NO_WINDOW
-                )
-                if res.returncode == 0:
+        test_cmd = list(cand_cmd) + ["-c", test_snippet]
+        try:
+            res = subprocess.run(
+                test_cmd,
+                capture_output=True,
+                timeout=3,
+                env=clean_env,
+                creationflags=CREATE_NO_WINDOW
+            )
+            if res.returncode == 0:
+                if require_gui:
                     _CACHED_PYTHON_RUNTIME_GUI = (cand_cmd, clean_env)
-                    return list(cand_cmd), clean_env
-            except Exception:
-                continue
-        else:
-            _CACHED_PYTHON_RUNTIME_NOGUI = (cand_cmd, clean_env)
-            return list(cand_cmd), clean_env
+                elif require_pillow:
+                    _CACHED_PYTHON_RUNTIME_PILLOW = (cand_cmd, clean_env)
+                else:
+                    _CACHED_PYTHON_RUNTIME_NOGUI = (cand_cmd, clean_env)
+                return list(cand_cmd), clean_env
+        except Exception:
+            continue
 
     # 若未找到任何可用直譯器，真實回傳 None (由 NX 原生對話框接手處理)
     fallback_env = os.environ.copy()
@@ -1245,6 +1294,8 @@ def resolve_python_runtime(require_gui=True):
     fallback_env.pop("PYTHONPATH", None)
     if require_gui:
         _CACHED_PYTHON_RUNTIME_GUI = (None, fallback_env)
+    elif require_pillow:
+        _CACHED_PYTHON_RUNTIME_PILLOW = (None, fallback_env)
     else:
         _CACHED_PYTHON_RUNTIME_NOGUI = (None, fallback_env)
     return None, fallback_env
@@ -1260,85 +1311,485 @@ def get_clean_subprocess_env():
         return valid_pythonw, env
     return None, env
 
+def post_process_captured_image(image_path, op_name="", margin_pct=0.04, listing=None):
+    """
+    一體化高效記憶體影像處理管線：
+    在單次載入與單次寫入中，依序完成：
+    1. 背景純白化 (RGBA 複合至純白底，解決透明背景與暗角)
+    2. 智慧邊界緊湊裁切 (基於 C 語言等級像素遮罩 getbbox() 偵測有效幾何邊界，加 4% 安全呼吸留白)
+    3. 工序名稱膠囊壓印 (深藍底 #004B87 白字圓角矩形，自適應字體大小)
+    4. 高效原子儲存 (單次磁碟 I/O，使用 compress_level=1 減少 80% CPU 壓縮時間，.tmp.png + os.replace)
+    雙層防護：優先當前直譯器 PIL 執行，若無 PIL 則呼叫外部 Python 單進程一次性完成。
+    """
+    if not image_path or not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+        return False
+
+    display_text = op_name if op_name and op_name != "通用工段" else ("加工示圖 / 裝夾全貌" if op_name else "")
+    label_text = display_text if display_text else ""
+
+    # 1. 優先嘗試在當前直譯器中於記憶體中一體化處理
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        tmp_path = image_path + ".tmp.png"
+        with Image.open(image_path) as im:
+            # 步驟 1: 背景純白化 (處理 Alpha 通道)
+            im_rgba = im.convert("RGBA")
+            bg = Image.new("RGBA", im_rgba.size, (255, 255, 255, 255))
+            bg.paste(im_rgba, mask=im_rgba.split()[-1])
+            rgb_im = bg.convert("RGB")
+            orig_w, orig_h = rgb_im.size
+
+            # 步驟 2: 智慧邊界緊湊裁切 (C 語言等級 getbbox)
+            gray = rgb_im.convert("L")
+            mask = gray.point(lambda p: 255 if p < 250 else 0)
+            bbox = mask.getbbox()
+            cropped_im = rgb_im
+            crop_done = False
+            w, h = orig_w, orig_h
+            if bbox:
+                bx0, by0, bx1, by1 = bbox
+                bw, bh = bx1 - bx0, by1 - by0
+                if not (bw >= orig_w * 0.95 and bh >= orig_h * 0.95):
+                    pad_x = max(20, int(bw * margin_pct))
+                    pad_y = max(20, int(bh * margin_pct))
+                    x0 = max(0, bx0 - pad_x)
+                    y0 = max(0, by0 - pad_y)
+                    x1 = min(orig_w, bx1 + pad_x)
+                    y1 = min(orig_h, by1 + pad_y)
+                    if (x1 - x0) >= 100 and (y1 - y0) >= 100:
+                        cropped_im = rgb_im.crop((x0, y0, x1, y1))
+                        w, h = cropped_im.size
+                        crop_done = True
+
+            # 步驟 3: 壓印工序名稱膠囊
+            if label_text:
+                font_size = max(20, min(34, int(w / 50)))
+                font = None
+                for font_candidate in [
+                    "C:/Windows/Fonts/msjhbd.ttc",
+                    "C:/Windows/Fonts/msjh.ttc",
+                    "C:/Windows/Fonts/mingliu.ttc",
+                    "C:/Windows/Fonts/simhei.ttf"
+                ]:
+                    if os.path.exists(font_candidate):
+                        try:
+                            font = ImageFont.truetype(font_candidate, font_size)
+                            break
+                        except Exception:
+                            pass
+                if font is None:
+                    font = ImageFont.load_default()
+
+                draw = ImageDraw.Draw(cropped_im)
+                tb = draw.textbbox((0, 0), label_text, font=font)
+                tw = tb[2] - tb[0]
+                th = tb[3] - tb[1]
+                pad_x = 16
+                pad_y = 8
+                margin_x = 24
+                margin_y = 24
+                box = [margin_x, margin_y, margin_x + tw + pad_x * 2, margin_y + th + pad_y * 2]
+                draw.rounded_rectangle(box, radius=8, fill=(0, 75, 135), outline=(255, 255, 255), width=2)
+                draw.text((margin_x + pad_x, margin_y + pad_y - 2), label_text, fill=(255, 255, 255), font=font)
+
+            # 步驟 4: 高效原子儲存 (單次磁碟 I/O，compress_level=1)
+            cropped_im.save(tmp_path, "PNG", compress_level=1)
+            try:
+                if cropped_im is not rgb_im:
+                    cropped_im.close()
+                rgb_im.close()
+                bg.close()
+                im_rgba.close()
+            except Exception:
+                pass
+
+        os.replace(tmp_path, image_path)
+        if listing:
+            if crop_done:
+                listing.WriteLine(f"  - 示圖智慧裁切完成：原尺寸 {orig_w}x{orig_h} -> 裁切後 {w}x{h}，工件特徵顯著放大。")
+            if label_text:
+                listing.WriteLine(f"  - 已於示圖左上角壓印工序標記：{label_text}")
+        return True
+    except Exception:
+        pass
+
+    # 2. 備援：若當前直譯器無 PIL，透過外部 Python 於單一進程完成全部步驟
+    try:
+        external_script = (
+            "import os, sys\n"
+            "from PIL import Image, ImageDraw, ImageFont\n"
+            "def process_all(path, text, margin_pct=0.04):\n"
+            "    with Image.open(path) as im:\n"
+            "        im_rgba = im.convert('RGBA')\n"
+            "        bg = Image.new('RGBA', im_rgba.size, (255, 255, 255, 255))\n"
+            "        bg.paste(im_rgba, mask=im_rgba.split()[-1])\n"
+            "        rgb_im = bg.convert('RGB')\n"
+            "        orig_w, orig_h = rgb_im.size\n"
+            "        gray = rgb_im.convert('L')\n"
+            "        mask = gray.point(lambda p: 255 if p < 250 else 0)\n"
+            "        bbox = mask.getbbox()\n"
+            "        cropped_im = rgb_im\n"
+            "        w, h = orig_w, orig_h\n"
+            "        if bbox:\n"
+            "            bx0, by0, bx1, by1 = bbox\n"
+            "            bw, bh = bx1 - bx0, by1 - by0\n"
+            "            if not (bw >= orig_w * 0.95 and bh >= orig_h * 0.95):\n"
+            "                pad_x = max(20, int(bw * margin_pct))\n"
+            "                pad_y = max(20, int(bh * margin_pct))\n"
+            "                x0 = max(0, bx0 - pad_x)\n"
+            "                y0 = max(0, by0 - pad_y)\n"
+            "                x1 = min(orig_w, bx1 + pad_x)\n"
+            "                y1 = min(orig_h, by1 + pad_y)\n"
+            "                if (x1 - x0) >= 100 and (y1 - y0) >= 100:\n"
+            "                    cropped_im = rgb_im.crop((x0, y0, x1, y1))\n"
+            "                    w, h = cropped_im.size\n"
+            "        if text:\n"
+            "            font_size = max(20, min(34, int(w / 50)))\n"
+            "            font = None\n"
+            "            for fc in ['C:/Windows/Fonts/msjhbd.ttc', 'C:/Windows/Fonts/msjh.ttc', 'C:/Windows/Fonts/mingliu.ttc']:\n"
+            "                if os.path.exists(fc):\n"
+            "                    try:\n"
+            "                        font = ImageFont.truetype(fc, font_size)\n"
+            "                        break\n"
+            "                    except Exception: pass\n"
+            "            if font is None: font = ImageFont.load_default()\n"
+            "            draw = ImageDraw.Draw(cropped_im)\n"
+            "            tb = draw.textbbox((0, 0), text, font=font)\n"
+            "            tw, th = tb[2] - tb[0], tb[3] - tb[1]\n"
+            "            pad_x, pad_y, margin_x, margin_y = 16, 8, 24, 24\n"
+            "            box = [margin_x, margin_y, margin_x + tw + pad_x * 2, margin_y + th + pad_y * 2]\n"
+            "            draw.rounded_rectangle(box, radius=8, fill=(0, 75, 135), outline=(255, 255, 255), width=2)\n"
+            "            draw.text((margin_x + pad_x, margin_y + pad_y - 2), text, fill=(255, 255, 255), font=font)\n"
+            "        tmp_p = path + '.tmp.png'\n"
+            "        cropped_im.save(tmp_p, 'PNG', compress_level=1)\n"
+            "    os.replace(tmp_p, path)\n"
+            f"process_all(r'{image_path}', r'{label_text}')\n"
+        )
+        py_cmd, py_env = resolve_python_runtime(require_gui=False)
+        if py_cmd:
+            full_cmd = list(py_cmd) + ["-c", external_script]
+            res = subprocess.run(full_cmd, timeout=8, env=py_env, creationflags=0x08000000)
+            if res.returncode == 0:
+                if listing:
+                    listing.WriteLine(f"  - [外部直譯器] 示圖一體化後處理完成。")
+                return True
+    except Exception:
+        pass
+
+    return False
+
+
 def ensure_white_background_image(png_path):
     """
     確保圖檔背景為 100% 純白色 (RGB 255, 255, 255)：
-    1. 若圖檔包含 Alpha 透明通道，複合至純白底色；
-    2. 若圖檔為 RGB 但四周邊界非純白色 (如 NX 漸變背景未清除)，執行邊界多點泛洪填充 (Floodfill) 將外圍背景清洗為純白。
-    雙層防護：支援當前直譯器 PIL 與外部 Python (已安裝 Pillow) 執行。
+    若圖檔包含 Alpha 透明通道，複合至純白底色，並以原子寫入快速儲存。
+    僅在當前直譯器具備 PIL 時快速處理；若無 PIL 則直接返回 (NX 內部已設定純白底色 Plain 1.0, 1.0, 1.0)，
+    絕不啟動外部進程造成數秒卡頓。
     """
-    if not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
+    if not png_path or not os.path.exists(png_path) or os.path.getsize(png_path) == 0:
         return
 
-    # 優先嘗試在當前直譯器中運行
     try:
-        from PIL import Image, ImageDraw
+        from PIL import Image
+        tmp_path = png_path + ".tmp.png"
         with Image.open(png_path) as im:
             im_rgba = im.convert("RGBA")
             bg = Image.new("RGBA", im_rgba.size, (255, 255, 255, 255))
             bg.paste(im_rgba, mask=im_rgba.split()[-1])
             rgb_im = bg.convert("RGB")
-            w, h = rgb_im.size
-            corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]
-            if any(sum(c) < 735 for c in corners):
-                step = max(10, min(w, h) // 40)
-                seeds = (
-                    [(x, 0) for x in range(0, w, step)] +
-                    [(x, h-1) for x in range(0, w, step)] +
-                    [(0, y) for y in range(0, h, step)] +
-                    [(w-1, y) for y in range(0, h, step)]
-                )
-                for pt in seeds:
-                    if sum(rgb_im.getpixel(pt)) < 735:
-                        try:
-                            ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)
-                        except Exception:
-                            pass
-            rgb_im.save(png_path, "PNG")
+            rgb_im.save(tmp_path, "PNG", compress_level=1)
             try:
                 rgb_im.close()
                 bg.close()
                 im_rgba.close()
             except Exception:
                 pass
-            return
+        os.replace(tmp_path, png_path)
     except Exception:
         pass
 
-    # 若當前直譯器未安裝 PIL，呼叫外部 Python 執行 (延遲構建指令碼)
+def smart_crop_image(image_path, margin_pct=0.04, listing=None):
+    """
+    智慧邊界緊湊裁切：
+    自動偵測並裁切 NX 視圖外圍過多之純白留白背景，使 3D 工件特徵在 Excel 工單中最大化呈現。
+    1. 雙層防護機制：優先當前直譯器 PIL 執行，若無 PIL 則自動調用外部 Python 直譯器。
+    2. 自動保留 margin_pct (預設 4%) 安全呼吸空間，避免切削特徵貼齊圖框。
+    3. 全白或純色無幾何畫面自動安全略過，保留原圖。
+    4. 採原子寫入 (.tmp.png + os.replace) 確保檔案完整性，全程零例外拋出防護。
+    """
+    if not image_path or not os.path.exists(image_path) or os.path.getsize(image_path) == 0:
+        return False
+
+    # 1. 優先當前直譯器執行
+    try:
+        from PIL import Image
+        tmp_path = image_path + ".tmp.png"
+        with Image.open(image_path) as im:
+            rgb_im = im.convert("RGB")
+            w, h = rgb_im.size
+            gray = rgb_im.convert("L")
+            mask = gray.point(lambda p: 255 if p < 250 else 0)
+            bbox = mask.getbbox()
+            if not bbox:
+                return True  # 全白畫面，保留原圖
+
+            bx0, by0, bx1, by1 = bbox
+            bw, bh = bx1 - bx0, by1 - by0
+
+            # 若主體本身已佔滿畫面 95% 以上，無需額外裁切
+            if bw >= w * 0.95 and bh >= h * 0.95:
+                return True
+
+            pad_x = max(20, int(bw * margin_pct))
+            pad_y = max(20, int(bh * margin_pct))
+
+            x0 = max(0, bx0 - pad_x)
+            y0 = max(0, by0 - pad_y)
+            x1 = min(w, bx1 + pad_x)
+            y1 = min(h, by1 + pad_y)
+
+            if (x1 - x0) < 100 or (y1 - y0) < 100:
+                return True
+
+            cropped = rgb_im.crop((x0, y0, x1, y1))
+            cropped.save(tmp_path, "PNG", compress_level=1)
+            try:
+                cropped.close()
+                rgb_im.close()
+            except Exception:
+                pass
+
+        os.replace(tmp_path, image_path)
+        if listing:
+            listing.WriteLine(f"  - 示圖智慧邊界裁切完成：原尺寸 {w}x{h} -> 裁切後 {x1-x0}x{y1-y0}，工件特徵顯著放大。")
+        return True
+    except Exception:
+        pass
+
+    # 2. 備援：外部 Python 直譯器執行
     try:
         external_script = (
-            "from PIL import Image, ImageDraw\n"
-            "def process(path):\n"
+            "import os, sys\n"
+            "from PIL import Image\n"
+            "def crop(path, margin_pct=0.04):\n"
             "    with Image.open(path) as im:\n"
-            "        im = im.convert('RGBA')\n"
-            "        bg = Image.new('RGBA', im.size, (255, 255, 255, 255))\n"
-            "        bg.paste(im, mask=im.split()[-1])\n"
-            "        rgb_im = bg.convert('RGB')\n"
+            "        rgb_im = im.convert('RGB')\n"
             "        w, h = rgb_im.size\n"
-            "        corners = [rgb_im.getpixel((0, 0)), rgb_im.getpixel((w-1, 0)), rgb_im.getpixel((0, h-1)), rgb_im.getpixel((w-1, h-1))]\n"
-            "        need_flood = any(sum(c) < 735 for c in corners)\n"
-            "        if need_flood:\n"
-            "            step = max(10, min(w, h) // 40)\n"
-            "            seeds = ([(x, 0) for x in range(0, w, step)] +\n"
-            "                     [(x, h-1) for x in range(0, w, step)] +\n"
-            "                     [(0, y) for y in range(0, h, step)] +\n"
-            "                     [(w-1, y) for y in range(0, h, step)])\n"
-            "            for pt in seeds:\n"
-            "                if sum(rgb_im.getpixel(pt)) < 735:\n"
-            "                    try:\n"
-            "                        ImageDraw.floodfill(rgb_im, pt, (255, 255, 255), thresh=45)\n"
-            "                    except Exception:\n"
-            "                        pass\n"
-            "        rgb_im.save(path, 'PNG')\n"
-            f"process(r'{png_path}')\n"
+            "        gray = rgb_im.convert('L')\n"
+            "        mask = gray.point(lambda p: 255 if p < 250 else 0)\n"
+            "        bbox = mask.getbbox()\n"
+            "        if not bbox: return\n"
+            "        bx0, by0, bx1, by1 = bbox\n"
+            "        bw, bh = bx1 - bx0, by1 - by0\n"
+            "        if bw >= w * 0.95 and bh >= h * 0.95: return\n"
+            "        pad_x = max(20, int(bw * margin_pct))\n"
+            "        pad_y = max(20, int(bh * margin_pct))\n"
+            "        x0 = max(0, bx0 - pad_x)\n"
+            "        y0 = max(0, by0 - pad_y)\n"
+            "        x1 = min(w, bx1 + pad_x)\n"
+            "        y1 = min(h, by1 + pad_y)\n"
+            "        if (x1 - x0) < 100 or (y1 - y0) < 100: return\n"
+            "        cropped = rgb_im.crop((x0, y0, x1, y1))\n"
+            "        tmp_p = path + '.tmp.png'\n"
+            "        cropped.save(tmp_p, 'PNG', compress_level=1)\n"
+            "    os.replace(tmp_p, path)\n"
+            f"crop(r'{image_path}')\n"
         )
         py_cmd, py_env = resolve_python_runtime(require_gui=False)
         if py_cmd:
             full_cmd = list(py_cmd) + ["-c", external_script]
-            subprocess.run(full_cmd, timeout=6, env=py_env, creationflags=0x08000000)
+            res = subprocess.run(full_cmd, timeout=8, env=py_env, creationflags=0x08000000)
+            if res.returncode == 0:
+                if listing:
+                    listing.WriteLine(f"  - [外部直譯器] 示圖智慧邊界裁切完成。")
+                return True
     except Exception:
         pass
+
+    return False
+
+
+def batch_overlay_op_labels(stage_images, listing=None, force=False):
+    """
+    批次於所有示圖左上角壓印高對比工序名稱標記膠囊 (如 OP10、A、加工示圖 / 裝夾全貌)：
+    零卡頓高效架構：
+    1. 拍照階段維持 0.05s 極速連拍，不執行耗時之直譯器進程呼叫。
+    2. 於 Excel 匯出前，單次批次遍歷所有截圖進行壓印。
+    3. 優先當前直譯器 PIL 記憶體內極速渲染；若無 PIL 則啟動單一外部 Python 進程一次性批次處理所有圖檔 (總耗時僅 ~0.2s)。
+    4. 支援繁體中文字型 (msjhbd.ttc / msjh.ttc) 與深藍底白字圓角膠囊 (#004B87)，自適應字級與原子寫入 (.tmp.png + os.replace)。
+    5. 具備已壓印記錄快取，杜絕重覆壓印。
+    """
+    if not stage_images or not isinstance(stage_images, dict):
+        return True
+
+    if not hasattr(batch_overlay_op_labels, "_stamped"):
+        batch_overlay_op_labels._stamped = set()
+
+    tasks = []
+    for stg, img_path in stage_images.items():
+        if not img_path or not isinstance(img_path, str):
+            continue
+        abs_p = os.path.abspath(img_path)
+        if not force and abs_p in batch_overlay_op_labels._stamped:
+            continue
+        try:
+            if not os.path.exists(img_path) or os.path.getsize(img_path) == 0:
+                continue
+        except Exception:
+            continue
+        display_text = stg if stg and stg != "通用工段" else "加工示圖 / 裝夾全貌"
+        label_text = display_text
+        tasks.append({"stage": stg, "path": img_path, "abs_path": abs_p, "text": label_text})
+
+    if not tasks:
+        return True
+
+    # 1. 優先當前直譯器 PIL 記憶體內高效批次壓印
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        font_cache = {}
+        for t in tasks:
+            p = t["path"]
+            txt = t["text"]
+            tmp_p = p + ".tmp.png"
+            with Image.open(p) as im:
+                rgb_im = im.convert("RGB")
+                w, h = rgb_im.size
+                font_size = max(20, min(34, int(w / 50)))
+                if font_size not in font_cache:
+                    font = None
+                    for fc in [
+                        "C:/Windows/Fonts/msjhbd.ttc",
+                        "C:/Windows/Fonts/msjh.ttc",
+                        "C:/Windows/Fonts/mingliu.ttc",
+                        "C:/Windows/Fonts/simhei.ttf"
+                    ]:
+                        if os.path.exists(fc):
+                            try:
+                                font = ImageFont.truetype(fc, font_size)
+                                break
+                            except Exception:
+                                pass
+                    if font is None:
+                        font = ImageFont.load_default()
+                    font_cache[font_size] = font
+                else:
+                    font = font_cache[font_size]
+
+                draw = ImageDraw.Draw(rgb_im)
+                bbox = draw.textbbox((0, 0), txt, font=font)
+                tw = bbox[2] - bbox[0]
+                th = bbox[3] - bbox[1]
+                pad_x = 16
+                pad_y = 8
+                margin_x = 24
+                margin_y = 24
+                box = [margin_x, margin_y, margin_x + tw + pad_x * 2, margin_y + th + pad_y * 2]
+                draw.rounded_rectangle(box, radius=8, fill=(0, 75, 135), outline=(255, 255, 255), width=2)
+                draw.text((margin_x + pad_x, margin_y + pad_y - 2), txt, fill=(255, 255, 255), font=font)
+                rgb_im.save(tmp_p, "PNG", compress_level=1)
+                try:
+                    rgb_im.close()
+                except Exception:
+                    pass
+            os.replace(tmp_p, p)
+            batch_overlay_op_labels._stamped.add(t["abs_path"])
+            if listing:
+                listing.WriteLine(f"  - 已於示圖左上角壓印工序標記：{txt}")
+        return True
+    except Exception:
+        pass
+
+    # 2. 備援：若當前直譯器無 PIL (如 NX 內部原生 Python)，呼叫外部已安裝 Pillow 之 Python 單進程一次性批次處理
+    try:
+        py_cmd, py_env = resolve_python_runtime(require_gui=False, require_pillow=True)
+        if not py_cmd:
+            if listing:
+                listing.WriteLine("  [提示] 系統未檢測到安裝有 Pillow 之外部 Python 環境，已安全略過標籤壓印。")
+            return False
+
+        temp_task_dir = os.path.dirname(tasks[0]["path"])
+        task_json_file = os.path.join(temp_task_dir, f"_batch_stamp_tasks_{os.getpid()}.json")
+        with open(task_json_file, "w", encoding="utf-8") as tf:
+            json.dump([{"path": t["path"], "text": t["text"]} for t in tasks], tf, ensure_ascii=False)
+
+        external_script = (
+            "import os, sys, json\n"
+            "from PIL import Image, ImageDraw, ImageFont\n"
+            f"task_f = r'{task_json_file}'\n"
+            "try:\n"
+            "    with open(task_f, 'r', encoding='utf-8') as f:\n"
+            "        item_list = json.load(f)\n"
+            "    font_c = {}\n"
+            "    for it in item_list:\n"
+            "        p, txt = it['path'], it['text']\n"
+            "        if not os.path.exists(p): continue\n"
+            "        tmp_p = p + '.tmp.png'\n"
+            "        with Image.open(p) as im:\n"
+            "            rgb_im = im.convert('RGB')\n"
+            "            w, h = rgb_im.size\n"
+            "            font_sz = max(20, min(34, int(w / 50)))\n"
+            "            if font_sz not in font_c:\n"
+            "                fnt = None\n"
+            "                for fc in ['C:/Windows/Fonts/msjhbd.ttc', 'C:/Windows/Fonts/msjh.ttc', 'C:/Windows/Fonts/mingliu.ttc']:\n"
+            "                    if os.path.exists(fc):\n"
+            "                        try:\n"
+            "                            fnt = ImageFont.truetype(fc, font_sz)\n"
+            "                            break\n"
+            "                        except Exception: pass\n"
+            "                if fnt is None: fnt = ImageFont.load_default()\n"
+            "                font_c[font_sz] = fnt\n"
+            "            else:\n"
+            "                fnt = font_c[font_sz]\n"
+            "            draw = ImageDraw.Draw(rgb_im)\n"
+            "            bbox = draw.textbbox((0, 0), txt, font=fnt)\n"
+            "            tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]\n"
+            "            pad_x, pad_y, margin_x, margin_y = 16, 8, 24, 24\n"
+            "            box = [margin_x, margin_y, margin_x + tw + pad_x * 2, margin_y + th + pad_y * 2]\n"
+            "            draw.rounded_rectangle(box, radius=8, fill=(0, 75, 135), outline=(255, 255, 255), width=2)\n"
+            "            draw.text((margin_x + pad_x, margin_y + pad_y - 2), txt, fill=(255, 255, 255), font=fnt)\n"
+            "            rgb_im.save(tmp_p, 'PNG', compress_level=1)\n"
+            "        try:\n"
+            "            os.replace(tmp_p, p)\n"
+            "        except Exception:\n"
+            "            try: os.remove(tmp_p)\n"
+            "            except Exception: pass\n"
+            "finally:\n"
+            "    if os.path.exists(task_f):\n"
+            "        try: os.remove(task_f)\n"
+            "        except Exception: pass\n"
+        )
+        full_cmd = list(py_cmd) + ["-c", external_script]
+        res = subprocess.run(full_cmd, capture_output=True, timeout=25, env=py_env, creationflags=0x08000000)
+        if res.returncode == 0:
+            for t in tasks:
+                batch_overlay_op_labels._stamped.add(t["abs_path"])
+                if listing:
+                    listing.WriteLine(f"  - [外部直譯器] 已於示圖左上角壓印工序標記：{t['text']}")
+            return True
+        else:
+            if listing:
+                err_msg = res.stderr.decode('utf-8', errors='ignore') if res.stderr else f"代碼 {res.returncode}"
+                listing.WriteLine(f"  [批次工序標籤壓印失敗] {err_msg}")
+    except Exception as ex_ext:
+        if listing:
+            listing.WriteLine(f"  [批次工序標籤壓印例外] {str(ex_ext)}")
+
+    return False
+
+def overlay_op_label_on_image(image_path, op_name, listing=None):
+    """
+    於截圖左上角壓印高對比工序名稱標記膠囊 (如 OP10、A、加工示圖 / 裝夾全貌)：
+    1. 雙層防護機制：優先當前直譯器 PIL 渲染，若當前環境未裝 Pillow 自動呼叫外部 Python 直譯器。
+    2. 自動搜尋繁體中文字型 (微軟正黑體 msjhbd.ttc / msjh.ttc)，排版字體平滑無亂碼。
+    3. 自適應動態字體級數 (20~34 pt) 與深藍底白字圓角膠囊 (#004B87)，醒目且專業。
+    4. 採原子寫入 (.tmp.png + os.replace) 確保圖檔不損壞，全程零拋出例外防護。
+    底層調用批次壓印核心邏輯，保證單張與批次行為 100% 一致。
+    """
+    if not image_path or not os.path.exists(image_path) or not op_name:
+        return False
+    return batch_overlay_op_labels({op_name: image_path}, listing=listing, force=True)
+
 
 def capture_nx_viewport(the_ui, out_png_path, white_background=True, listing=None, work_part=None):
     """
@@ -2073,10 +2524,31 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
             msg = wintypes.MSG()
             PM_REMOVE = 0x0001
 
-            for s_idx, stg in enumerate(stages):
+            cached_layer_data = None
+            try:
+                cached_layer_data = get_part_layer_info(work_part, uf_session)
+            except Exception:
+                pass
+
+            s_idx = 0
+            while s_idx < total_stages:
+                item = stages[s_idx]
+                if isinstance(item, dict):
+                    stg = item.get("target_op") or item.get("stage", "通用工段")
+                    target_op = item.get("target_op", stg)
+                    tools_summary = item.get("tools_summary", "")
+                    placement = item.get("placement", "")
+                    custom_seq = item.get("custom_seq", "")
+                else:
+                    stg = str(item)
+                    target_op = stg
+                    tools_summary = ""
+                    placement = ""
+                    custom_seq = ""
+
                 safe_stg_name = re.sub(r'[\\/:*?"<>|]', '_', stg)
                 out_img = os.path.join(temp_dir, f"_temp_stage_{safe_stg_name}.png")
-                display_name = stg if stg != "通用工段" else "加工工件全貌 / 裝夾示圖"
+                display_name = target_op
                 req_file = os.path.join(temp_dir, f"_snap_request_{s_idx}.flag")
                 if os.path.exists(req_file):
                     try:
@@ -2089,11 +2561,12 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                 layer_apply_file = os.path.join(temp_dir, f"_layer_apply_{s_idx}.json")
                 layer_flag_file = os.path.join(temp_dir, f"_layer_changed_{s_idx}.flag")
 
-                # 預先掃描當前圖層資訊並寫入 JSON
+                # 寫入圖層資訊通訊檔案供小工具載入 (優先使用快取資料)
                 try:
-                    layer_data = get_part_layer_info(work_part, uf_session)
+                    if cached_layer_data is None:
+                        cached_layer_data = get_part_layer_info(work_part, uf_session)
                     with open(layer_info_file, "w", encoding="utf-8") as lf:
-                        json.dump(layer_data, lf, ensure_ascii=False)
+                        json.dump(cached_layer_data, lf, ensure_ascii=False)
                 except Exception:
                     pass
 
@@ -2101,6 +2574,10 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                 cmd = list(interpreter_cmd) + [
                     assistant_script,
                     "--stage", stg,
+                    "--target-op", target_op,
+                    "--tools", tools_summary,
+                    "--placement", placement,
+                    "--custom-seq", custom_seq,
                     "--index", str(s_idx + 1),
                     "--total", str(total_stages),
                     "--parent-hwnd", str(nx_hwnd),
@@ -2111,7 +2588,9 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                 ]
 
                 if listing:
-                    listing.WriteLine(f"  [拍照引導] 已啟動右上角精緻引導小按鈕 (請在 NX 中按滑鼠中鍵自由旋轉工件，支援 F8 擺正與圖層控制)...")
+                    place_info = f" [{placement}]" if placement else ""
+                    tools_info = f" (包含刀具: {tools_summary})" if tools_summary else ""
+                    listing.WriteLine(f"  [拍照引導 ({s_idx + 1}/{total_stages})] 示圖用於工序【{target_op}】{place_info}{tools_info}...")
 
                 proc = None
                 ret_code = -1
@@ -2161,6 +2640,7 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                     with open(layer_apply_file, "r", encoding="utf-8") as lf:
                                         layer_dict = json.load(lf)
                                     apply_part_layer_states(work_part, uf_session, layer_dict, orig_work_layer=initial_work_layer)
+                                    cached_layer_data = get_part_layer_info(work_part, uf_session)
                                     if listing:
                                         listing.WriteLine(f"  [🗂 圖層控制] 圖層可見性已即時更新並刷新 3D 畫面。")
                                 except Exception as ex_layer:
@@ -2168,7 +2648,6 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                         listing.WriteLine(f"  [🗂 圖層控制例外] {str(ex_layer)}")
 
                         # 4. 滑鼠旋轉與畫面重繪：精確派發當前執行緒之滑鼠互動 (0x0200~0x020E) 與重繪訊息 (WM_PAINT 0x000F)
-                        # 嚴格限定訊息類型，絕不碰觸 Qt / QtWebEngine 私有 IPC 訊息 (0x8000+ 或 WM_USER)，確保記憶體穩定零洩漏！
                         while user32.PeekMessageW(ctypes.byref(msg), 0, 0x0200, 0x020E, PM_REMOVE):
                             user32.DispatchMessageW(ctypes.byref(msg))
                         while user32.PeekMessageW(ctypes.byref(msg), 0, 0x000F, 0x000F, PM_REMOVE):
@@ -2212,18 +2691,32 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                     if success:
                         captured_images[stg] = out_img
                         if listing:
-                            listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
+                            listing.WriteLine(f"  - 工序【{stg}】示圖已成功截取。")
+                    s_idx += 1
                 elif ret_code == 2:
                     # 使用者在小工具點選「略過此段」或關閉 (X)
+                    captured_images.pop(stg, None)
                     if listing:
-                        listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
+                        listing.WriteLine(f"  - 工序【{stg}】已由使用者略過。")
+                    s_idx += 1
+                elif ret_code == 3:
+                    # 使用者點選「⬅ 上一步」
+                    if s_idx > 0:
+                        s_idx -= 1
+                        if listing:
+                            listing.WriteLine(f"  [⬅ 上一步] 已返回上一工序【{stages[s_idx]}】，準備重新設定視角或拍攝。")
+                    else:
+                        # 在第一工序點選「上一步」：依使用者指示返回前一階段【分頁排版編輯器】
+                        if listing:
+                            listing.WriteLine(f"  [⬅ 上一步] 於第一工序請求返回【工單可視化互動式分頁排版編輯器】。")
+                        return {"__ACTION__": "BACK_TO_PAGINATION"}
                 else:
-                    # 外部小工具異常 (returncode != 0 且 != 2)，自動啟動原生對話框備援，避免功能被跳過
+                    # 外部小工具異常 (returncode != 0, 2, 3)，自動啟動原生對話框備援
                     if listing:
                         listing.WriteLine(f"  [拍照引導提示] 獨立小工具異常退出 (代碼 {ret_code})，自動啟用 NX 備援確認視窗...")
                     if the_ui:
                         backup_msg = (
-                            f"【工段 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
+                            f"【工序 ({s_idx+1}/{total_stages})】：{display_name}\n\n"
                             f"請確認當前 NX 視窗視角是否已適當？\n\n"
                             f"・點選【是 (Yes)】：立即截取當前視圖 (白底高清)\n"
                             f"・點選【否 (No)】：略過此工段不放圖"
@@ -2238,10 +2731,11 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                             if success:
                                 captured_images[stg] = out_img
                                 if listing:
-                                    listing.WriteLine(f"  - 工段【{stg}】示圖已成功截取。")
+                                    listing.WriteLine(f"  - 工序【{stg}】示圖已成功截取。")
                         else:
                             if listing:
-                                listing.WriteLine(f"  - 工段【{stg}】已由使用者略過。")
+                                listing.WriteLine(f"  - 工序【{stg}】已由使用者略過。")
+                    s_idx += 1
 
             gui_success = True
 
@@ -2341,7 +2835,18 @@ def paginate_operations(chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="pa
         chunks_in_stage = stage_groups[stg]
         all_ops = []
         for c in chunks_in_stage:
+            p_prog = c.get("parent_program", "") or c.get("group_name", "")
+            c_grp = c.get("group_name", "")
             for op_item in c.get("operations", []):
+                if not op_item.get("parent_program"):
+                    op_item["parent_program"] = p_prog
+                if not op_item.get("group_name"):
+                    op_item["group_name"] = c_grp
+                if not op_item.get("stage"):
+                    op_item["stage"] = stg
+                if not op_item.get("program_name"):
+                    is_d = op_item.get("is_direct_op", False)
+                    op_item["program_name"] = op_item.get("clean_op_name") if is_d else clean_program_name(p_prog)
                 all_ops.append(op_item)
 
         total_ops = len(all_ops)
@@ -2518,7 +3023,7 @@ def escape_vbs_str(val):
     s = s.replace('\r\n', ' ').replace('\r', ' ').replace('\n', ' ')
     return s
 
-def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None, stage_origins=None):
+def export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=None, stage_origins=None, sequence_style="per_page"):
     """
     透過 Windows 原生 VBScript 動態複製 Excel 工作表產生「第1頁」、「第2頁」...
     並填入表頭、工步明細、頁碼標註，並將工段對應之加工示圖等比例居中嵌入 A18:J36 區域
@@ -2528,6 +3033,9 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
 
     stage_images = stage_images or {}
     stage_origins = stage_origins or {}
+    # 確保所有示圖在寫入 Excel 之前均完成工序名稱標籤壓印
+    if stage_images:
+        batch_overlay_op_labels(stage_images)
     part_name = work_part.Leaf
     part_path = work_part.FullPath
     part_dir = os.path.dirname(part_path)
@@ -2564,6 +3072,8 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         'End If',
         'objExcel.Visible = False',
         'objExcel.DisplayAlerts = False',
+        'objExcel.ScreenUpdating = False',
+        'objExcel.EnableEvents = False',
         'Set fso = CreateObject("Scripting.FileSystemObject")',
         f'Set objWb = objExcel.Workbooks.Open("{abs_template}")',
         'If Err.Number <> 0 Then',
@@ -2574,9 +3084,11 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         '    WScript.StdErr.WriteLine vbsErrDesc',
         '    WScript.Quit vbsErrCode',
         'End If',
-        'Set seedWs = objWb.Sheets(1)'
+        'Set seedWs = objWb.Sheets(1)',
+        'objExcel.Calculation = -4135'  # -4135 = xlCalculationManual (活頁簿開啟後暫停重算，大幅加速多頁寫入)
     ]
 
+    global_seq = 1
     # 逐頁複製母版並填入資料
     for p_idx, page_item in enumerate(pages, start=1):
         page_name = f"第{p_idx}頁"
@@ -2627,11 +3139,25 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         if not stage_origin_text:
             stage_origin_text = "加工原點【G54】：X=MID, Y=MID, Z=TOP"
 
+        target_op = page_item.get("target_op")
+        target_ops = page_item.get("target_ops", [])
+        if not target_ops and target_op:
+            target_ops = [target_op]
+        image_layout = page_item.get("image_layout", "single")
+        if len(target_ops) >= 3:
+            labels = [f"【圖{i+1}: {op}】" for i, op in enumerate(target_ops)]
+            stage_origin_text = "  ".join(labels) + (f"  ({stage_origin_text})" if stage_origin_text else "")
+        elif image_layout == "side_by_side" and len(target_ops) >= 2:
+            stage_origin_text = f"【左圖: {target_ops[0]}】  【右圖: {target_ops[1]}】" + (f"  ({stage_origin_text})" if stage_origin_text else "")
+        elif is_appendix and target_ops:
+            stage_origin_text = f"工序【{target_ops[0]}】專屬加工示圖 / 裝夾圖" + (f" ({stage_origin_text})" if stage_origin_text else "")
+
         safe_origin_vbs = escape_vbs_str(stage_origin_text)
+        origin_font_size = 8 if len(target_ops) >= 4 else (9 if len(target_ops) >= 2 else 10)
         vbs_lines.extend([
             f'ws.Range("A37").Value = "{safe_origin_vbs}"',
             'ws.Range("A37").Font.Bold = True',
-            'ws.Range("A37").Font.Size = 10',
+            f'ws.Range("A37").Font.Size = {origin_font_size}',
             'ws.Range("A37").Font.Color = RGB(0, 51, 102)'
         ])
 
@@ -2658,104 +3184,248 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                     f'ws.Range("A{last_op_row}:J{last_op_row}").Borders(4).Weight = 3'  # 4 = xlEdgeBottom, 3 = xlMedium 封底線
                 ])
 
-            loop_rows = max(ROWS_PER_PAGE, num_rows)
-            for row_offset in range(loop_rows):
+            for row_offset in range(num_rows):
                 curr_r = start_row + row_offset
-                if row_offset < num_rows:
-                    item = page_rows[row_offset]
-                    if item["type"] == "spacer":
-                        # 空行分隔：清空此列資料 (不計序號)
-                        for col_i in range(1, 9):
-                            vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
-                    else:
-                        d = item["data"]
-                        safe_seq = str(page_seq)
-                        safe_op_name = escape_vbs_str(d.get("op_name", ""))
-                        safe_tool_num = escape_vbs_str(d.get("tool_number", ""))
-                        spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
-                        safe_tool_dia = escape_vbs_str(spec_str)
-                        safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
-                        safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
-                        safe_time = escape_vbs_str(d.get("time", ""))
-                        
-                        # 備註欄與刀號衝突、刀具安全評估處理
-                        has_conflict = d.get("has_tool_conflict", False)
-                        conflict_msg = d.get("tool_conflict_msg", "")
-                        safety_warn = d.get("tool_safety_warning", "")
-                        note_val = str(d.get("note", "")).strip()
-
-                        if safety_warn and safety_warn not in note_val:
-                            note_val = f"{safety_warn} {note_val}".strip() if note_val else safety_warn
-
-                        if has_conflict and conflict_msg:
-                            if conflict_msg not in note_val:
-                                note_val = f"{conflict_msg} {note_val}".strip() if note_val else conflict_msg
-                        safe_note = escape_vbs_str(note_val)
-
-                        vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 3).Value = "{safe_tool_num}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 4).Value = "{safe_tool_dia}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 5).Value = "{safe_flute_len}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
-                        vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
-
-                        if has_conflict:
-                            # 刀號儲存格高亮標記：淡紅底色 (RGB: 255, 204, 204) + 深紅粗體字 (RGB: 180, 0, 0)
-                            vbs_lines.extend([
-                                f'ws.Cells({curr_r}, 3).Interior.Color = RGB(255, 204, 204)',
-                                f'ws.Cells({curr_r}, 3).Font.Color = RGB(180, 0, 0)',
-                                f'ws.Cells({curr_r}, 3).Font.Bold = True'
-                            ])
-
-                        page_seq += 1
+                item = page_rows[row_offset]
+                if item["type"] == "spacer":
+                    # 空行分隔：批次清空此列資料 (不計序號，1 次 COM 調用取代 8 次)
+                    vbs_lines.append(f'ws.Range("A{curr_r}:I{curr_r}").ClearContents')
                 else:
-                    # 未填滿的列位：清空範本預設的工站數字，保持頁面乾淨
-                    for col_i in range(1, 9):
-                        vbs_lines.append(f'ws.Cells({curr_r}, {col_i}).Value = ""')
+                    d = item["data"]
+                    if d.get("custom_seq"):
+                        safe_seq = escape_vbs_str(str(d.get("custom_seq")))
+                    elif sequence_style == "stage_prefix":
+                        stg_label = page_stage if page_stage and page_stage != "通用工段" else "OP"
+                        safe_seq = escape_vbs_str(f"{stg_label}-{page_seq:02d}")
+                    elif sequence_style == "global_continuous":
+                        safe_seq = escape_vbs_str(str(global_seq))
+                    elif sequence_style == "zero_padded":
+                        safe_seq = escape_vbs_str(f"{page_seq:02d}")
+                    elif sequence_style == "step_10":
+                        safe_seq = escape_vbs_str(str(page_seq * 10))
+                    else:
+                        safe_seq = str(page_seq)
+                    safe_op_name = escape_vbs_str(d.get("op_name", ""))
+                    safe_tool_num = escape_vbs_str(d.get("tool_number", ""))
+                    spec_str = d.get("tool_spec_display", d.get("tool_diameter", "-"))
+                    safe_tool_dia = escape_vbs_str(spec_str)
+                    safe_flute_len = escape_vbs_str(d.get("flute_length", ""))
+                    safe_holder_len = escape_vbs_str(d.get("holder_length", ""))
+                    safe_time = escape_vbs_str(d.get("time", ""))
+                    
+                    # 備註欄與刀號衝突、刀具安全評估處理
+                    has_conflict = d.get("has_tool_conflict", False)
+                    conflict_msg = d.get("tool_conflict_msg", "")
+                    safety_warn = d.get("tool_safety_warning", "")
+                    note_val = str(d.get("note", "")).strip()
 
-        # 插入該工段對應之加工示圖 (等比例居中置放)
-        img_path = stage_images.get(page_stage)
-        if not img_path:
-            img_path = stage_images.get("通用工段")
-        if not img_path and len(stage_images) == 1:
-            img_path = list(stage_images.values())[0]
+                    if safety_warn and safety_warn not in note_val:
+                        note_val = f"{safety_warn} {note_val}".strip() if note_val else safety_warn
 
-        if show_image and img_path and os.path.exists(img_path):
-            safe_img = os.path.abspath(img_path).replace('"', '""')
+                    if has_conflict and conflict_msg:
+                        if conflict_msg not in note_val:
+                            note_val = f"{conflict_msg} {note_val}".strip() if note_val else conflict_msg
+                    safe_note = escape_vbs_str(note_val)
+
+                    vbs_lines.append(f'ws.Cells({curr_r}, 1).Value = "{safe_seq}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 2).Value = "{safe_op_name}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 3).Value = "{safe_tool_num}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 4).Value = "{safe_tool_dia}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 5).Value = "{safe_flute_len}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 6).Value = "{safe_holder_len}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 7).Value = "{safe_time}"')
+                    vbs_lines.append(f'ws.Cells({curr_r}, 8).Value = "{safe_note}"')
+
+                    if has_conflict:
+                        # 刀號儲存格高亮標記：淡紅底色 (RGB: 255, 204, 204) + 深紅粗體字 (RGB: 180, 0, 0)
+                        vbs_lines.extend([
+                            f'ws.Cells({curr_r}, 3).Interior.Color = RGB(255, 204, 204)',
+                            f'ws.Cells({curr_r}, 3).Font.Color = RGB(180, 0, 0)',
+                            f'ws.Cells({curr_r}, 3).Font.Bold = True'
+                        ])
+
+                    page_seq += 1
+                    global_seq += 1
+
+            # 未填滿的列位：批次清空範本預設的工站數字，保持頁面乾淨 (1 次 COM 呼叫取代最多 64 次逐格調用)
+            if num_rows < ROWS_PER_PAGE:
+                empty_start_r = start_row + num_rows
+                empty_end_r = start_row + ROWS_PER_PAGE - 1
+                vbs_lines.append(f'ws.Range("A{empty_start_r}:I{empty_end_r}").ClearContents')
+
+        # 插入該工序/工段對應之加工示圖 (支援單圖全幅與雙圖左右並排)
+        target_ops = page_item.get("target_ops", [])
+        target_op = page_item.get("target_op")
+        if not target_ops and target_op:
+            target_ops = [target_op]
+
+        image_layout = page_item.get("image_layout", "single")
+
+        # 檢驗收集有效圖片列表
+        valid_imgs = []
+        for top in target_ops:
+            ip = stage_images.get(top)
+            if not ip and page_stage in stage_images:
+                ip = stage_images.get(page_stage)
+            if not ip and "通用工段" in stage_images:
+                ip = stage_images.get("通用工段")
+            if ip and os.path.exists(ip):
+                valid_imgs.append((top, ip))
+
+        if show_image and valid_imgs:
             top_cell_str = f"A{image_top_row}"
             bottom_cell_str = f"J{image_bottom_row}"
-            vbs_lines.extend([
-                f'If fso.FileExists("{safe_img}") Then',
-                f'    Set topCell = ws.Range("{top_cell_str}")',
-                f'    Set bottomCell = ws.Range("{bottom_cell_str}")',
-                '    boxL = topCell.Left + 5',
-                '    boxT = topCell.Top + 5',
-                '    boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
-                '    boxH = (bottomCell.Top + bottomCell.Height) - topCell.Top - 10',
-                f'    Set shp = ws.Shapes.AddPicture("{safe_img}", 0, -1, boxL, boxT, -1, -1)',
-                '    shp.LockAspectRatio = -1',
-                '    origW = shp.Width',
-                '    origH = shp.Height',
-                '    If (origW / origH) > (boxW / boxH) Then',
-                '        targetW = boxW',
-                '        targetH = origH * (boxW / origW)',
-                '    Else',
-                '        targetH = boxH',
-                '        targetW = origW * (boxH / origH)',
-                '    End If',
-                '    shp.Width = targetW',
-                '    shp.Height = targetH',
-                '    shp.Left = boxL + (boxW - targetW) / 2',
-                '    shp.Top = boxT + (boxH - targetH) / 2',
-                '    shp.Placement = 1',
-                'End If'
-            ])
+
+            if len(valid_imgs) >= 3 or image_layout == "grid":
+                # === 多圖網格排列模式 (3 ~ 6 張圖) ===
+                n_imgs = min(len(valid_imgs), 6)
+                grid_cols = 2
+                grid_rows = 2 if n_imgs <= 4 else 3
+                gap_x = 10
+                gap_y = 10 if n_imgs <= 4 else 8
+
+                vbs_lines.extend([
+                    f'Set topCell = ws.Range("{top_cell_str}")',
+                    f'Set bottomCell = ws.Range("{bottom_cell_str}")',
+                    'boxL = topCell.Left + 5',
+                    'boxT = topCell.Top + 5',
+                    'boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
+                    'boxH = (bottomCell.Top + bottomCell.Height) - topCell.Top - 10',
+                    f'gapX = {gap_x}',
+                    f'gapY = {gap_y}',
+                    f'cellW = (boxW - gapX) / {grid_cols}',
+                    f'cellH = (boxH - ({grid_rows - 1}) * gapY) / {grid_rows}',
+                ])
+
+                for k in range(n_imgs):
+                    top_k, img_k = valid_imgs[k]
+                    safe_img_k = os.path.abspath(img_k).replace('"', '""')
+                    row_k = k // 2
+                    col_k = k % 2
+
+                    is_centered_odd = (n_imgs == 3 and k == 2) or (n_imgs == 5 and k == 4)
+                    if is_centered_odd:
+                        left_expr = 'boxL + (boxW - cellW) / 2'
+                    else:
+                        left_expr = f'boxL + {col_k} * (cellW + gapX)'
+
+                    top_expr = f'boxT + {row_k} * (cellH + gapY)'
+
+                    vbs_lines.extend([
+                        f'If fso.FileExists("{safe_img_k}") Then',
+                        f'    cL{k} = {left_expr}',
+                        f'    cT{k} = {top_expr}',
+                        f'    Set shp{k} = ws.Shapes.AddPicture("{safe_img_k}", 0, -1, cL{k}, cT{k}, -1, -1)',
+                        f'    shp{k}.LockAspectRatio = -1',
+                        f'    origW{k} = shp{k}.Width',
+                        f'    origH{k} = shp{k}.Height',
+                        f'    If (origW{k} / origH{k}) > (cellW / cellH) Then',
+                        f'        targetW{k} = cellW',
+                        f'        targetH{k} = origH{k} * (cellW / origW{k})',
+                        f'    Else',
+                        f'        targetH{k} = cellH',
+                        f'        targetW{k} = origW{k} * (cellH / origH{k})',
+                        f'    End If',
+                        f'    shp{k}.Width = targetW{k}',
+                        f'    shp{k}.Height = targetH{k}',
+                        f'    shp{k}.Left = cL{k} + (cellW - targetW{k}) / 2',
+                        f'    shp{k}.Top = cT{k} + (cellH - targetH{k}) / 2',
+                        f'    shp{k}.Placement = 1',
+                        f'End If'
+                    ])
+            elif image_layout == "side_by_side" and len(valid_imgs) >= 2:
+                # === 雙圖左右並排模式 ===
+                top1, img1 = valid_imgs[0]
+                top2, img2 = valid_imgs[1]
+                safe_img1 = os.path.abspath(img1).replace('"', '""')
+                safe_img2 = os.path.abspath(img2).replace('"', '""')
+
+                vbs_lines.extend([
+                    f'If fso.FileExists("{safe_img1}") And fso.FileExists("{safe_img2}") Then',
+                    f'    Set topCell = ws.Range("{top_cell_str}")',
+                    f'    Set bottomCell = ws.Range("{bottom_cell_str}")',
+                    '    boxL = topCell.Left + 5',
+                    '    boxT = topCell.Top + 5',
+                    '    boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
+                    '    boxH = (bottomCell.Top + bottomCell.Height) - topCell.Top - 10',
+                    '    gap = 10',
+                    '    halfW = (boxW - gap) / 2',
+                    # 左圖
+                    '    boxL1 = boxL',
+                    '    boxW1 = halfW',
+                    f'    Set shp1 = ws.Shapes.AddPicture("{safe_img1}", 0, -1, boxL1, boxT, -1, -1)',
+                    '    shp1.LockAspectRatio = -1',
+                    '    origW1 = shp1.Width',
+                    '    origH1 = shp1.Height',
+                    '    If (origW1 / origH1) > (boxW1 / boxH) Then',
+                    '        targetW1 = boxW1',
+                    '        targetH1 = origH1 * (boxW1 / origW1)',
+                    '    Else',
+                    '        targetH1 = boxH',
+                    '        targetW1 = origW1 * (boxH / origH1)',
+                    '    End If',
+                    '    shp1.Width = targetW1',
+                    '    shp1.Height = targetH1',
+                    '    shp1.Left = boxL1 + (boxW1 - targetW1) / 2',
+                    '    shp1.Top = boxT + (boxH - targetH1) / 2',
+                    '    shp1.Placement = 1',
+                    # 右圖
+                    '    boxL2 = boxL + halfW + gap',
+                    '    boxW2 = halfW',
+                    f'    Set shp2 = ws.Shapes.AddPicture("{safe_img2}", 0, -1, boxL2, boxT, -1, -1)',
+                    '    shp2.LockAspectRatio = -1',
+                    '    origW2 = shp2.Width',
+                    '    origH2 = shp2.Height',
+                    '    If (origW2 / origH2) > (boxW2 / boxH) Then',
+                    '        targetW2 = boxW2',
+                    '        targetH2 = origH2 * (boxW2 / origW2)',
+                    '    Else',
+                    '        targetH2 = boxH',
+                    '        targetW2 = origW2 * (boxH / origH2)',
+                    '    End If',
+                    '    shp2.Width = targetW2',
+                    '    shp2.Height = targetH2',
+                    '    shp2.Left = boxL2 + (boxW2 - targetW2) / 2',
+                    '    shp2.Top = boxT + (boxH - targetH2) / 2',
+                    '    shp2.Placement = 1',
+                    'End If'
+                ])
+            else:
+                # === 單圖全幅模式 ===
+                top1, img1 = valid_imgs[0]
+                safe_img = os.path.abspath(img1).replace('"', '""')
+                vbs_lines.extend([
+                    f'If fso.FileExists("{safe_img}") Then',
+                    f'    Set topCell = ws.Range("{top_cell_str}")',
+                    f'    Set bottomCell = ws.Range("{bottom_cell_str}")',
+                    '    boxL = topCell.Left + 5',
+                    '    boxT = topCell.Top + 5',
+                    '    boxW = (bottomCell.Left + bottomCell.Width) - topCell.Left - 10',
+                    '    boxH = (bottomCell.Top + bottomCell.Height) - topCell.Top - 10',
+                    f'    Set shp = ws.Shapes.AddPicture("{safe_img}", 0, -1, boxL, boxT, -1, -1)',
+                    '    shp.LockAspectRatio = -1',
+                    '    origW = shp.Width',
+                    '    origH = shp.Height',
+                    '    If (origW / origH) > (boxW / boxH) Then',
+                    '        targetW = boxW',
+                    '        targetH = origH * (boxW / origW)',
+                    '    Else',
+                    '        targetH = boxH',
+                    '        targetW = origW * (boxH / origH)',
+                    '    End If',
+                    '    shp.Width = targetW',
+                    '    shp.Height = targetH',
+                    '    shp.Left = boxL + (boxW - targetW) / 2',
+                    '    shp.Top = boxT + (boxH - targetH) / 2',
+                    '    shp.Placement = 1',
+                    'End If'
+                ])
 
     # 刪除最初的母版，只保留產出的 第1頁, 第2頁...
     vbs_lines.extend([
         'seedWs.Delete',
+        'objExcel.Calculation = -4105',  # -4105 = xlCalculationAutomatic (還原自動重算)
+        'objExcel.Calculate',            # 一次性完整計算公式
         f'objWb.SaveAs "{abs_output}"',
         'If Err.Number <> 0 Then',
         '    vbsErrCode = Err.Number',
@@ -2982,9 +3652,27 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
             "source_type": t.get("source_type", "")
         })
 
+    last_profile = "FANUC_HORIZONTAL"
+    remembered_post = default_post
+    custom_post_path = ""
+    try:
+        post_settings = get_post_settings()
+        last_profile = post_settings.get("last_selected_id", "FANUC_HORIZONTAL")
+        saved_post = post_settings.get("last_selected_post")
+        if saved_post:
+            remembered_post = saved_post
+        custom_post_path = post_settings.get("last_custom_post_path", "")
+    except Exception:
+        try:
+            last_profile = get_last_selected_profile_id()
+        except Exception:
+            pass
+
     config_payload = {
         "output_dir": default_dir,
-        "default_post": default_post,
+        "default_post": remembered_post,
+        "custom_post_path": custom_post_path,
+        "default_machine_profile": last_profile,
         "nc_tasks": tasks_summary
     }
 
@@ -3241,79 +3929,158 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
 
     return mode_result
 
-def execute_nc_postprocessing(cam_setup, nc_tasks, post_config, listing=None):
+
+def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence_style="per_page", listing=None, the_session=None, work_part=None):
     """
-    依據使用者設定，逐一對 nc_tasks 執行 NX CAM 原生後處理轉出 NC 碼
+    啟動獨立進程之工單可視化互動式分頁排版編輯器 (interactive_pagination_dialog.py)
+    回傳 dict:
+      {
+        "action": "ok" / "cancel",
+        "sequence_style": "per_page" / ...,
+        "pages": [ ... ]
+      }
     """
-    if not nc_tasks or not cam_setup:
-        return
+    if the_session is None:
+        try:
+            the_session = NXOpen.Session.GetSession()
+        except Exception:
+            pass
 
-    post_name = post_config.get("postprocessor_name", "").strip()
-    custom_post = post_config.get("custom_post_path", "").strip()
-    output_dir = post_config.get("output_dir", "").strip()
-    extension = post_config.get("extension", ".nc").strip()
+    dialog_script = resolve_asset_file("interactive_pagination_dialog.py", the_session=the_session, work_part=work_part)
+    interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
-    if not extension.startswith("."):
-        extension = "." + extension
+    fallback_result = {
+        "action": "ok",
+        "sequence_style": initial_sequence_style,
+        "pages": default_pages
+    }
 
-    # 若為自訂後處理器檔案路徑
-    actual_post = custom_post if (custom_post and os.path.exists(custom_post)) else post_name
-    if actual_post.startswith("[自訂]"):
-        actual_post = actual_post.replace("[自訂]", "").strip()
+    if not interpreter_cmd or not os.path.exists(dialog_script):
+        if listing:
+            listing.WriteLine("  [提示] 未偵測到支援 GUI 之 Python 環境或互動式分頁組件，自動套用系統推薦排版。")
+        return fallback_result
 
-    if not output_dir:
-        output_dir = os.getcwd()
-    os.makedirs(output_dir, exist_ok=True)
+    temp_dir = tempfile.gettempdir()
+    pid = os.getpid()
+    timestamp = datetime.datetime.now().strftime("%H%M%S%f")
+    cfg_file = os.path.join(temp_dir, f"_ip_cfg_{pid}_{timestamp}.json")
+    res_file = os.path.join(temp_dir, f"_ip_res_{pid}_{timestamp}.json")
 
-    # 決定後處理單位 (PostDefined 優先，回退 Metric)
-    units = getattr(NXOpen.CAM.CAMSetup.OutputUnits, "PostDefined", None)
-    if units is None:
-        units = getattr(NXOpen.CAM.CAMSetup.OutputUnits, "Metric", 0)
+    # 準備序列化資料 (過濾 NXOpen C++ 參照)
+    serializable_default_pages = []
+    for p in default_pages:
+        stg = p.get("stage", "通用工段")
+        p_rows = p.get("rows", [])
+        ops_data = []
+        for r in p_rows:
+            d = r.get("data", {}) if isinstance(r, dict) and "data" in r else r
+            safe_d = {}
+            for k, v in d.items():
+                if k != "_nx_op_obj":
+                    safe_d[k] = v
+            ops_data.append(safe_d)
+        serializable_default_pages.append({
+            "stage": stg,
+            "operations": ops_data
+        })
 
-    if listing:
-        listing.WriteLine("----------------------------------------")
-        listing.WriteLine("【開始轉出 NC 碼】")
-        listing.WriteLine(f"  - 後處理器：{actual_post}")
-        listing.WriteLine(f"  - 輸出目錄：{output_dir}")
-        listing.WriteLine(f"  - 程式副檔名：{extension}")
-        listing.WriteLine(f"  - 待處理檔案數：{len(nc_tasks)} 個")
+    config_payload = {
+        "stages": stages,
+        "initial_sequence_style": initial_sequence_style,
+        "default_pages": serializable_default_pages
+    }
 
-    success_count = 0
-    fail_count = 0
+    try:
+        with open(cfg_file, "w", encoding="utf-8") as f:
+            json.dump(config_payload, f, ensure_ascii=False, indent=2)
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [錯誤] 無法寫入互動分頁設定暫存檔：{str(ex)}")
+        return fallback_result
 
-    for idx, task in enumerate(nc_tasks, start=1):
-        p_name = task.get("program_name", f"PROG_{idx}")
-        ops = task.get("operations", [])
-        out_file = os.path.join(output_dir, f"{p_name}{extension}")
+    cmd = list(interpreter_cmd) + [
+        dialog_script,
+        "--cfg-file", cfg_file,
+        "--res-file", res_file
+    ]
 
-        if not ops:
-            if listing:
-                listing.WriteLine(f"  [{idx:02d}/{len(nc_tasks):02d}] 略過 {p_name} (無有效工序)")
-            continue
+    result_data = fallback_result
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=clean_env,
+            creationflags=0x08000000
+        )
 
         try:
-            if listing:
-                listing.WriteLine(f"  [{idx:02d}/{len(nc_tasks):02d}] 正在後處理 {p_name}{extension} (共 {len(ops)} 道工序)...")
+            proc.wait(timeout=600)  # 10 分鐘等待保護
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
-            # 調用 NX Open CAM 原生後處理 API
-            cam_setup.Postprocess(ops, actual_post, out_file, units)
+        if os.path.exists(res_file):
+            with open(res_file, "r", encoding="utf-8") as f:
+                res_json = json.load(f)
+                action = res_json.get("action", "ok")
+                seq_style = res_json.get("sequence_style", initial_sequence_style)
+                returned_pages = res_json.get("pages", [])
 
-            if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
-                success_count += 1
-                if listing:
-                    listing.WriteLine(f"      ✔ 成功轉出：{out_file} ({os.path.getsize(out_file)} 位元組)")
-            else:
-                success_count += 1
-                if listing:
-                    listing.WriteLine(f"      ✔ 完成調用：{out_file}")
-        except Exception as ex:
-            fail_count += 1
-            if listing:
-                listing.WriteLine(f"      ✖ 後處理失敗 [{p_name}]：{str(ex)}")
+                if action == "cancel":
+                    result_data = {
+                        "action": "cancel",
+                        "sequence_style": seq_style,
+                        "pages": []
+                    }
+                elif returned_pages:
+                    # 重新連結 _nx_op_obj 參照
+                    op_obj_map = {}
+                    for p in default_pages:
+                        for r in p.get("rows", []):
+                            d = r.get("data", {}) if isinstance(r, dict) and "data" in r else r
+                            op_obj = d.get("_nx_op_obj")
+                            c_name = d.get("clean_op_name") or d.get("op_name")
+                            if op_obj and c_name:
+                                op_obj_map[c_name] = op_obj
 
-    if listing:
-        listing.WriteLine(f"NC 碼轉出完畢：成功 {success_count} 筆，失敗 {fail_count} 筆。")
-        listing.WriteLine("----------------------------------------")
+                    for rp in returned_pages:
+                        for r_item in rp.get("rows", []):
+                            r_data = r_item.get("data", {})
+                            c_name = r_data.get("clean_op_name") or r_data.get("op_name")
+                            if c_name in op_obj_map and "_nx_op_obj" not in r_data:
+                                r_data["_nx_op_obj"] = op_obj_map[c_name]
+
+                    result_data = {
+                        "action": "ok",
+                        "sequence_style": seq_style,
+                        "pages": returned_pages
+                    }
+    except Exception as ex:
+        if listing:
+            listing.WriteLine(f"  [互動式分頁例外] {str(ex)}，自動套用系統推薦排版。")
+        result_data = fallback_result
+    finally:
+        if proc is not None:
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+            try:
+                if proc.stdout: proc.stdout.close()
+                if proc.stderr: proc.stderr.close()
+                if proc.stdin: proc.stdin.close()
+            except Exception:
+                pass
+        for tmp_f in [cfg_file, res_file]:
+            if os.path.exists(tmp_f):
+                try:
+                    os.remove(tmp_f)
+                except Exception:
+                    pass
+
+    return result_data
+
 
 # ==================== 主執行流程 ====================
 
@@ -3370,23 +4137,10 @@ def main():
     target_folder = os.path.dirname(full_part_path)
     part_name = work_part.Leaf
 
-    # 彈出目標機型與任務模式選擇視窗 (Zero-Debug 子進程隔離)
-    user_choice = prompt_machine_selection_gui()
-    if user_choice.get("action") == "cancel":
-        the_session.ListingWindow.WriteLine("提示：操作已由使用者取消。")
-        return
-
-    target_profile_id = user_choice.get("profile_id", "FANUC_HORIZONTAL")
-    task_run_mode = user_choice.get("run_mode", "FULL_DOC_AND_NC")
-
     template_path = resolve_asset_file("ShopDoc_Template.xlsx", the_session=the_session, work_part=work_part)
-    if not os.path.exists(template_path) and task_run_mode == "FULL_DOC_AND_NC":
-        the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
-        return
     output_path = os.path.join(target_folder, f"{part_name}_選定工序工單.xlsx")
 
     the_session.ListingWindow.WriteLine("========================================")
-    the_session.ListingWindow.WriteLine(f"已選定機型檔頭：[{target_profile_id}] | 執行模式：[{task_run_mode}]")
     the_session.ListingWindow.WriteLine("開始分析 CAM 導覽器結構與工藝數據...")
 
     # 1. 遞迴收集並按群組分塊 (Chunks)，同時過濾排除群組與提取資訊群組
@@ -3478,9 +4232,23 @@ def main():
         return
 
     chosen_post = post_config.get("postprocessor_name", "Fanuc_2026")
-    chosen_profile = post_config.get("machine_profile", "fanuc_horizontal")
+    chosen_profile = post_config.get("machine_profile", "FANUC_HORIZONTAL")
+    chosen_custom = post_config.get("custom_post_path", "")
     chosen_out_dir = post_config.get("output_dir", target_folder)
     chosen_ext = post_config.get("extension", ".nc")
+
+    # 記憶本次使用者選取之機台後處理器與機型配置 (下次啟動時自動帶入)
+    try:
+        save_post_settings(
+            profile_id=chosen_profile,
+            post_name=chosen_post,
+            custom_post_path=chosen_custom
+        )
+    except Exception:
+        try:
+            save_last_selected_profile_id(chosen_profile)
+        except Exception:
+            pass
 
     if action == "post_and_export":
         the_session.ListingWindow.WriteLine("使用者選擇【🚀 轉出 NC 碼並匯出工單】。")
@@ -3491,6 +4259,13 @@ def main():
     else:
         the_session.ListingWindow.WriteLine("使用者選擇【📋 僅匯出工單 (不轉 NC 碼)】。")
         task_run_mode = "EXPORT_ONLY"
+
+    the_session.ListingWindow.WriteLine(f"已選定機型檔頭：[{chosen_profile}] | 執行模式：[{task_run_mode}]")
+
+    # 工單範本檔案存在性檢查 (僅在需要產出工單的模式下檢查)
+    if task_run_mode != "NC_ONLY" and not os.path.exists(template_path):
+        the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
+        return
 
     # 2. 逐一萃取工序資訊並執行群組內刀具合併 (各子資料夾獨立合併，不跨子資料夾合併！)
     processed_chunks = []
@@ -3540,6 +4315,7 @@ def main():
                     except Exception:
                         pass
 
+            prog_label = clean_op_name if is_direct else clean_program_name(parent_prog)
             raw_ops.append({
                 "clean_op_name": clean_op_name,
                 "is_direct_op": is_direct,
@@ -3552,7 +4328,11 @@ def main():
                 "time_seconds": op_seconds,
                 "time": op_time_str,
                 "note": rpm_feed_note,
-                "_nx_op_obj": op
+                "_nx_op_obj": op,
+                "group_name": grp_name,
+                "parent_program": parent_prog,
+                "stage": chunk_stage,
+                "program_name": prog_label
             })
             total_op_count += 1
 
@@ -3564,6 +4344,11 @@ def main():
         # 2. 若該工步為「資料夾展開」：以母工段/父資料夾為邊界，僅首道工步填寫父資料夾名稱，後續所有工步全部留空
         for mop in merged_ops:
             is_direct = mop.get("is_direct_op", False)
+            prog_label = mop.get("clean_op_name", "") if is_direct else clean_program_name(parent_prog)
+            mop["group_name"] = grp_name
+            mop["parent_program"] = parent_prog
+            mop["stage"] = chunk_stage
+            mop["program_name"] = prog_label
             if is_direct:
                 mop["op_name"] = mop.get("clean_op_name", "")
             else:
@@ -3688,72 +4473,120 @@ def main():
                 pass
         return
 
-    # 3. 預先分析各工段工步數量與各模式下之預計頁數 (供使用者預覽與決策)
-    stage_stats, total_extend_pages, total_paginate_pages, has_choice = preview_pagination_plan(
-        processed_chunks, rows_per_page=ROWS_PER_PAGE
-    )
+    # 3. 預先分析各工段工步數量與系統推薦排版 (工段優先分頁)
+    distinct_stages = get_distinct_stages(processed_chunks)
+    current_pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="extend")
+    current_seq_style = "per_page"
+    stage_images = {}
 
-    pagination_mode = "extend"  # 預設模式：單頁延伸
-
-    if has_choice:
+    while True:
         the_session.ListingWindow.WriteLine("----------------------------------------")
-        the_session.ListingWindow.WriteLine("【工單分頁預覽】：")
-        for s in stage_stats:
-            the_session.ListingWindow.WriteLine(
-                f"  - 工段【{s['stage']}】({s['count']}刀)：單頁延伸規劃 ➔ {s['extend_desc']} | 自動分頁規劃 ➔ {s['paginate_desc']}"
-            )
-        the_session.ListingWindow.WriteLine(
-            f"預計工單總頁數對比：單頁延伸模式為【共 {total_extend_pages} 頁】，自動分頁模式為【共 {total_paginate_pages} 頁】。"
-        )
-        the_session.ListingWindow.WriteLine("正在啟動【工單分頁預覽與排版決策視窗】供使用者選擇...")
-
-        user_choice = invoke_pagination_prompt_dialog(
-            stage_stats, total_extend_pages, total_paginate_pages, listing=the_session.ListingWindow,
-            the_session=the_session, work_part=work_part
+        the_session.ListingWindow.WriteLine("啟動【工單可視化互動式分頁排版編輯器】...")
+        pagination_result = invoke_interactive_pagination_dialog(
+            default_pages=current_pages,
+            stages=distinct_stages,
+            initial_sequence_style=current_seq_style,
+            listing=the_session.ListingWindow,
+            the_session=the_session,
+            work_part=work_part
         )
 
-        if user_choice == "cancel":
+        if pagination_result.get("action") == "cancel":
             the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消排版操作，流程中止。")
             return
-        elif user_choice == "paginate":
-            pagination_mode = "paginate"
-            the_session.ListingWindow.WriteLine(
-                f"使用者選擇【📋 自動分頁顯示】(依標準 10 格/頁分頁，預計總共 {total_paginate_pages} 頁)。"
-            )
-        else:
-            pagination_mode = "extend"
-            the_session.ListingWindow.WriteLine(
-                f"使用者選擇【📑 單頁延伸顯示】(刀具向下增加格數，預計總共 {total_extend_pages} 頁)。"
-            )
-    else:
+
+        pages = pagination_result.get("pages", current_pages)
+        chosen_seq_style = pagination_result.get("sequence_style", current_seq_style)
+        current_seq_style = chosen_seq_style
+        # 更新 current_pages，過濾掉純大圖附圖頁，保留所有刀具分頁與自訂設定以備退回重調
+        current_pages = [p for p in pages if not p.get("is_appendix_image_page")]
+
         the_session.ListingWindow.WriteLine(
-            f"各工段刀具數皆在 10 格以內，預先計算工單總頁數為：共 {total_extend_pages} 頁。"
+            f"分頁排版完成：最終產出為 {len(pages)} 頁，序號編排風格：[{chosen_seq_style}]。"
         )
 
-    # 執行智慧分頁 (支援工段優先分頁與動態增加格數/單頁延伸/截圖下一頁模式)
-    pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode=pagination_mode)
-    the_session.ListingWindow.WriteLine(f"分頁排版完成：最終產出為 {len(pages)} 頁。")
+        # 4. 分析所有群組歸納實際需要拍照之工序/工段清單與詳細工序用途資訊
+        # 依使用者規則：工序右方截圖若有勾選，即表示該工序需要一張專屬截圖，並在截圖階段明確標明用於哪一個工序
+        capture_stages = []
+        seen_targets = set()
+        for p_idx, p in enumerate(pages, start=1):
+            if p.get("show_image", True):
+                tgt_ops = p.get("target_ops", [])
+                if not tgt_ops and (p.get("target_op") or p.get("stage")):
+                    tgt_ops = [p.get("target_op") or p.get("stage")]
 
-    # 4. 分析所有群組歸納獨立工段清單
-    distinct_stages = get_distinct_stages(processed_chunks)
-    the_session.ListingWindow.WriteLine(f"識別到的加工工段清單：{distinct_stages}")
+                is_side_by_side = (p.get("image_layout") == "side_by_side" and len(tgt_ops) >= 2)
 
-    # 5. 方案二：【互動引導式拍照精靈】
-    the_session.ListingWindow.WriteLine("----------------------------------------")
-    the_session.ListingWindow.WriteLine("啟動【互動引導式拍照精靈】...")
-    the_session.ListingWindow.WriteLine("提示：請在置頂拍照小視窗引導下，在 NX 主視窗旋轉縮放工件至最佳視角後點選拍照。")
+                for t_idx, tgt in enumerate(tgt_ops):
+                    if tgt and tgt not in seen_targets:
+                        seen_targets.add(tgt)
 
-    stage_images = {}
-    try:
-        stage_images = run_interactive_capture_wizard(
-            distinct_stages, target_folder, uf_session, the_ui=the_ui, listing=the_session.ListingWindow, work_part=work_part
-        )
-        if stage_images:
-            the_session.ListingWindow.WriteLine(f"各工段加工示圖已擷取：{list(stage_images.keys())}")
+                        # 收集該工序包含的所有刀具規格
+                        tools_list = []
+                        for page in pages:
+                            for r in page.get("rows", []):
+                                op_d = r.get("data", {}) if isinstance(r, dict) and "data" in r else r
+                                p_name = op_d.get("program_name") or op_d.get("op_name", "")
+                                if p_name == tgt:
+                                    t_no = op_d.get("tool_number", "")
+                                    t_spec = op_d.get("tool_spec_display") or op_d.get("tool_name", "")
+                                    t_str = f"{t_no}({t_spec})" if t_spec else t_no
+                                    if t_str and t_str not in tools_list:
+                                        tools_list.append(t_str)
+
+                        # 該截圖在 Excel 工單中之版面位置描述
+                        if p.get("is_appendix_image_page"):
+                            if len(tgt_ops) > 1:
+                                placement = f"工單第 {p_idx} 頁 (大圖附圖頁【圖{t_idx + 1}】)"
+                            else:
+                                placement = f"工單第 {p_idx} 頁 (專屬大圖附圖頁)"
+                        elif is_side_by_side:
+                            side_label = "左側示圖" if t_idx == 0 else "右側示圖"
+                            placement = f"工單第 {p_idx} 頁 (刀具下方【{side_label}】並排)"
+                        else:
+                            placement = f"工單第 {p_idx} 頁 (刀具下方示圖區)"
+
+                        stg_name = p.get("stage", "通用工段")
+                        custom_seq = p.get("custom_seq", "")
+
+                        capture_stages.append({
+                            "target_op": tgt,
+                            "stage": stg_name,
+                            "custom_seq": custom_seq,
+                            "tools_summary": ", ".join(tools_list) if tools_list else "所屬全部刀具",
+                            "placement": placement
+                        })
+
+        target_names = [item["target_op"] for item in capture_stages]
+        the_session.ListingWindow.WriteLine(f"識別到需截圖的加工工序清單：{target_names}（共 {len(capture_stages)} 張）")
+
+        # 5. 方案二：【互動引導式拍照精靈】
+        stage_images = {}
+        if not capture_stages:
+            the_session.ListingWindow.WriteLine("----------------------------------------")
+            the_session.ListingWindow.WriteLine("所有程式群組皆設定為不擷取示圖，自動略過拍照流程。")
+            break
         else:
-            the_session.ListingWindow.WriteLine("未截取示圖或已略過，工單展示區將保持留白。")
-    except Exception as ex:
-        the_session.ListingWindow.WriteLine(f"拍照精靈啟動異常 (安全跳過)：{str(ex)}")
+            the_session.ListingWindow.WriteLine("----------------------------------------")
+            the_session.ListingWindow.WriteLine("啟動【互動引導式拍照精靈】...")
+            the_session.ListingWindow.WriteLine("提示：請在置頂拍照小視窗引導下，在 NX 主視窗旋轉縮放工件至最佳視角後點選拍照。")
+            try:
+                stage_images = run_interactive_capture_wizard(
+                    capture_stages, target_folder, uf_session, the_ui=the_ui, listing=the_session.ListingWindow, work_part=work_part
+                )
+                if isinstance(stage_images, dict) and stage_images.get("__ACTION__") == "BACK_TO_PAGINATION":
+                    the_session.ListingWindow.WriteLine("----------------------------------------")
+                    the_session.ListingWindow.WriteLine("【導航通知】使用者於第一工序點選「回到上一步」，正在返回分頁排版編輯器...")
+                    continue
+
+                if stage_images:
+                    the_session.ListingWindow.WriteLine(f"各工段加工示圖已擷取：{list(stage_images.keys())}")
+                else:
+                    the_session.ListingWindow.WriteLine("未截取示圖或已略過，工單展示區將保持留白。")
+                break
+            except Exception as ex:
+                the_session.ListingWindow.WriteLine(f"拍照精靈啟動異常 (安全跳過)：{str(ex)}")
+                break
 
     # 6. 判定表頭資訊 (依使用者最新規則)
     # 圖名：應為檔案名稱
@@ -3784,19 +4617,24 @@ def main():
     the_session.ListingWindow.WriteLine("----------------------------------------")
     the_session.ListingWindow.WriteLine("【工段加工原點 (MCS) 方位標註解析】：")
     for stg in distinct_stages:
-        stg_ops = stage_ops_map.get(stg, [])
-        origin_str = resolve_stage_mcs_origin_string(
-            stg_ops, work_part=work_part, cam_setup=work_part.CAMSetup if work_part else None, uf_session=uf_session
-        )
+        if "stage_origins_nc" in locals() and stage_origins_nc and stg in stage_origins_nc:
+            origin_str = stage_origins_nc[stg]
+        else:
+            stg_ops = stage_ops_map.get(stg, [])
+            origin_str = resolve_stage_mcs_origin_string(
+                stg_ops, work_part=work_part, cam_setup=work_part.CAMSetup if work_part else None, uf_session=uf_session
+            )
         stage_origins[stg] = origin_str
         the_session.ListingWindow.WriteLine(f"  - 工段【{stg}】：{origin_str}")
 
     # 7. 透過 VBS 多頁寫入 Excel 並內嵌加工示圖
     the_session.ListingWindow.WriteLine("正在產生多頁 Excel 工單與嵌入加工示圖...")
     if stage_images:
+        the_session.ListingWindow.WriteLine("正在執行示圖工序標籤自動壓印...")
+        batch_overlay_op_labels(stage_images, listing=the_session.ListingWindow, force=True)
         the_session.ListingWindow.WriteLine(f"準備嵌入之加工示圖列表：{stage_images}")
     try:
-        export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=stage_images, stage_origins=stage_origins)
+        export_multipage_via_vbs(pages, template_path, output_path, work_part, header_info, stage_images=stage_images, stage_origins=stage_origins, sequence_style=chosen_seq_style)
         the_session.ListingWindow.WriteLine(f"工單建立完成！檔案路徑：{output_path}")
         the_session.ListingWindow.WriteLine("========================================")
         os.startfile(output_path)
