@@ -10,6 +10,12 @@ _capture_debug.log
 ~$*.xls
 *.bak*
 
+# User custom template files (never overwritten by git)
+*Custom.xlsx
+*User.xlsx
+*_custom.xlsx
+*_user.xlsx
+
 # OS generated files
 Thumbs.db
 [Dd]esktop.ini

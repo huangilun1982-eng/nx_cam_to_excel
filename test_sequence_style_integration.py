@@ -376,5 +376,36 @@ class TestSequenceStyleIntegration(unittest.TestCase):
         # 斷言 3：A37 包含完整多圖標註
         self.assertIn("【圖1: OP10】  【圖2: OP20】  【圖3: OP30】  【圖4: OP40】", vbs_content)
 
+    @patch("nx_cam_to_excel.resolve_project_root_dir")
+    def test_custom_template_priority_resolution(self, mock_root):
+        """
+        驗證方案 A：個人化自訂範本優先載入機制
+        1. 當存在 ShopDoc_Template_Custom.xlsx 時，resolve_asset_file 優先回傳該客製檔案。
+        2. 當客製範本不存在時，平滑回退載入標準公用 ShopDoc_Template.xlsx。
+        """
+        from nx_cam_to_excel import resolve_asset_file
+        import tempfile
+        import shutil
+
+        temp_dir = tempfile.mkdtemp()
+        mock_root.return_value = temp_dir
+        try:
+            std_tpl = os.path.join(temp_dir, "ShopDoc_Template.xlsx")
+            cust_tpl = os.path.join(temp_dir, "ShopDoc_Template_Custom.xlsx")
+
+            # 情況 1：僅有標準範本
+            with open(std_tpl, "w", encoding="utf-8") as f:
+                f.write("standard")
+            res_std = resolve_asset_file("ShopDoc_Template.xlsx")
+            self.assertEqual(os.path.normpath(res_std), os.path.normpath(std_tpl))
+
+            # 情況 2：加入自訂客製範本，必須優先回傳客製範本
+            with open(cust_tpl, "w", encoding="utf-8") as f:
+                f.write("custom")
+            res_cust = resolve_asset_file("ShopDoc_Template.xlsx")
+            self.assertEqual(os.path.normpath(res_cust), os.path.normpath(cust_tpl))
+        finally:
+            shutil.rmtree(temp_dir)
+
 if __name__ == "__main__":
     unittest.main()

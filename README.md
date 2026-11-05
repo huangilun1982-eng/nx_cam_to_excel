@@ -91,6 +91,7 @@
 ├── machine_profile_manager.py             # CNC 機型配置管理器
 ├── nc_processor.py                        # NC 程式碼背景後處理與檔頭轉換引擎
 ├── ShopDoc_Template.xlsx                 # Excel 工單標準格式範本
+├── ShopDoc_Template_Custom.xlsx          # (選用) 個人自訂範本 (優先載入且不被 Git 回溯)
 ├── NX_CAM工單自動化匯出.xlsx              # 範例匯出工單活頁簿
 ├── NX_CAM工單自動化匯出_佈署與操作手冊.md   # 詳細佈署與操作教學手冊
 ├── README.md                             # 專案說明文件

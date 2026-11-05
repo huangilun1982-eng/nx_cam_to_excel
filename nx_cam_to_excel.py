@@ -1053,7 +1053,7 @@ def resolve_project_root_dir(the_session=None, work_part=None):
     # 去重並驗證目錄中是否存在核心組件或範本
     seen = set()
     best_dir = None
-    key_files = ["ShopDoc_Template.xlsx", "nc_post_dialog.py", "nx_cam_to_excel.py"]
+    key_files = ["ShopDoc_Template_Custom.xlsx", "ShopDoc_Template_User.xlsx", "ShopDoc_Template.xlsx", "nc_post_dialog.py", "nx_cam_to_excel.py"]
 
     for d in candidate_dirs:
         if not d:
@@ -1079,12 +1079,23 @@ def resolve_project_root_dir(the_session=None, work_part=None):
 
 def resolve_asset_file(filename, the_session=None, work_part=None):
     """
-    精確解析專案資產檔案 (對話框腳本、Excel 範本等) 之絕對路徑
+    精確解析專案資產檔案 (對話框腳本、Excel 範本等) 之絕對路徑。
+    支援個人化客製範本優先加載機制 (方案 A)：
+    當解析 "ShopDoc_Template.xlsx" 時，系統會優先探測是否存在使用者自訂範本：
+    1. ShopDoc_Template_Custom.xlsx
+    2. ShopDoc_Template_User.xlsx
+    若存在客製範本則優先採用，徹底保障工程師之個人化格式與設定永不被 Git 版本更新回溯；
+    若無客製範本則平滑回退載入標準公用範本 ShopDoc_Template.xlsx。
     """
+    candidates = [filename]
+    if filename.lower() == "shopdoc_template.xlsx":
+        candidates = ["ShopDoc_Template_Custom.xlsx", "ShopDoc_Template_User.xlsx", "ShopDoc_Template.xlsx"]
+
     root_dir = resolve_project_root_dir(the_session=the_session, work_part=work_part)
-    target_path = os.path.join(root_dir, filename)
-    if os.path.exists(target_path):
-        return target_path
+    for cand in candidates:
+        target_path = os.path.join(root_dir, cand)
+        if os.path.exists(target_path):
+            return target_path
 
     # 若根目錄未直接命中，進一步搜尋常見位置
     search_dirs = [
@@ -1098,15 +1109,16 @@ def resolve_asset_file(filename, the_session=None, work_part=None):
         except Exception:
             pass
 
-    for s_dir in search_dirs:
-        try:
-            p = os.path.join(s_dir, filename)
-            if os.path.exists(p):
-                return p
-        except Exception:
-            continue
+    for cand in candidates:
+        for s_dir in search_dirs:
+            try:
+                p = os.path.join(s_dir, cand)
+                if os.path.exists(p):
+                    return p
+            except Exception:
+                continue
 
-    return target_path
+    return os.path.join(root_dir, filename)
 
 def is_valid_external_python(exe_path):
     """嚴格校驗是否為合法外部獨立 Python 直譯器 (絕不誤判 ugraf.exe 或 NX 內建環境)"""
@@ -4263,9 +4275,15 @@ def main():
     the_session.ListingWindow.WriteLine(f"已選定機型檔頭：[{chosen_profile}] | 執行模式：[{task_run_mode}]")
 
     # 工單範本檔案存在性檢查 (僅在需要產出工單的模式下檢查)
-    if task_run_mode != "NC_ONLY" and not os.path.exists(template_path):
-        the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
-        return
+    if task_run_mode != "NC_ONLY":
+        if not os.path.exists(template_path):
+            the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
+            return
+        tpl_bname = os.path.basename(template_path)
+        if "custom" in tpl_bname.lower() or "user" in tpl_bname.lower():
+            the_session.ListingWindow.WriteLine(f"  [範本模式] 已偵測並優先載入個人化自訂範本：{tpl_bname}")
+        else:
+            the_session.ListingWindow.WriteLine(f"  [範本模式] 載入標準公用工單範本：{tpl_bname}")
 
     # 2. 逐一萃取工序資訊並執行群組內刀具合併 (各子資料夾獨立合併，不跨子資料夾合併！)
     processed_chunks = []
