@@ -835,6 +835,7 @@ def merge_consecutive_tools(raw_ops, group_name=""):
     for op in raw_ops:
         if temp_op is None:
             temp_op = dict(op)
+            temp_op["_merged_nx_ops"] = [op.get("_nx_op_obj")] if op.get("_nx_op_obj") else []
             t_int = parse_tool_int(temp_op.get("tool_number"))
             temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
             temp_op["_last_tool_int"] = t_int
@@ -846,6 +847,7 @@ def merge_consecutive_tools(raw_ops, group_name=""):
         if is_direct_curr or is_direct_prev:
             merged_ops.append(temp_op)
             temp_op = dict(op)
+            temp_op["_merged_nx_ops"] = [op.get("_nx_op_obj")] if op.get("_nx_op_obj") else []
             t_int = parse_tool_int(temp_op.get("tool_number"))
             temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
             temp_op["_last_tool_int"] = t_int
@@ -882,7 +884,12 @@ def merge_consecutive_tools(raw_ops, group_name=""):
         is_consecutive = (t_curr_int == t_prev_int + 1 and t_curr_int != -99999 and is_spec_match)
 
         if is_same_id or is_consecutive:
-            # 觸發合併
+            # 觸發合併：記錄合併之 NX 工序物件，保證 NC 後處理轉出完整不遺漏
+            if "_merged_nx_ops" not in temp_op:
+                temp_op["_merged_nx_ops"] = [temp_op.get("_nx_op_obj")] if temp_op.get("_nx_op_obj") else []
+            if op.get("_nx_op_obj"):
+                temp_op["_merged_nx_ops"].append(op.get("_nx_op_obj"))
+
             # (1) 刀名正規化為乾淨名稱 (去後綴)
             if name_prev:
                 temp_op["raw_tool_name"] = name_prev
@@ -926,6 +933,7 @@ def merge_consecutive_tools(raw_ops, group_name=""):
             # 不符合合併條件，結算前一工步
             merged_ops.append(temp_op)
             temp_op = dict(op)
+            temp_op["_merged_nx_ops"] = [op.get("_nx_op_obj")] if op.get("_nx_op_obj") else []
             t_int = parse_tool_int(temp_op.get("tool_number"))
             temp_op["_start_tool_str"] = format_tool_number(temp_op.get("tool_number"))
             temp_op["_last_tool_int"] = t_int
@@ -3493,13 +3501,13 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
 
 # ==================== NX CAM 後處理與 NC 轉出模組 ====================
 
-def build_nc_tasks_from_selection(selected_objects):
+def build_nc_tasks_from_selection(selected_objects, tree_map=None):
     """
     依照使用者在 CAM 導覽器選取之物件構建 NC 轉出任務列表：
     1. 若選取為父資料夾：將該資料夾內所有底層工序彙整為一個 NC 任務，檔名為資料夾名稱 (如 MK-1-M1.nc)。
     2. 若祖先已被選取：該子資料夾或子工序自動略過（由最頂層選取統一轉出，避免重疊重複產出）。
     3. 若單獨選取工序：該工序獨立為一個 NC 任務，檔名為該工序名稱。
-    4. 保證 100% 遵守選取之工藝順序與去重原則。
+    4. 保證 100% 遵守選取之工藝順序與去重原則，並關聯所屬工段標籤 (stage)。
     """
     tasks = []
     covered_op_tags = set()
@@ -3531,6 +3539,17 @@ def build_nc_tasks_from_selection(selected_objects):
             pass
         return ops
 
+    def _resolve_stage_for_ops(ops, fallback_name=""):
+        if tree_map and ops:
+            for op in ops:
+                t = getattr(op, "Tag", None)
+                if t and t in tree_map:
+                    stg = tree_map[t].get("stage")
+                    if stg:
+                        return stg
+        stg = extract_stage_key(fallback_name)
+        return stg or "通用工段"
+
     for obj in selected_objects:
         obj_name = getattr(obj, "Name", "").strip()
         is_grp = isinstance(obj, NXOpen.CAM.NCGroup)
@@ -3548,12 +3567,14 @@ def build_nc_tasks_from_selection(selected_objects):
             if remaining_ops:
                 clean_name = clean_program_name(obj_name)
                 clean_name = re.sub(r'[\\/:*?"<>|]', '_', clean_name)
+                stage_label = _resolve_stage_for_ops(remaining_ops, obj_name)
                 tasks.append({
                     "program_name": clean_name,
                     "operations": remaining_ops,
                     "op_names": [getattr(op, "Name", "") for op in remaining_ops],
                     "op_count": len(remaining_ops),
-                    "source_type": "group"
+                    "source_type": "group",
+                    "stage": stage_label
                 })
                 for op in remaining_ops:
                     t = getattr(op, "Tag", None)
@@ -3565,12 +3586,14 @@ def build_nc_tasks_from_selection(selected_objects):
             if op_tag not in covered_op_tags:
                 clean_name = clean_program_name(obj_name)
                 clean_name = re.sub(r'[\\/:*?"<>|]', '_', clean_name)
+                stage_label = _resolve_stage_for_ops([obj], obj_name)
                 tasks.append({
                     "program_name": clean_name,
                     "operations": [obj],
                     "op_names": [obj_name],
                     "op_count": 1,
-                    "source_type": "operation"
+                    "source_type": "operation",
+                    "stage": stage_label
                 })
                 if op_tag:
                     covered_op_tags.add(op_tag)
@@ -4228,7 +4251,7 @@ def main():
         the_session.ListingWindow.WriteLine(f"已自動識別表頭資訊：{extracted_info}")
 
     # 2. 建構 NC 轉出任務清單 (符合分組分檔、父資料夾包含子工序、單獨工序各自轉出、自動去重規則)
-    nc_tasks = build_nc_tasks_from_selection(selected_objects)
+    nc_tasks = build_nc_tasks_from_selection(selected_objects, tree_map=cam_tree_map)
 
     # 3. 彈出互動確認視窗：讓使用者決定是否依表單轉出 NC 碼、選擇機台後處理器與輸出路徑
     the_session.ListingWindow.WriteLine("----------------------------------------")
@@ -4480,7 +4503,8 @@ def main():
             output_dir=chosen_out_dir,
             listing=the_session.ListingWindow,
             default_post=chosen_post,
-            extension=chosen_ext
+            extension=chosen_ext,
+            nc_tasks=nc_tasks
         )
         the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_cnt} 筆，失敗 {fail_cnt} 筆。輸出目錄：{chosen_out_dir}")
         the_session.ListingWindow.WriteLine("========================================")
@@ -4669,7 +4693,8 @@ def main():
                 output_dir=chosen_out_dir,
                 listing=the_session.ListingWindow,
                 default_post=chosen_post,
-                extension=chosen_ext
+                extension=chosen_ext,
+                nc_tasks=nc_tasks
             )
             the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_nc} 筆，失敗 {fail_nc} 筆。輸出目錄：{chosen_out_dir}")
             the_session.ListingWindow.WriteLine("========================================")

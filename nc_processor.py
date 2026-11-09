@@ -84,6 +84,7 @@ def build_nc_header_comment_block(header_info, mcs_origin_str, tools_summary=Non
 def parse_first_tool_and_speed_from_ops(raw_ops):
     """
     自工序列表提取第一道工序的 T 號、轉速 S 與安全 Z 值。
+    相容原生字典結構與巢狀 data 字典，並支援連續刀號格式 (如 T01~T02)。
     """
     tool_no = "1"
     speed = "4000"
@@ -93,10 +94,12 @@ def parse_first_tool_and_speed_from_ops(raw_ops):
 
     if raw_ops:
         first_op = raw_ops[0]
-        data = first_op.get("data", {}) if isinstance(first_op, dict) else {}
+        data = first_op.get("data") if (isinstance(first_op, dict) and "data" in first_op) else (first_op if isinstance(first_op, dict) else {})
         t_raw = str(data.get("tool_number", "1")).upper().replace("T", "").strip()
+        if "~" in t_raw:
+            t_raw = t_raw.split("~")[0].strip()
         if t_raw.isdigit():
-            tool_no = t_raw
+            tool_no = str(int(t_raw))
         
         note_str = str(data.get("note", ""))
         m_s = re.search(r"[Ss][:=-]?\s*(\d+)", note_str)
@@ -105,43 +108,124 @@ def parse_first_tool_and_speed_from_ops(raw_ops):
 
     return tool_no, speed, safe_z, start_x, start_y
 
+def parse_nc_initial_params(nc_text, default_wcs="G54", default_tool="1", default_speed="4000", default_safe_z="50."):
+    """
+    自原始 NC 程式中解析首把刀具之工作座標系 (WCS, 如 G54/G55/G56)、
+    起刀切削點 (X, Y 絕對座標)、安全 Z 高度、刀號與主軸轉速。
+    保證臥式機型置換檔頭時，絕對不覆蓋掉 CAM 原生算出的真實首刀起刀點座標！
+    """
+    lines = nc_text.splitlines()
+    code_lines = []
+    for line in lines:
+        clean = line.strip().upper()
+        code_only = re.sub(r'\(.*?\)', '', clean).strip()
+        code_lines.append(code_only)
+        if re.search(r'\bM0?8\b', code_only):
+            break
+        if len(code_lines) > 60:
+            break
+
+    header_code = "\n".join(code_lines)
+
+    # 尋找 M06 換刀行之位置
+    m06_idx = 0
+    for idx, l in enumerate(code_lines):
+        if re.search(r'\bM0?6\b', l):
+            m06_idx = idx
+            break
+
+    # 1. 解析 WCS (例如 G54, G55, G56, G57, G58, G59, G54.1 P1 等)
+    # 優先自 M06 之後尋找，若無則自全表頭尋找
+    wcs = default_wcs
+    after_m06_text = "\n".join(code_lines[m06_idx:])
+    m_wcs = re.search(r'\b(G5[4-9]|G54\.1\s*P\d+)\b', after_m06_text) or re.search(r'\b(G5[4-9]|G54\.1\s*P\d+)\b', header_code)
+    if m_wcs:
+        wcs = m_wcs.group(1).replace(" ", "")
+
+    # 2. 解析 Tool 號
+    tool = default_tool
+    m_t = re.search(r'\bT0*(\d+)\b', header_code)
+    if m_t:
+        tool = m_t.group(1)
+
+    # 3. 解析主軸轉速 S
+    speed = default_speed
+    m_s = re.search(r'\bS(\d+)\b', header_code)
+    if m_s:
+        speed = m_s.group(1)
+
+    # 4. 解析安全 Z (優先自 G43 刀長補償行或換刀後 Z 移動抓取)
+    safe_z = default_safe_z
+    m_z = (
+        re.search(r'G43[^\n]*\bZ([-+]?\d*\.?\d+)\b', after_m06_text) or
+        re.search(r'\bZ([-+]?\d*\.?\d+)\b[^\n]*G43', after_m06_text) or
+        re.search(r'\bZ([-+]?\d*\.?\d+)\b', after_m06_text)
+    )
+    if m_z:
+        safe_z = m_z.group(1)
+        if '.' not in safe_z:
+            safe_z += '.'
+
+    # 5. 解析起刀點 X, Y 座標 (在 M06 之後排除 G28/G30/G53 歸零干擾)
+    start_x = "0."
+    start_y = "0."
+    non_homing_lines = [l for l in code_lines[m06_idx:] if not any(k in l for k in ('G28', 'G30', 'G53'))]
+    non_homing_text = "\n".join(non_homing_lines)
+
+    m_x = re.search(r'\bX([-+]?\d*\.?\d+)\b', non_homing_text)
+    if m_x:
+        start_x = m_x.group(1)
+        if '.' not in start_x:
+            start_x += '.'
+
+    m_y = re.search(r'\bY([-+]?\d*\.?\d+)\b', non_homing_text)
+    if m_y:
+        start_y = m_y.group(1)
+        if '.' not in start_y:
+            start_y += '.'
+
+    return wcs, tool, speed, safe_z, start_x, start_y
+
 def extract_body_from_original_nc(raw_nc_content):
     """
     從原始 NC 程式中切分出主切削路徑主體 (Body)，截斷開頭重複之舊檔頭與舊換刀準備行。
     
     截斷點判斷邏輯：
-    尋找原始程式中第一把刀啟動刀長補償 (G43 H..) 或冷卻液 (M08) 後的第一行實際進刀動作。
-    若未找到明確切削起點，則自第一個 M06/換刀後的第 3~4 行起刀點截斷。
+    1. 尋找原始程式中首道工序啟動冷卻液 (M08/M8) 的行，自下一行起視為主切削本體。
+    2. 若未設定 M08，則自第一把刀啟動刀長補償 (G43) 的下一行起截斷。
+    3. 若無上述指令，則自首個 M06 換刀後的第 4 行起截斷。
+    4. 濾除括號註解，避免工序說明或刀具備註中包含 M8 等字眼造成誤判。
     """
     lines = raw_nc_content.splitlines()
     body_start_idx = 0
+    found_cut = False
 
-    # 尋找第一處 M08 或 G43
-    found_m08 = False
+    # 1. 優先尋找首道換刀後之第一處 M08 / M8 (冷卻液啟動行)
     for i, line in enumerate(lines):
-        clean_l = line.strip().upper()
-        if "M08" in clean_l or "M8" in clean_l:
+        clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
+        if re.search(r'\bM0?8\b', clean_l):
             body_start_idx = i + 1
-            found_m08 = True
-            break
-        elif "G43" in clean_l:
-            body_start_idx = i + 1
-            found_m08 = True
-            # 如果下一行緊接著 M08，則跳過 M08
-            if i + 1 < len(lines) and ("M08" in lines[i+1].upper() or "M8" in lines[i+1].upper()):
-                body_start_idx = i + 2
+            found_cut = True
             break
 
-    if not found_m08:
-        # 備援：尋找第一個 M06
+    # 2. 備援 A：若無 M08，則尋找第一處 G43 (刀長補償建立行)
+    if not found_cut:
         for i, line in enumerate(lines):
-            clean_l = line.strip().upper()
-            if "M06" in clean_l or "M6" in clean_l:
-                # 跳過換刀行後續的 S/M03、G54、G43 預備行 (通常約 3~4 行)
-                body_start_idx = min(i + 4, len(lines))
+            clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
+            if "G43" in clean_l:
+                body_start_idx = i + 1
+                found_cut = True
                 break
 
-    # 回傳主體切削代碼行
+    # 3. 備援 B：若無 M08 亦無 G43，則尋找首個 M06 (換刀行) 並跳過預備行
+    if not found_cut:
+        for i, line in enumerate(lines):
+            clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
+            if re.search(r'\bM0?6\b', clean_l):
+                body_start_idx = min(i + 4, len(lines))
+                found_cut = True
+                break
+
     body_lines = lines[body_start_idx:]
     return "\n".join(body_lines)
 
@@ -151,20 +235,20 @@ def transform_nc_content_by_profile(original_nc, profile_id, header_info, mcs_or
     """
     sanitized_original = sanitize_nc_text(original_nc)
     
-    # 提取第一把刀與主軸轉速
-    tool_no, speed, safe_z, start_x, start_y = parse_first_tool_and_speed_from_ops(raw_ops)
+    # 提取第一把刀與主軸轉速 (作為預設後備值)
+    op_tool, op_speed, op_safe_z, op_x, op_y = parse_first_tool_and_speed_from_ops(raw_ops)
 
     # 收集刀具簡要清單供註解使用
     tool_summary_list = []
     if raw_ops:
         seen_t = set()
         for op in raw_ops:
-            op_data = op.get("data", {}) if isinstance(op, dict) else {}
+            op_data = op.get("data") if (isinstance(op, dict) and "data" in op) else (op if isinstance(op, dict) else {})
             t_num = str(op_data.get("tool_number", "")).strip()
             if t_num and t_num not in seen_t:
                 seen_t.add(t_num)
                 t_spec = op_data.get("tool_spec_display", "")
-                t_name = op_data.get("op_name", "")
+                t_name = op_data.get("op_name", op_data.get("clean_op_name", ""))
                 tool_summary_list.append(f"{t_num:<4} {t_spec:<16} {t_name}")
 
     # 建立標準工單註解
@@ -174,6 +258,30 @@ def transform_nc_content_by_profile(original_nc, profile_id, header_info, mcs_or
         # -------------------------------------------------------------
         # Fanuc 臥式機型：專屬 12 行安全性與 B0 定位檔頭置換
         # -------------------------------------------------------------
+        # 從 mcs_origin_str 提取工段原點 WCS (作為預設後備值)
+        default_wcs = "G54"
+        if mcs_origin_str:
+            m_stg_wcs = re.search(r'\b(G5[4-9]|G54\.1\s*P\d+)\b', mcs_origin_str)
+            if m_stg_wcs:
+                default_wcs = m_stg_wcs.group(1).replace(" ", "")
+
+        # 自原始 NC 程式中動態精確解析真實 WCS、起刀點 X/Y、安全 Z、刀號 T 與轉速 S
+        nc_wcs, nc_tool, nc_speed, nc_safe_z, nc_start_x, nc_start_y = parse_nc_initial_params(
+            sanitized_original,
+            default_wcs=default_wcs,
+            default_tool=op_tool,
+            default_speed=op_speed,
+            default_safe_z=op_safe_z
+        )
+
+        # 決定最終採用參數 (起刀座標與 WCS 嚴格取自原始 NC 避免撞機，刀具轉速兼顧 raw_ops 顯式設定)
+        tool_no = op_tool if (raw_ops and op_tool != "1") else nc_tool
+        speed = op_speed if (raw_ops and op_speed != "4000") else nc_speed
+        safe_z = nc_safe_z if nc_safe_z != "50." else op_safe_z
+        start_x = nc_start_x
+        start_y = nc_start_y
+        wcs = nc_wcs
+
         hz_header_lines = [
             "%",
             comment_block,
@@ -181,12 +289,12 @@ def transform_nc_content_by_profile(original_nc, profile_id, header_info, mcs_or
             "G91G30X0.Y0.",
             "G90G17G00G40G49G80",
             "M11",
-            "G90G0G54B0.",
+            f"G90G0{wcs}B0.",
             "M10",
             f"M06 T{tool_no}",
             f"S{speed} M03",
             "G17 G40 G80",
-            f"G90 G54 G00 X{start_x} Y{start_y}",
+            f"G90 {wcs} G00 X{start_x} Y{start_y}",
             f"G0 G43 H{tool_no} Z{safe_z}",
             "M08"
         ]
@@ -240,16 +348,21 @@ def run_nx_postprocess(cam_setup, cam_objects, post_name, output_file):
     except Exception:
         return False
 
-def process_and_export_nc_tasks(cam_setup, processed_chunks, profile_id, header_info, stage_origins, output_dir, listing=None, default_post="Fanuc", extension=".nc"):
+def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FANUC_HORIZONTAL", header_info=None, stage_origins=None, output_dir="", listing=None, default_post="Fanuc", extension=".nc", nc_tasks=None):
     """
     批次處理各程式群組：執行背景後處理、特殊字元清洗、機型檔頭置換與安全落盤。
+    支援直接傳入 nc_tasks (保證未合併之 100% 原始工序物件) 或 processed_chunks (自動展開同刀號合併工序)。
     """
-    if not cam_setup or not processed_chunks:
+    if not cam_setup:
+        return 0, 0
+    if not processed_chunks and not nc_tasks:
         return 0, 0
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
+    header_info = header_info or {}
+    stage_origins = stage_origins or {}
     success_count = 0
     fail_count = 0
 
@@ -257,22 +370,67 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks, profile_id, header_
         listing.WriteLine("----------------------------------------")
         listing.WriteLine(f"【開始 NC 碼後處理與機型檔頭置換 (目標機型: {profile_id})】")
 
-    # 依母程式名稱或群組名稱聚合工序
+    # 建立輔助查找映射表 (從 processed_chunks 蒐集已解析的工步資訊與刀具資料)
+    chunk_ops_by_prog = {}
+    chunk_stage_by_prog = {}
+    if processed_chunks:
+        for chunk in processed_chunks:
+            p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
+            stage = chunk.get("stage", "通用工段")
+            if p_name not in chunk_stage_by_prog:
+                chunk_stage_by_prog[p_name] = stage
+            if p_name not in chunk_ops_by_prog:
+                chunk_ops_by_prog[p_name] = []
+            for mop in chunk.get("operations", []):
+                chunk_ops_by_prog[p_name].append(mop)
+
+    # 聚合各程式群組的工序任務，確保 100% 納入所有工序物件
     prog_tasks = {}
-    for chunk in processed_chunks:
-        p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
-        stage = chunk.get("stage", "通用工段")
-        if p_name not in prog_tasks:
+
+    # 1. 優先使用 nc_tasks (由 CAM 導覽器選取樹構建之任務，工序未合併，保有完整物件列表)
+    if nc_tasks:
+        for task in nc_tasks:
+            p_name = task.get("program_name", "MAIN")
+            stage = task.get("stage") or chunk_stage_by_prog.get(p_name, "通用工段")
+            raw_ops_in_task = task.get("operations", [])
+            ops_data = task.get("ops_data") or chunk_ops_by_prog.get(p_name, [])
+
+            # 若無現成 ops_data 則自 task["operations"] 構建基礎資訊
+            if not ops_data and raw_ops_in_task:
+                ops_data = []
+                for op in raw_ops_in_task:
+                    op_n = getattr(op, "Name", "") if hasattr(op, "Name") else str(op)
+                    ops_data.append({"op_name": op_n, "_nx_op_obj": op})
+
             prog_tasks[p_name] = {
                 "stage": stage,
-                "ops_data": [],
-                "nx_ops": []
+                "ops_data": ops_data,
+                "nx_ops": list(raw_ops_in_task)
             }
-        for mop in chunk.get("operations", []):
-            prog_tasks[p_name]["ops_data"].append(mop)
-            nx_op = mop.get("_nx_op_obj")
-            if nx_op and nx_op not in prog_tasks[p_name]["nx_ops"]:
-                prog_tasks[p_name]["nx_ops"].append(nx_op)
+
+    # 2. 備援模式：自 processed_chunks 重建任務，並透過 _merged_nx_ops 保證所有合併工序皆被取出
+    elif processed_chunks:
+        for chunk in processed_chunks:
+            p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
+            stage = chunk.get("stage", "通用工段")
+            if p_name not in prog_tasks:
+                prog_tasks[p_name] = {
+                    "stage": stage,
+                    "ops_data": [],
+                    "nx_ops": []
+                }
+            for mop in chunk.get("operations", []):
+                prog_tasks[p_name]["ops_data"].append(mop)
+                # 萃取所有底層工序物件 (包含因同刀號合併被收納於 _merged_nx_ops 之工序)
+                sub_ops = mop.get("_merged_nx_ops")
+                if sub_ops and isinstance(sub_ops, (list, tuple)):
+                    for nx_op in sub_ops:
+                        if nx_op and nx_op not in prog_tasks[p_name]["nx_ops"]:
+                            prog_tasks[p_name]["nx_ops"].append(nx_op)
+                else:
+                    nx_op = mop.get("_nx_op_obj")
+                    if nx_op and nx_op not in prog_tasks[p_name]["nx_ops"]:
+                        prog_tasks[p_name]["nx_ops"].append(nx_op)
 
     for prog_name, task_info in prog_tasks.items():
         nx_ops = task_info["nx_ops"]

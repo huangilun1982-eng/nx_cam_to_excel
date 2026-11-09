@@ -142,7 +142,7 @@ WScript.Echo "R7_NOTE=" & c1_note
         with open(tmp_check_vbs, "w", encoding="cp950") as f:
             f.write(verify_vbs)
 
-        res = subprocess.run(["cscript.exe", "//Nologo", tmp_check_vbs], capture_output=True, text=True)
+        res = subprocess.run(["cscript.exe", "//Nologo", tmp_check_vbs], capture_output=True, encoding="cp950", errors="replace")
         if os.path.exists(tmp_check_vbs):
             os.remove(tmp_check_vbs)
 
