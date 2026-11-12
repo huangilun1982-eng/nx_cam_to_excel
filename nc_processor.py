@@ -108,6 +108,40 @@ def parse_first_tool_and_speed_from_ops(raw_ops):
 
     return tool_no, speed, safe_z, start_x, start_y
 
+def _find_first_tool_header_limit(lines):
+    """
+    定位原始 NC 程式中「第一把刀起始檔頭」的絕對搜尋上限行號：
+    1. 若遇到第二處 M06 (換第二把刀)，立即停止。
+    2. 若已出現過 G43 / M03 / M04 / M06，且遇到首個切削移動指令 (G01/G02/G03) 或固定循環 (G73/G74/G76/G81~G89)，
+       代表已進入首把刀之實際切削刀軌，立即於該行前停止，絕不跨入切削路徑或後續刀具。
+    """
+    m06_count = 0
+    seen_setup_token = False
+    max_scan = min(len(lines), 100)
+
+    for i in range(max_scan):
+        clean_l = re.sub(r'\(.*?\)', '', lines[i]).strip().upper()
+        if not clean_l:
+            continue
+
+        if re.search(r'\bM0?6\b', clean_l):
+            m06_count += 1
+            seen_setup_token = True
+            if m06_count >= 2:
+                return i
+            continue
+
+        if re.search(r'\b(G43|M0?[34]|G5[4-9]|G54\.1)\b', clean_l):
+            seen_setup_token = True
+
+        # 一旦進入切削移動 (G01/G02/G03) 或鑽孔/攻牙固定循環 (G73/G74/G76/G81~G89)，即為刀軌本體起點
+        if re.search(r'\b(G0?[123]|G7[346]|G8[1-9])\b', clean_l):
+            if seen_setup_token or i > 0:
+                return i
+
+    return min(len(lines), 60)
+
+
 def parse_nc_initial_params(nc_text, default_wcs="G54", default_tool="1", default_speed="4000", default_safe_z="50."):
     """
     自原始 NC 程式中解析首把刀具之工作座標系 (WCS, 如 G54/G55/G56)、
@@ -115,14 +149,13 @@ def parse_nc_initial_params(nc_text, default_wcs="G54", default_tool="1", defaul
     保證臥式機型置換檔頭時，絕對不覆蓋掉 CAM 原生算出的真實首刀起刀點座標！
     """
     lines = nc_text.splitlines()
+    limit_idx = _find_first_tool_header_limit(lines)
     code_lines = []
-    for line in lines:
+    for line in lines[:limit_idx]:
         clean = line.strip().upper()
         code_only = re.sub(r'\(.*?\)', '', clean).strip()
         code_lines.append(code_only)
-        if re.search(r'\bM0?8\b', code_only):
-            break
-        if len(code_lines) > 60:
+        if re.search(r'\bM0?[78]\b', code_only):
             break
 
     header_code = "\n".join(code_lines)
@@ -154,23 +187,33 @@ def parse_nc_initial_params(nc_text, default_wcs="G54", default_tool="1", defaul
     if m_s:
         speed = m_s.group(1)
 
-    # 4. 解析安全 Z (優先自 G43 刀長補償行或換刀後 Z 移動抓取)
+    # 在 M06 之後排除 G28/G30/G53/G92 機械歸零干擾行
+    non_homing_lines = [l for l in code_lines[m06_idx:] if not re.search(r'\b(G28|G30|G53|G92)\b', l)]
+    non_homing_text = "\n".join(non_homing_lines)
+
+    # 4. 解析安全 Z (優先自 G43 刀長補償行抓取；備援僅自非歸零行抓取正值安全高度，杜絕誤抓 G28 Z0.)
     safe_z = default_safe_z
-    m_z = (
-        re.search(r'G43[^\n]*\bZ([-+]?\d*\.?\d+)\b', after_m06_text) or
-        re.search(r'\bZ([-+]?\d*\.?\d+)\b[^\n]*G43', after_m06_text) or
-        re.search(r'\bZ([-+]?\d*\.?\d+)\b', after_m06_text)
+    m_z_g43 = (
+        re.search(r'\bG43\b[^\n]*\bZ([-+]?\d*\.?\d+)\b', after_m06_text) or
+        re.search(r'\bZ([-+]?\d*\.?\d+)\b[^\n]*\bG43\b', after_m06_text)
     )
-    if m_z:
-        safe_z = m_z.group(1)
+    if m_z_g43:
+        safe_z = m_z_g43.group(1)
         if '.' not in safe_z:
             safe_z += '.'
+    else:
+        for m_z_cand in re.finditer(r'\bZ([-+]?\d*\.?\d+)\b', non_homing_text):
+            z_str = m_z_cand.group(1)
+            try:
+                if float(z_str) > 0.0:
+                    safe_z = z_str if '.' in z_str else (z_str + '.')
+                    break
+            except Exception:
+                pass
 
     # 5. 解析起刀點 X, Y 座標 (在 M06 之後排除 G28/G30/G53 歸零干擾)
     start_x = "0."
     start_y = "0."
-    non_homing_lines = [l for l in code_lines[m06_idx:] if not any(k in l for k in ('G28', 'G30', 'G53'))]
-    non_homing_text = "\n".join(non_homing_lines)
 
     m_x = re.search(r'\bX([-+]?\d*\.?\d+)\b', non_homing_text)
     if m_x:
@@ -190,39 +233,40 @@ def extract_body_from_original_nc(raw_nc_content):
     """
     從原始 NC 程式中切分出主切削路徑主體 (Body)，截斷開頭重複之舊檔頭與舊換刀準備行。
     
-    截斷點判斷邏輯：
-    1. 尋找原始程式中首道工序啟動冷卻液 (M08/M8) 的行，自下一行起視為主切削本體。
-    2. 若未設定 M08，則自第一把刀啟動刀長補償 (G43) 的下一行起截斷。
-    3. 若無上述指令，則自首個 M06 換刀後的第 4 行起截斷。
+    截斷點判斷邏輯 (嚴格限制於首把刀檔頭邊界 _find_first_tool_header_limit 內，絕不跨刀誤刪乾切削刀軌)：
+    1. 尋找首把刀檔頭區間內啟動冷卻液 (M08/M8/M07/M7) 的行，自下一行起視為主切削本體。
+    2. 若首把刀未設定 M08 (如乾切削)，則自首把刀檔頭區間內啟動刀長補償 (G43) 的下一行起截斷。
+    3. 若無上述指令，則自首把刀檔頭區間內首個 M06 換刀後的預備行 (不超過首刀檔頭上限) 截斷。
     4. 濾除括號註解，避免工序說明或刀具備註中包含 M8 等字眼造成誤判。
     """
     lines = raw_nc_content.splitlines()
+    limit_idx = _find_first_tool_header_limit(lines)
     body_start_idx = 0
     found_cut = False
 
-    # 1. 優先尋找首道換刀後之第一處 M08 / M8 (冷卻液啟動行)
-    for i, line in enumerate(lines):
-        clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
-        if re.search(r'\bM0?8\b', clean_l):
+    # 1. 優先在首把刀檔頭區間內尋找第一處 M08 / M8 / M07 / M7 (冷卻液啟動行)
+    for i in range(limit_idx):
+        clean_l = re.sub(r'\(.*?\)', '', lines[i]).strip().upper()
+        if re.search(r'\bM0?[78]\b', clean_l):
             body_start_idx = i + 1
             found_cut = True
             break
 
-    # 2. 備援 A：若無 M08，則尋找第一處 G43 (刀長補償建立行)
+    # 2. 備援 A：若首把刀無 M08 (乾切削)，則在首把刀檔頭區間內尋找第一處 G43 (刀長補償建立行)
     if not found_cut:
-        for i, line in enumerate(lines):
-            clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
-            if "G43" in clean_l:
+        for i in range(limit_idx):
+            clean_l = re.sub(r'\(.*?\)', '', lines[i]).strip().upper()
+            if re.search(r'\bG43\b', clean_l):
                 body_start_idx = i + 1
                 found_cut = True
                 break
 
-    # 3. 備援 B：若無 M08 亦無 G43，則尋找首個 M06 (換刀行) 並跳過預備行
+    # 3. 備援 B：若無 M08 亦無 G43，則在首把刀檔頭區間內尋找首個 M06 (換刀行) 並跳過預備行 (絕不超過 limit_idx)
     if not found_cut:
-        for i, line in enumerate(lines):
-            clean_l = re.sub(r'\(.*?\)', '', line).strip().upper()
+        for i in range(limit_idx):
+            clean_l = re.sub(r'\(.*?\)', '', lines[i]).strip().upper()
             if re.search(r'\bM0?6\b', clean_l):
-                body_start_idx = min(i + 4, len(lines))
+                body_start_idx = min(i + 4, limit_idx)
                 found_cut = True
                 break
 
@@ -329,9 +373,18 @@ def transform_nc_content_by_profile(original_nc, profile_id, header_info, mcs_or
 
 
 
-def run_nx_postprocess(cam_setup, cam_objects, post_name, output_file):
+def _normalize_prog_key(name):
+    """將程式群組或工序名稱正規化為與 nc_tasks 一致的乾淨檔名鍵值"""
+    if not name:
+        return ""
+    clean = re.sub(r'[-_]T\d+$', '', str(name).strip(), flags=re.IGNORECASE).strip()
+    return re.sub(r'[\\/:*?"<>|]', '_', clean)
+
+
+def run_nx_postprocess(cam_setup, cam_objects, post_name, output_file, custom_post_path=""):
     """
     呼叫 NX CAM 官方 Postprocess API 將工序背景後處理輸出至檔案。
+    支援標準註冊名稱、"[自訂] xxx" 標籤自動還原與外部 custom_post_path 智能解析。
     """
     if not cam_setup or not cam_objects:
         return False
@@ -339,16 +392,72 @@ def run_nx_postprocess(cam_setup, cam_objects, post_name, output_file):
     try:
         import NXOpen.CAM
         metric_unit = NXOpen.CAM.CAMSetup.OutputUnits.Metric
-        out_dir = os.path.dirname(os.path.abspath(output_file))
+    except Exception:
+        metric_unit = 1
+
+    try:
+        output_file = os.path.normpath(os.path.abspath(str(output_file)))
+        out_dir = os.path.dirname(output_file)
         if not os.path.exists(out_dir):
             os.makedirs(out_dir, exist_ok=True)
 
-        cam_setup.Postprocess(list(cam_objects), post_name, output_file, metric_unit)
-        return os.path.exists(output_file) and os.path.getsize(output_file) > 0
+        candidates = []
+        raw_post_str = str(post_name or "").strip()
+        is_custom_label = raw_post_str.startswith("[自訂]")
+        clean_post_name = re.sub(r'^\[自訂\]\s*', '', raw_post_str).strip()
+
+        # 若非 [自訂] 標籤 (即標準註冊後處理器名稱)，第一優先直接以該名稱呼叫
+        if not is_custom_label and raw_post_str:
+            candidates.append(raw_post_str)
+
+        # 若選取了 [自訂] 標籤或提供外部自訂後處理路徑，比對 template_post.dat 註冊表與基礎名稱
+        if is_custom_label or custom_post_path:
+            target_base = ""
+            if is_custom_label and custom_post_path:
+                target_base = os.path.splitext(os.path.basename(str(custom_post_path).strip()))[0].lower()
+            elif is_custom_label and clean_post_name:
+                target_base = clean_post_name.lower()
+            elif custom_post_path:
+                target_base = os.path.splitext(os.path.basename(str(custom_post_path).strip()))[0].lower()
+
+            if target_base:
+                try:
+                    from machine_profile_manager import load_available_postprocessors
+                    for p_entry in load_available_postprocessors():
+                        reg_name = p_entry.get("name", "")
+                        tcl_b = os.path.splitext(os.path.basename(p_entry.get("tcl", "")))[0].lower()
+                        def_b = os.path.splitext(os.path.basename(p_entry.get("def", "")))[0].lower()
+                        if target_base in (reg_name.lower(), tcl_b, def_b) and reg_name not in candidates:
+                            candidates.append(reg_name)
+                except Exception:
+                    pass
+
+            if clean_post_name and clean_post_name not in candidates:
+                candidates.append(clean_post_name)
+            if custom_post_path:
+                cp_str = str(custom_post_path).strip()
+                cp_no_ext = os.path.splitext(cp_str)[0]
+                for c_path in (cp_no_ext, cp_str):
+                    if c_path and c_path not in candidates:
+                        candidates.append(c_path)
+
+        if raw_post_str and raw_post_str not in candidates:
+            candidates.append(raw_post_str)
+
+        for cand in candidates:
+            try:
+                cam_setup.Postprocess(list(cam_objects), cand, output_file, metric_unit)
+                if os.path.exists(output_file) and os.path.getsize(output_file) > 0:
+                    return True
+            except Exception:
+                continue
+
+        return False
     except Exception:
         return False
 
-def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FANUC_HORIZONTAL", header_info=None, stage_origins=None, output_dir="", listing=None, default_post="Fanuc", extension=".nc", nc_tasks=None):
+
+def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FANUC_HORIZONTAL", header_info=None, stage_origins=None, output_dir="", listing=None, default_post="Fanuc", extension=".nc", nc_tasks=None, custom_post_path=""):
     """
     批次處理各程式群組：執行背景後處理、特殊字元清洗、機型檔頭置換與安全落盤。
     支援直接傳入 nc_tasks (保證未合併之 100% 原始工序物件) 或 processed_chunks (自動展開同刀號合併工序)。
@@ -358,6 +467,8 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FA
     if not processed_chunks and not nc_tasks:
         return 0, 0
 
+    raw_out_dir = str(output_dir or "").strip().strip('"').strip("'").strip()
+    output_dir = os.path.normpath(os.path.abspath(raw_out_dir)) if raw_out_dir else os.getcwd()
     if not os.path.exists(output_dir):
         os.makedirs(output_dir, exist_ok=True)
 
@@ -370,19 +481,54 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FA
         listing.WriteLine("----------------------------------------")
         listing.WriteLine(f"【開始 NC 碼後處理與機型檔頭置換 (目標機型: {profile_id})】")
 
-    # 建立輔助查找映射表 (從 processed_chunks 蒐集已解析的工步資訊與刀具資料)
+    # 建立輔助查找映射表 (同時支援原始名稱、清洗後檔名、單一工序名稱與底層工序物件反查)
     chunk_ops_by_prog = {}
     chunk_stage_by_prog = {}
+    mop_by_nx_obj_id = {}
+    mop_by_nx_tag = {}
+
+    def _register_prog_mop(key, mop, stg):
+        if not key:
+            return
+        if key not in chunk_stage_by_prog and stg:
+            chunk_stage_by_prog[key] = stg
+        if key not in chunk_ops_by_prog:
+            chunk_ops_by_prog[key] = []
+        if mop not in chunk_ops_by_prog[key]:
+            chunk_ops_by_prog[key].append(mop)
+
     if processed_chunks:
         for chunk in processed_chunks:
             p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
+            clean_p_name = _normalize_prog_key(p_name)
+            grp_name = chunk.get("group_name", "")
+            clean_grp_name = _normalize_prog_key(grp_name)
             stage = chunk.get("stage", "通用工段")
-            if p_name not in chunk_stage_by_prog:
-                chunk_stage_by_prog[p_name] = stage
-            if p_name not in chunk_ops_by_prog:
-                chunk_ops_by_prog[p_name] = []
+
+            for k in (p_name, clean_p_name, grp_name, clean_grp_name):
+                if k and k not in chunk_stage_by_prog:
+                    chunk_stage_by_prog[k] = stage
+
             for mop in chunk.get("operations", []):
-                chunk_ops_by_prog[p_name].append(mop)
+                _register_prog_mop(p_name, mop, stage)
+                _register_prog_mop(clean_p_name, mop, stage)
+                _register_prog_mop( mop.get("program_name", ""), mop, stage)
+                _register_prog_mop(_normalize_prog_key(mop.get("program_name", "")), mop, stage)
+                _register_prog_mop(_normalize_prog_key(mop.get("clean_op_name", "")), mop, stage)
+
+                # 建立底層 NX 工序物件 -> 已解析工步字典 (mop) 之反查索引
+                nx_objs_for_mop = []
+                if mop.get("_merged_nx_ops") and isinstance(mop.get("_merged_nx_ops"), (list, tuple)):
+                    nx_objs_for_mop.extend(mop.get("_merged_nx_ops"))
+                if mop.get("_nx_op_obj") is not None:
+                    nx_objs_for_mop.append(mop.get("_nx_op_obj"))
+
+                for nx_o in nx_objs_for_mop:
+                    if nx_o is not None:
+                        mop_by_nx_obj_id[id(nx_o)] = mop
+                        t_val = getattr(nx_o, "Tag", None)
+                        if t_val is not None:
+                            mop_by_nx_tag[t_val] = mop
 
     # 聚合各程式群組的工序任務，確保 100% 納入所有工序物件
     prog_tasks = {}
@@ -391,46 +537,96 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FA
     if nc_tasks:
         for task in nc_tasks:
             p_name = task.get("program_name", "MAIN")
-            stage = task.get("stage") or chunk_stage_by_prog.get(p_name, "通用工段")
+            norm_p_name = _normalize_prog_key(p_name)
+            stage = (
+                task.get("stage")
+                or chunk_stage_by_prog.get(p_name)
+                or chunk_stage_by_prog.get(norm_p_name)
+                or "通用工段"
+            )
             raw_ops_in_task = task.get("operations", [])
-            ops_data = task.get("ops_data") or chunk_ops_by_prog.get(p_name, [])
+            ops_data = (
+                task.get("ops_data")
+                or chunk_ops_by_prog.get(p_name)
+                or chunk_ops_by_prog.get(norm_p_name)
+                or []
+            )
 
-            # 若無現成 ops_data 則自 task["operations"] 構建基礎資訊
+            # 若名稱鍵值未直接命中 (例如單獨選取工序或特殊命名)，透過底層工序物件反查已解析之完整工步字典
             if not ops_data and raw_ops_in_task:
                 ops_data = []
                 for op in raw_ops_in_task:
-                    op_n = getattr(op, "Name", "") if hasattr(op, "Name") else str(op)
-                    ops_data.append({"op_name": op_n, "_nx_op_obj": op})
+                    matched_mop = mop_by_nx_obj_id.get(id(op))
+                    if matched_mop is None:
+                        t_val = getattr(op, "Tag", None)
+                        if t_val is not None:
+                            matched_mop = mop_by_nx_tag.get(t_val)
+                    if matched_mop is None:
+                        op_n = getattr(op, "Name", "") if hasattr(op, "Name") else str(op)
+                        cand_mops = chunk_ops_by_prog.get(_normalize_prog_key(op_n), [])
+                        if cand_mops:
+                            matched_mop = cand_mops[0]
 
-            prog_tasks[p_name] = {
-                "stage": stage,
-                "ops_data": ops_data,
-                "nx_ops": list(raw_ops_in_task)
-            }
+                    if matched_mop is not None:
+                        if matched_mop not in ops_data:
+                            ops_data.append(matched_mop)
+                    else:
+                        op_n = getattr(op, "Name", "") if hasattr(op, "Name") else str(op)
+                        ops_data.append({"op_name": op_n, "_nx_op_obj": op})
+
+            # 防止清洗後檔名碰撞覆蓋：同工段自動合併工序與工步；不同工段自動加上工段或序號後綴區隔
+            target_key = p_name
+            if target_key in prog_tasks and prog_tasks[target_key]["stage"] != stage:
+                safe_stg = re.sub(r'[\\/:*?"<>|]', '_', str(stage).strip())
+                cand_key = f"{p_name}_{safe_stg}" if safe_stg else f"{p_name}_2"
+                dup_idx = 2
+                while cand_key in prog_tasks and prog_tasks[cand_key]["stage"] != stage:
+                    dup_idx += 1
+                    cand_key = f"{p_name}_{safe_stg}_{dup_idx}"
+                target_key = cand_key
+
+            if target_key not in prog_tasks:
+                prog_tasks[target_key] = {
+                    "stage": stage,
+                    "ops_data": list(ops_data),
+                    "nx_ops": list(raw_ops_in_task)
+                }
+            else:
+                for mop_item in ops_data:
+                    if mop_item not in prog_tasks[target_key]["ops_data"]:
+                        prog_tasks[target_key]["ops_data"].append(mop_item)
+                for nx_op_item in raw_ops_in_task:
+                    if nx_op_item not in prog_tasks[target_key]["nx_ops"]:
+                        prog_tasks[target_key]["nx_ops"].append(nx_op_item)
 
     # 2. 備援模式：自 processed_chunks 重建任務，並透過 _merged_nx_ops 保證所有合併工序皆被取出
     elif processed_chunks:
         for chunk in processed_chunks:
-            p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
+            raw_p_name = chunk.get("parent_program", "") or chunk.get("group_name", "MAIN")
+            p_name = _normalize_prog_key(raw_p_name) or raw_p_name
             stage = chunk.get("stage", "通用工段")
-            if p_name not in prog_tasks:
-                prog_tasks[p_name] = {
+            target_key = p_name
+            if target_key in prog_tasks and prog_tasks[target_key]["stage"] != stage:
+                safe_stg = re.sub(r'[\\/:*?"<>|]', '_', str(stage).strip())
+                target_key = f"{p_name}_{safe_stg}" if safe_stg else f"{p_name}_2"
+            if target_key not in prog_tasks:
+                prog_tasks[target_key] = {
                     "stage": stage,
                     "ops_data": [],
                     "nx_ops": []
                 }
             for mop in chunk.get("operations", []):
-                prog_tasks[p_name]["ops_data"].append(mop)
+                prog_tasks[target_key]["ops_data"].append(mop)
                 # 萃取所有底層工序物件 (包含因同刀號合併被收納於 _merged_nx_ops 之工序)
                 sub_ops = mop.get("_merged_nx_ops")
                 if sub_ops and isinstance(sub_ops, (list, tuple)):
                     for nx_op in sub_ops:
-                        if nx_op and nx_op not in prog_tasks[p_name]["nx_ops"]:
-                            prog_tasks[p_name]["nx_ops"].append(nx_op)
+                        if nx_op and nx_op not in prog_tasks[target_key]["nx_ops"]:
+                            prog_tasks[target_key]["nx_ops"].append(nx_op)
                 else:
                     nx_op = mop.get("_nx_op_obj")
-                    if nx_op and nx_op not in prog_tasks[p_name]["nx_ops"]:
-                        prog_tasks[p_name]["nx_ops"].append(nx_op)
+                    if nx_op and nx_op not in prog_tasks[target_key]["nx_ops"]:
+                        prog_tasks[target_key]["nx_ops"].append(nx_op)
 
     for prog_name, task_info in prog_tasks.items():
         nx_ops = task_info["nx_ops"]
@@ -451,17 +647,15 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FA
                 listing.WriteLine(f"  正在處理 [{prog_name}] (共 {len(nx_ops)} 道工序)...")
 
             # 1. 執行背景後處理輸出暫存原始碼
-            ok = run_nx_postprocess(cam_setup, nx_ops, default_post, tmp_raw_nc)
+            ok = run_nx_postprocess(cam_setup, nx_ops, default_post, tmp_raw_nc, custom_post_path=custom_post_path)
             if not ok or not os.path.exists(tmp_raw_nc):
                 fail_count += 1
                 if listing:
                     listing.WriteLine(f"    ✖ 後處理器呼叫失敗 [{prog_name}]")
                 continue
 
-            # 2. 讀取原始 NC 碼
-            raw_content = ""
-            with open(tmp_raw_nc, "r", errors="ignore") as f:
-                raw_content = f.read()
+            # 2. 讀取原始 NC 碼 (支援 UTF-8 / CP950 多編碼容錯，避免非 ASCII 註解遺失)
+            raw_content = _read_raw_nc_file(tmp_raw_nc)
 
             # 3. 執行機型檔頭轉換與特殊字元清洗
             final_content = transform_nc_content_by_profile(
@@ -497,6 +691,18 @@ def process_and_export_nc_tasks(cam_setup, processed_chunks=None, profile_id="FA
         listing.WriteLine("----------------------------------------")
 
     return success_count, fail_count
+
+def _read_raw_nc_file(file_path):
+    """以多編碼容錯順序讀取原始 NC 檔案，避免 UTF-8 或 CP950 註解文字遺失"""
+    for enc in ("utf-8-sig", "utf-8", "cp950"):
+        try:
+            with open(file_path, "r", encoding=enc) as f:
+                return f.read()
+        except Exception:
+            continue
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
 
 def safe_write_nc_file(file_path, content, encoding="utf-8"):
     """

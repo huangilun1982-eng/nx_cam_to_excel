@@ -1667,11 +1667,20 @@ class InteractivePaginationDialogApp:
         seq_style = self.get_selected_seq_style()
         img_mode = self.get_selected_img_layout_mode()
 
+        editor_pages = [
+            {
+                "stage": p.get("stage", self.stages[0]),
+                "rows": [{"type": "op", "data": copy.deepcopy(op)} for op in p.get("items", [])]
+            }
+            for p in self.pages_data
+        ]
+
         self.result = {
             "action": "ok",
             "sequence_style": seq_style,
             "image_layout_mode": img_mode,
-            "pages": final_pages
+            "pages": final_pages,
+            "editor_pages": editor_pages
         }
         self.master.destroy()
 

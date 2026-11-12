@@ -870,15 +870,18 @@ def merge_consecutive_tools(raw_ops, group_name=""):
         holder_prev = extract_float(temp_op.get("holder_length"))
         holder_curr = extract_float(op.get("holder_length"))
 
+        is_same_tool_identity = (
+            name_prev.upper() == name_curr.upper() and
+            round(dia_prev, 2) == round(dia_curr, 2)
+        )
         is_spec_match = (
-            name_prev == name_curr and
-            dia_prev == dia_curr and
+            is_same_tool_identity and
             flute_prev == flute_curr and
             holder_prev == holder_curr
         )
 
-        # 狀況 A：同把刀 (刀號相同且有效)
-        is_same_id = (t_curr_int == t_prev_int and t_curr_int != -99999)
+        # 狀況 A：同把刀 (刀號相同且刀名/直徑一致；若同 T 號卻不同刀名或直徑則保留獨立列位供衝突檢測器標紅)
+        is_same_id = (t_curr_int == t_prev_int and t_curr_int != -99999 and is_same_tool_identity)
 
         # 狀況 B：連續刀號且規格完全相同 (例如 T01 與 T02)
         is_consecutive = (t_curr_int == t_prev_int + 1 and t_curr_int != -99999 and is_spec_match)
@@ -2519,6 +2522,28 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
         except Exception:
             pass
 
+    def _restore_capture_view_and_layers():
+        """統一還原進入拍照精靈前的 Triad/WCS 座標軸顯示與全圖層狀態"""
+        try:
+            restore_triad_and_wcs(
+                the_session=None, work_part=work_part, w_view=w_view, uf_session=uf_session,
+                orig_view_triad=orig_view_triad, orig_view_wcs=orig_view_wcs
+            )
+        except Exception:
+            pass
+        if uf_session is not None and hasattr(uf_session, "Layer") and initial_layer_statuses:
+            try:
+                if initial_work_layer:
+                    uf_session.Layer.SetStatus(initial_work_layer, 1)
+                for l_idx, st_val in initial_layer_statuses.items():
+                    if l_idx != initial_work_layer:
+                        uf_session.Layer.SetStatus(l_idx, st_val)
+                if hasattr(uf_session, "Disp"):
+                    uf_session.Disp.RegenerateDisplay()
+                    uf_session.Disp.Refresh()
+            except Exception:
+                pass
+
     # 1. 尋找精緻置頂拍照組件 capture_assistant_gui.py
     the_session = None
     try:
@@ -2637,10 +2662,9 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                                 if listing:
                                     listing.WriteLine(f"  [擺正例外防護] {str(ex_snap)}")
 
-                        # 2. 視角擺正機制 B：硬體層即時偵測鍵盤 F8 鍵 (VK_F8 = 0x77)
-                        # 無論焦點在 NX 主視窗、3D 繪圖區或小工具，只要按 F8 均保證 100% 原生擺正，且不碰訊息隊列
+                        # 2. 視角擺正機制 B：硬體層即時偵測鍵盤 F8 鍵 (VK_F8 = 0x77，限定前景視窗為 NX 主視窗)
                         try:
-                            if user32.GetAsyncKeyState(0x77) & 0x8000:
+                            if (user32.GetAsyncKeyState(0x77) & 0x8000) and (nx_hwnd == 0 or user32.GetForegroundWindow() == nx_hwnd):
                                 try:
                                     snap_work_view_closest(work_part, w_view, uf_session, listing=listing)
                                 except Exception:
@@ -2724,9 +2748,12 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
                     if s_idx > 0:
                         s_idx -= 1
                         if listing:
-                            listing.WriteLine(f"  [⬅ 上一步] 已返回上一工序【{stages[s_idx]}】，準備重新設定視角或拍攝。")
+                            prev_item = stages[s_idx]
+                            prev_name = (prev_item.get("target_op") or prev_item.get("stage", "通用工段")) if isinstance(prev_item, dict) else str(prev_item)
+                            listing.WriteLine(f"  [⬅ 上一步] 已返回上一工序【{prev_name}】，準備重新設定視角或拍攝。")
                     else:
                         # 在第一工序點選「上一步」：依使用者指示返回前一階段【分頁排版編輯器】
+                        _restore_capture_view_and_layers()
                         if listing:
                             listing.WriteLine(f"  [⬅ 上一步] 於第一工序請求返回【工單可視化互動式分頁排版編輯器】。")
                         return {"__ACTION__": "BACK_TO_PAGINATION"}
@@ -2768,7 +2795,11 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
         try:
             if listing:
                 listing.WriteLine("  [NX 原生引導] 啟動 NX 原生拍照確認視窗引導各工段示圖拍照...")
-            for s_idx, stg in enumerate(stages):
+            for s_idx, item in enumerate(stages):
+                if isinstance(item, dict):
+                    stg = item.get("target_op") or item.get("stage", "通用工段")
+                else:
+                    stg = str(item)
                 safe_stg_name = re.sub(r'[\\/:*?"<>|]', '_', stg)
                 out_img = os.path.join(temp_dir, f"_temp_stage_{safe_stg_name}.png")
                 display_name = stg if stg != "通用工段" else "加工工件全貌 / 裝夾示圖"
@@ -2798,28 +2829,8 @@ def run_interactive_capture_wizard(stages, temp_dir, uf_session, the_ui=None, li
             if listing:
                 listing.WriteLine(f"  [拍照精靈警告] 備援模式執行異常：{str(ex_fb)}")
 
-    # 拍照流程完全結束，雙重保證 NX 主視窗座標圖示 (View Triad / WCS) 100% 恢復顯示並強制刷新
-    try:
-        restore_triad_and_wcs(
-            the_session=None, work_part=work_part, w_view=w_view, uf_session=uf_session,
-            orig_view_triad=orig_view_triad, orig_view_wcs=orig_view_wcs
-        )
-    except Exception:
-        pass
-
-    # 拍照流程完全結束，100% 恢復進入拍照精靈前的原始工作圖層與所有圖層狀態
-    if uf_session is not None and hasattr(uf_session, "Layer") and initial_layer_statuses:
-        try:
-            if initial_work_layer:
-                uf_session.Layer.SetStatus(initial_work_layer, 1) # 先恢復工作圖層
-            for l_idx, st_val in initial_layer_statuses.items():
-                if l_idx != initial_work_layer:
-                    uf_session.Layer.SetStatus(l_idx, st_val)
-            if hasattr(uf_session, "Disp"):
-                uf_session.Disp.RegenerateDisplay()
-                uf_session.Disp.Refresh()
-        except Exception:
-            pass
+    # 拍照流程完全結束，100% 恢復進入拍照精靈前的視窗座標圖示與全圖層狀態
+    _restore_capture_view_and_layers()
 
     return captured_images
 
@@ -3159,11 +3170,11 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
         if not stage_origin_text:
             stage_origin_text = "加工原點【G54】：X=MID, Y=MID, Z=TOP"
 
-        target_op = page_item.get("target_op")
-        target_ops = page_item.get("target_ops", [])
+        target_op = page_item.get("target_op") if isinstance(page_item, dict) else None
+        target_ops = page_item.get("target_ops", []) if isinstance(page_item, dict) else []
         if not target_ops and target_op:
             target_ops = [target_op]
-        image_layout = page_item.get("image_layout", "single")
+        image_layout = page_item.get("image_layout", "single") if isinstance(page_item, dict) else "single" if isinstance(page_item, dict) else "single"
         if len(target_ops) >= 3:
             labels = [f"【圖{i+1}: {op}】" for i, op in enumerate(target_ops)]
             stage_origin_text = "  ".join(labels) + (f"  ({stage_origin_text})" if stage_origin_text else "")
@@ -3273,13 +3284,16 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
                 empty_end_r = start_row + ROWS_PER_PAGE - 1
                 vbs_lines.append(f'ws.Range("A{empty_start_r}:I{empty_end_r}").ClearContents')
 
-        # 插入該工序/工段對應之加工示圖 (支援單圖全幅與雙圖左右並排)
-        target_ops = page_item.get("target_ops", [])
-        target_op = page_item.get("target_op")
-        if not target_ops and target_op:
-            target_ops = [target_op]
+        # 插入該工序/工段對應之加工示圖 (支援單圖全幅與雙圖左右並排，並完整相容無 target_op 之工段級頁面)
+        target_ops = page_item.get("target_ops", []) if isinstance(page_item, dict) else []
+        target_op = page_item.get("target_op") if isinstance(page_item, dict) else None
+        if not target_ops:
+            if target_op:
+                target_ops = [target_op]
+            elif page_stage:
+                target_ops = [page_stage]
 
-        image_layout = page_item.get("image_layout", "single")
+        image_layout = page_item.get("image_layout", "single") if isinstance(page_item, dict) else "single"
 
         # 檢驗收集有效圖片列表
         valid_imgs = []
@@ -3485,6 +3499,8 @@ def export_multipage_via_vbs(pages, template_path, output_path, work_part, heade
             timeout=180,
             capture_output=True,
             text=True,
+            encoding="cp950",
+            errors="replace",
             creationflags=0x08000000
         )
     except subprocess.TimeoutExpired:
@@ -3600,12 +3616,55 @@ def build_nc_tasks_from_selection(selected_objects, tree_map=None):
 
     return tasks
 
+def _prompt_nx_native_post_fallback(nc_tasks, default_dir, default_post="Fanuc_2026", listing=None):
+    """NX 原生後處理轉出決策備援視窗 (共用單一實作，避免重複程式碼)"""
+    try:
+        the_ui = NXOpen.UI.GetUI()
+        if the_ui:
+            task_names = [t.get("program_name", "") for t in nc_tasks if t.get("program_name", "")]
+            task_summary_str = "、".join(task_names[:5])
+            if len(task_names) > 5:
+                task_summary_str += f" 等共 {len(task_names)} 組"
+
+            msg = (
+                "【後處理轉出確認 (NX 原生備援視窗)】\n\n"
+                f"選定之 NC 程式：{task_summary_str}\n"
+                f"預設後處理器：{default_post}\n"
+                f"輸出目錄：{default_dir}\n\n"
+                "是否要依照選定工序自動轉出 NC 碼？\n\n"
+                "・點選【是 (Yes)】：轉出 NC 碼並匯出工單\n"
+                "・點選【否 (No)】：僅匯出工單 (不轉出 NC 碼)"
+            )
+            resp = the_ui.NXMessageBox.Show(
+                "後處理轉出與工單設定",
+                NXOpen.NXMessageBox.DialogType.Question,
+                msg
+            )
+            if resp == 1:
+                if listing:
+                    listing.WriteLine("  [NX 備援視窗] 使用者選擇【轉出 NC 碼並匯出工單】。")
+                return {
+                    "action": "post_and_export",
+                    "postprocessor_name": default_post,
+                    "custom_post_path": "",
+                    "output_dir": default_dir,
+                    "extension": ".nc"
+                }
+            else:
+                if listing:
+                    listing.WriteLine("  [NX 備援視窗] 使用者選擇【僅匯出工單 (不轉 NC 碼)】。")
+                return {"action": "export_only"}
+    except Exception:
+        pass
+    return None
+
+
 def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", listing=None, the_session=None, work_part=None):
     """
     啟動獨立進程之後處理確認視窗 (nc_post_dialog.py)
     回傳 post_config 字典：
       {
-         "action": "post_and_export" | "export_only" | "cancel",
+         "action": "post_and_export" | "post_only" | "export_only" | "cancel",
          "postprocessor_name": "Fanuc_2026",
          "custom_post_path": "",
          "output_dir": r"...",
@@ -3622,45 +3681,10 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
     interpreter_cmd, clean_env = resolve_python_runtime(require_gui=True)
 
     if not interpreter_cmd or not os.path.exists(dialog_script):
-        # 備援防護：若無外部 Python 直譯器或獨立組件，啟動 NX 原生對話框完成決策，確保純 NX 電腦依然具備 100% 決策能力
-        try:
-            the_ui = NXOpen.UI.GetUI()
-            if the_ui:
-                task_names = [t.get("program_name", "") for t in nc_tasks if t.get("program_name", "")]
-                task_summary_str = "、".join(task_names[:5])
-                if len(task_names) > 5:
-                    task_summary_str += f" 等共 {len(task_names)} 組"
-
-                msg = (
-                    "【後處理轉出確認 (NX 原生備援視窗)】\n\n"
-                    f"選定之 NC 程式：{task_summary_str}\n"
-                    f"預設後處理器：{default_post}\n"
-                    f"輸出目錄：{default_dir}\n\n"
-                    "是否要依照選定工序自動轉出 NC 碼？\n\n"
-                    "・點選【是 (Yes)】：轉出 NC 碼並匯出工單\n"
-                    "・點選【否 (No)】：僅匯出工單 (不轉出 NC 碼)"
-                )
-                resp = the_ui.NXMessageBox.Show(
-                    "後處理轉出與工單設定",
-                    NXOpen.NXMessageBox.DialogType.Question,
-                    msg
-                )
-                if resp == 1:
-                    if listing:
-                        listing.WriteLine("  [NX 備援視窗] 使用者選擇【轉出 NC 碼並匯出工單】。")
-                    return {
-                        "action": "post_and_export",
-                        "postprocessor_name": default_post,
-                        "custom_post_path": "",
-                        "output_dir": default_dir,
-                        "extension": ".nc"
-                    }
-                else:
-                    if listing:
-                        listing.WriteLine("  [NX 備援視窗] 使用者選擇【僅匯出工單 (不轉 NC 碼)】。")
-                    return {"action": "export_only"}
-        except Exception:
-            pass
+        # 備援防護：若無外部 Python 直譯器或獨立組件，啟動 NX 原生對話框完成決策
+        fb_res = _prompt_nx_native_post_fallback(nc_tasks, default_dir, default_post=default_post, listing=listing)
+        if fb_res is not None:
+            return fb_res
 
         if listing:
             if not interpreter_cmd:
@@ -3739,47 +3763,21 @@ def invoke_nc_post_dialog(nc_tasks, default_dir, default_post="Fanuc_2026", list
             proc.wait(timeout=600) # 10 分鐘保護
         except subprocess.TimeoutExpired:
             proc.kill()
+            raise RuntimeError("後處理設定對話框等待逾時 (超過 600 秒)")
 
-        if os.path.exists(res_file):
-            with open(res_file, "r", encoding="utf-8") as f:
-                result = json.load(f)
+        if proc.returncode not in (0, None) and not os.path.exists(res_file):
+            raise RuntimeError(f"後處理設定對話框異常退出 (returncode={proc.returncode})")
+
+        if not os.path.exists(res_file):
+            raise RuntimeError("後處理設定對話框未產出結果檔")
+
+        with open(res_file, "r", encoding="utf-8") as f:
+            result = json.load(f)
     except Exception as ex:
         if listing:
             listing.WriteLine(f"  [後處理對話框例外] {str(ex)}，自動啟用 NX 原生備援視窗...")
-        try:
-            the_ui = NXOpen.UI.GetUI()
-            if the_ui:
-                task_names = [t.get("program_name", "") for t in nc_tasks if t.get("program_name", "")]
-                task_summary_str = "、".join(task_names[:5])
-                if len(task_names) > 5:
-                    task_summary_str += f" 等共 {len(task_names)} 組"
-
-                msg = (
-                    "【後處理轉出確認 (NX 原生備援視窗)】\n\n"
-                    f"選定之 NC 程式：{task_summary_str}\n"
-                    f"預設後處理器：{default_post}\n"
-                    f"輸出目錄：{default_dir}\n\n"
-                    "是否要依照選定工序自動轉出 NC 碼？\n\n"
-                    "・點選【是 (Yes)】：轉出 NC 碼並匯出工單\n"
-                    "・點選【否 (No)】：僅匯出工單 (不轉出 NC 碼)"
-                )
-                resp = the_ui.NXMessageBox.Show(
-                    "後處理轉出與工單設定",
-                    NXOpen.NXMessageBox.DialogType.Question,
-                    msg
-                )
-                if resp == 1:
-                    result = {
-                        "action": "post_and_export",
-                        "postprocessor_name": default_post,
-                        "custom_post_path": "",
-                        "output_dir": default_dir,
-                        "extension": ".nc"
-                    }
-                else:
-                    result = {"action": "export_only"}
-        except Exception:
-            result = {"action": "export_only"}
+        fb_res = _prompt_nx_native_post_fallback(nc_tasks, default_dir, default_post=default_post, listing=listing)
+        result = fb_res if fb_res is not None else {"action": "export_only"}
     finally:
         if proc is not None:
             if proc.poll() is None:
@@ -3965,14 +3963,16 @@ def invoke_pagination_prompt_dialog(stage_stats, total_extend_pages, total_pagin
     return mode_result
 
 
-def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence_style="per_page", listing=None, the_session=None, work_part=None):
+def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence_style="per_page", initial_image_layout="after_ops", listing=None, the_session=None, work_part=None):
     """
     啟動獨立進程之工單可視化互動式分頁排版編輯器 (interactive_pagination_dialog.py)
     回傳 dict:
       {
         "action": "ok" / "cancel",
         "sequence_style": "per_page" / ...,
-        "pages": [ ... ]
+        "image_layout_mode": "after_ops" / "last_page",
+        "pages": [ ... ],
+        "editor_pages": [ ... ]
       }
     """
     if the_session is None:
@@ -3987,7 +3987,9 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
     fallback_result = {
         "action": "ok",
         "sequence_style": initial_sequence_style,
-        "pages": default_pages
+        "image_layout_mode": initial_image_layout,
+        "pages": default_pages,
+        "editor_pages": default_pages
     }
 
     if not interpreter_cmd or not os.path.exists(dialog_script):
@@ -4001,7 +4003,7 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
     cfg_file = os.path.join(temp_dir, f"_ip_cfg_{pid}_{timestamp}.json")
     res_file = os.path.join(temp_dir, f"_ip_res_{pid}_{timestamp}.json")
 
-    # 準備序列化資料 (過濾 NXOpen C++ 參照)
+    # 準備序列化資料 (嚴格過濾 _nx_op_obj 與 _merged_nx_ops 等 NXOpen C++ 參照，防止 json.dump 崩潰)
     serializable_default_pages = []
     for p in default_pages:
         stg = p.get("stage", "通用工段")
@@ -4011,7 +4013,7 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
             d = r.get("data", {}) if isinstance(r, dict) and "data" in r else r
             safe_d = {}
             for k, v in d.items():
-                if k != "_nx_op_obj":
+                if k not in ("_nx_op_obj", "_merged_nx_ops"):
                     safe_d[k] = v
             ops_data.append(safe_d)
         serializable_default_pages.append({
@@ -4022,6 +4024,7 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
     config_payload = {
         "stages": stages,
         "initial_sequence_style": initial_sequence_style,
+        "initial_image_layout": initial_image_layout,
         "default_pages": serializable_default_pages
     }
 
@@ -4058,36 +4061,62 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
                 res_json = json.load(f)
                 action = res_json.get("action", "ok")
                 seq_style = res_json.get("sequence_style", initial_sequence_style)
+                img_layout = res_json.get("image_layout_mode", initial_image_layout)
                 returned_pages = res_json.get("pages", [])
+                returned_editor_pages = res_json.get("editor_pages", [])
 
                 if action == "cancel":
                     result_data = {
                         "action": "cancel",
                         "sequence_style": seq_style,
-                        "pages": []
+                        "image_layout_mode": img_layout,
+                        "pages": [],
+                        "editor_pages": []
                     }
                 elif returned_pages:
-                    # 重新連結 _nx_op_obj 參照
+                    # 重新連結 _nx_op_obj 與 _merged_nx_ops 參照
                     op_obj_map = {}
+                    merged_ops_map = {}
                     for p in default_pages:
                         for r in p.get("rows", []):
                             d = r.get("data", {}) if isinstance(r, dict) and "data" in r else r
                             op_obj = d.get("_nx_op_obj")
+                            m_ops = d.get("_merged_nx_ops")
                             c_name = d.get("clean_op_name") or d.get("op_name")
-                            if op_obj and c_name:
-                                op_obj_map[c_name] = op_obj
+                            t_no = d.get("tool_number", "")
+                            if c_name:
+                                if op_obj is not None:
+                                    op_obj_map[c_name] = op_obj
+                                    op_obj_map[(c_name, t_no)] = op_obj
+                                if m_ops is not None:
+                                    merged_ops_map[c_name] = m_ops
+                                    merged_ops_map[(c_name, t_no)] = m_ops
 
-                    for rp in returned_pages:
-                        for r_item in rp.get("rows", []):
-                            r_data = r_item.get("data", {})
-                            c_name = r_data.get("clean_op_name") or r_data.get("op_name")
-                            if c_name in op_obj_map and "_nx_op_obj" not in r_data:
-                                r_data["_nx_op_obj"] = op_obj_map[c_name]
+                    def _relink_pages_refs(page_list):
+                        for rp in page_list:
+                            for r_item in rp.get("rows", []):
+                                r_data = r_item.get("data", {})
+                                c_name = r_data.get("clean_op_name") or r_data.get("op_name")
+                                t_no = r_data.get("tool_number", "")
+                                if "_nx_op_obj" not in r_data:
+                                    ref_obj = op_obj_map.get((c_name, t_no)) or op_obj_map.get(c_name)
+                                    if ref_obj is not None:
+                                        r_data["_nx_op_obj"] = ref_obj
+                                if "_merged_nx_ops" not in r_data:
+                                    ref_m = merged_ops_map.get((c_name, t_no)) or merged_ops_map.get(c_name)
+                                    if ref_m is not None:
+                                        r_data["_merged_nx_ops"] = ref_m
+
+                    _relink_pages_refs(returned_pages)
+                    if returned_editor_pages:
+                        _relink_pages_refs(returned_editor_pages)
 
                     result_data = {
                         "action": "ok",
                         "sequence_style": seq_style,
-                        "pages": returned_pages
+                        "image_layout_mode": img_layout,
+                        "pages": returned_pages,
+                        "editor_pages": returned_editor_pages or [p for p in returned_pages if not p.get("is_appendix_image_page")]
                     }
     except Exception as ex:
         if listing:
@@ -4115,6 +4144,49 @@ def invoke_interactive_pagination_dialog(default_pages, stages, initial_sequence
                     pass
 
     return result_data
+
+
+def _release_nx_collections(*collections):
+    """顯式清理大型集合參照並觸發 GC，釋放 NXOpen 封裝物件"""
+    for col in collections:
+        if col is not None:
+            try:
+                col.clear()
+            except Exception:
+                pass
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+
+
+def _cleanup_session_resources(target_folder=None, stage_images=None, *collections):
+    """統一清理暫存圖檔、跨進程旗標與 NXOpen 集合參照，確保提前返回與正常結束皆零殘留"""
+    if isinstance(stage_images, dict):
+        for k, img_f in stage_images.items():
+            if k != "__ACTION__" and isinstance(img_f, str) and img_f and os.path.exists(img_f):
+                try:
+                    os.remove(img_f)
+                except Exception:
+                    pass
+
+    if target_folder and os.path.isdir(target_folder):
+        try:
+            for f in os.listdir(target_folder):
+                is_temp_png = f.startswith("_temp_stage_") and f.endswith(".png")
+                is_temp_flag = (f.startswith("_snap_request_") or f.startswith("_layer_changed_")) and f.endswith(".flag")
+                is_temp_layer = (f.startswith("_layer_info_") or f.startswith("_layer_apply_")) and f.endswith(".json")
+                if is_temp_png or is_temp_flag or is_temp_layer:
+                    fp = os.path.join(target_folder, f)
+                    try:
+                        os.remove(fp)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    _release_nx_collections(stage_images, *collections)
 
 
 # ==================== 主執行流程 ====================
@@ -4244,6 +4316,7 @@ def main():
 
     if not raw_chunks:
         the_session.ListingWindow.WriteLine("錯誤：選取的項目中未包含任何有效的 CAM 工序！")
+        _cleanup_session_resources(target_folder, None, raw_chunks, cam_tree_map, selected_objects)
         return
 
     # 若有提取到資訊關鍵字，印出提示
@@ -4264,12 +4337,14 @@ def main():
     action = post_config.get("action", "export_only")
     if action == "cancel":
         the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消操作，流程中止。")
+        _cleanup_session_resources(target_folder, None, raw_chunks, cam_tree_map, selected_objects)
         return
 
     chosen_post = post_config.get("postprocessor_name", "Fanuc_2026")
     chosen_profile = post_config.get("machine_profile", "FANUC_HORIZONTAL")
     chosen_custom = post_config.get("custom_post_path", "")
-    chosen_out_dir = post_config.get("output_dir", target_folder)
+    raw_out_dir = (post_config.get("output_dir") or "").strip().strip('"').strip("'").strip()
+    chosen_out_dir = os.path.normpath(raw_out_dir) if raw_out_dir else target_folder
     chosen_ext = post_config.get("extension", ".nc")
 
     # 記憶本次使用者選取之機台後處理器與機型配置 (下次啟動時自動帶入)
@@ -4301,6 +4376,7 @@ def main():
     if task_run_mode != "NC_ONLY":
         if not os.path.exists(template_path):
             the_session.ListingWindow.WriteLine(f"  [錯誤] 找不到 Excel 工單範本檔案：{template_path}，請確認已正確放置範本檔案！")
+            _cleanup_session_resources(target_folder, None, raw_chunks, cam_tree_map, selected_objects)
             return
         tpl_bname = os.path.basename(template_path)
         if "custom" in tpl_bname.lower() or "user" in tpl_bname.lower():
@@ -4429,9 +4505,14 @@ def main():
             })
 
     the_session.ListingWindow.WriteLine("----------------------------------------")
-    the_session.ListingWindow.WriteLine(
-        f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
-    )
+    if task_run_mode == "NC_ONLY":
+        the_session.ListingWindow.WriteLine(
+            f"共讀取到 {total_op_count} 道有效工序 (共 {total_merged_step_count} 個工步)，正在準備轉出 NC 碼..."
+        )
+    else:
+        the_session.ListingWindow.WriteLine(
+            f"共讀取到 {total_op_count} 道有效工序，刀具合併後共 {total_merged_step_count} 個工步，正在計算分頁排版..."
+        )
 
     # 執行工段級刀具 T 號重複性衝突檢驗 (同工段內相同 T 號指派給不同刀具規格判定)
     stage_ops_map = {}
@@ -4504,21 +4585,33 @@ def main():
             listing=the_session.ListingWindow,
             default_post=chosen_post,
             extension=chosen_ext,
-            nc_tasks=nc_tasks
+            nc_tasks=nc_tasks,
+            custom_post_path=chosen_custom
         )
         the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_cnt} 筆，失敗 {fail_cnt} 筆。輸出目錄：{chosen_out_dir}")
         the_session.ListingWindow.WriteLine("========================================")
-        if os.path.exists(chosen_out_dir):
+        if succ_cnt == 0 and fail_cnt > 0:
+            try:
+                the_ui.NXMessageBox.Show(
+                    "只轉 NC 碼失敗",
+                    NXOpen.NXMessageBox.DialogType.Warning,
+                    f"所有 NC 碼轉出均失敗（共 {fail_cnt} 筆）。\n請檢查 Listing Window 訊息與後處理器設定。"
+                )
+            except Exception:
+                pass
+        elif succ_cnt > 0 and os.path.exists(chosen_out_dir):
             try:
                 os.startfile(chosen_out_dir)
             except Exception:
                 pass
+        _cleanup_session_resources(target_folder, None, raw_chunks, processed_chunks, cam_tree_map, selected_objects)
         return
 
     # 3. 預先分析各工段工步數量與系統推薦排版 (工段優先分頁)
     distinct_stages = get_distinct_stages(processed_chunks)
     current_pages = paginate_operations(processed_chunks, rows_per_page=ROWS_PER_PAGE, pagination_mode="extend")
     current_seq_style = "per_page"
+    current_img_layout = "after_ops"
     stage_images = {}
 
     while True:
@@ -4528,6 +4621,7 @@ def main():
             default_pages=current_pages,
             stages=distinct_stages,
             initial_sequence_style=current_seq_style,
+            initial_image_layout=current_img_layout,
             listing=the_session.ListingWindow,
             the_session=the_session,
             work_part=work_part
@@ -4535,13 +4629,16 @@ def main():
 
         if pagination_result.get("action") == "cancel":
             the_session.ListingWindow.WriteLine("\n[提示] 使用者已取消排版操作，流程中止。")
+            _cleanup_session_resources(target_folder, stage_images, raw_chunks, processed_chunks, current_pages, cam_tree_map, selected_objects)
             return
 
         pages = pagination_result.get("pages", current_pages)
         chosen_seq_style = pagination_result.get("sequence_style", current_seq_style)
+        chosen_img_layout = pagination_result.get("image_layout_mode", current_img_layout)
         current_seq_style = chosen_seq_style
-        # 更新 current_pages，過濾掉純大圖附圖頁，保留所有刀具分頁與自訂設定以備退回重調
-        current_pages = [p for p in pages if not p.get("is_appendix_image_page")]
+        current_img_layout = chosen_img_layout
+        # 更新 current_pages：優先採用 editor_pages (保留原始未拆頁之編輯器頁面狀態與截圖勾選)，確保退回重調時 100% 保持原貌
+        current_pages = pagination_result.get("editor_pages") or [p for p in pages if not p.get("is_appendix_image_page")]
 
         the_session.ListingWindow.WriteLine(
             f"分頁排版完成：最終產出為 {len(pages)} 頁，序號編排風格：[{chosen_seq_style}]。"
@@ -4694,52 +4791,27 @@ def main():
                 listing=the_session.ListingWindow,
                 default_post=chosen_post,
                 extension=chosen_ext,
-                nc_tasks=nc_tasks
+                nc_tasks=nc_tasks,
+                custom_post_path=chosen_custom
             )
             the_session.ListingWindow.WriteLine(f"NC 碼轉出完成！成功 {succ_nc} 筆，失敗 {fail_nc} 筆。輸出目錄：{chosen_out_dir}")
             the_session.ListingWindow.WriteLine("========================================")
+            if succ_nc == 0 and fail_nc > 0:
+                try:
+                    the_ui.NXMessageBox.Show(
+                        "NC 碼後處理失敗",
+                        NXOpen.NXMessageBox.DialogType.Warning,
+                        f"Excel 工單已匯出，但 NC 碼轉出均失敗（共 {fail_nc} 筆）。\n請檢查後處理器設定。"
+                    )
+                except Exception:
+                    pass
     except Exception as ex:
         the_session.ListingWindow.WriteLine(f"匯出失敗：{str(ex)}")
     finally:
-        # Zero-Debug 資源防護與記憶體清理：
-        # 1. 拍照精靈產生的暫存圖檔已實體內嵌於 Excel，安全刪除外部暫存檔保持目錄整潔
-        for img_f in stage_images.values():
-            if img_f and os.path.exists(img_f):
-                try:
-                    os.remove(img_f)
-                except Exception:
-                    pass
+        # Zero-Debug 資源防護與記憶體清理：統一清除拍照暫存圖檔、跨進程旗標與 NXOpen 集合參照
+        _cleanup_session_resources(target_folder, stage_images, raw_chunks, processed_chunks, pages, cam_tree_map, selected_objects)
 
-        # 2. 清理目標目錄中所有本次殘留之拍照暫存圖檔與擺正旗標
-        try:
-            for f in os.listdir(target_folder):
-                if (f.startswith("_temp_stage_") and f.endswith(".png")) or (f.startswith("_snap_request_") and f.endswith(".flag")):
-                    fp = os.path.join(target_folder, f)
-                    try:
-                        os.remove(fp)
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
-        # 3. 顯式解構大型資料集合參照，釋放 NXOpen 封裝物件
-        try:
-            raw_chunks.clear()
-            processed_chunks.clear()
-            pages.clear()
-            cam_tree_map.clear()
-            selected_objects.clear()
-        except Exception:
-            pass
-
-        # 4. 主動觸發 Python 垃圾回收 (Garbage Collection)，徹底釋放 NX 內部記憶體堆疊
-        try:
-            import gc
-            gc.collect()
-        except Exception:
-            pass
-
-        # 5. 安全關閉資訊視窗 (ListingWindow)，釋放 NX 內部關聯之 QtWebEngine 瀏覽器資源
+        # 安全關閉資訊視窗 (ListingWindow)，釋放 NX 內部關聯之 QtWebEngine 瀏覽器資源
         try:
             if the_session is not None and hasattr(the_session, "ListingWindow"):
                 the_session.ListingWindow.Close()

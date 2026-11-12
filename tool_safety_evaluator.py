@@ -64,28 +64,37 @@ def evaluate_operations_tool_safety(operations, cam_setup=None):
         flute_str = op_item.get("flute_length", "-")
         holder_str = op_item.get("holder_length", "-")
         nx_op = op_item.get("_nx_op_obj")
+        merged_ops = op_item.get("_merged_nx_ops")
+
+        if merged_ops and isinstance(merged_ops, (list, tuple)):
+            nx_ops_to_check = [o for o in merged_ops if o is not None]
+        elif nx_op is not None:
+            nx_ops_to_check = [nx_op]
+        else:
+            nx_ops_to_check = []
 
         violation_amt = 0.0
 
-        # 若在 NX 實機環境且有有效工序物件與 cam_setup，嘗試調用 CutDepthChecker
-        if cam_setup is not None and nx_op is not None:
-            checker = None
-            try:
-                checker = cam_setup.CreateCutDepthChecker()
-                if checker:
-                    checker.OperationToCheck = nx_op
-                    checker.CheckNeck = True
-                    checker.PerformCheck()
-                    if checker.NumCutDepthViolations > 0:
-                        violation_amt = checker.MaxCutDepthViolation
-            except Exception:
-                pass
-            finally:
-                if checker is not None:
-                    try:
-                        checker.Destroy()
-                    except Exception:
-                        pass
+        # 若在 NX 實機環境且有有效工序物件與 cam_setup，逐一調用 CutDepthChecker 取最大超深量 (涵蓋同刀合併之所有子工序)
+        if cam_setup is not None and nx_ops_to_check:
+            for sub_nx_op in nx_ops_to_check:
+                checker = None
+                try:
+                    checker = cam_setup.CreateCutDepthChecker()
+                    if checker:
+                        checker.OperationToCheck = sub_nx_op
+                        checker.CheckNeck = True
+                        checker.PerformCheck()
+                        if checker.NumCutDepthViolations > 0:
+                            violation_amt = max(violation_amt, float(checker.MaxCutDepthViolation))
+                except Exception:
+                    pass
+                finally:
+                    if checker is not None:
+                        try:
+                            checker.Destroy()
+                        except Exception:
+                            pass
 
         # 評估安全性
         warn_msg = evaluate_single_tool_safety(flute_str, holder_str, violation_amount=violation_amt)

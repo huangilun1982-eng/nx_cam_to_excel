@@ -22,103 +22,10 @@ import ctypes
 
 user32 = ctypes.windll.user32 if hasattr(ctypes, "windll") else None
 
-
-def find_template_post_files():
-    """尋找本機 NX 安裝目錄中的 template_post.dat 檔案清單"""
-    found_files = []
-    
-    # 0. 優先加入本機已知實體路徑
-    known_paths = [
-        r"C:\Siemens\DesigncenterNX2512\MACH\resource\postprocessor\template_post.dat",
-        r"C:\Program Files\Siemens\NX2206\MACH\resource\postprocessor\template_post.dat",
-    ]
-    for kp in known_paths:
-        if os.path.exists(kp) and kp not in found_files:
-            found_files.append(kp)
-
-    # 1. 從環境變數取得
-    ug_cam_post = os.environ.get("UGII_CAM_POST_DIR", "")
-    if ug_cam_post:
-        cand = os.path.join(ug_cam_post, "template_post.dat")
-        if os.path.exists(cand) and cand not in found_files:
-            found_files.append(cand)
-            
-    ug_base = os.environ.get("UGII_BASE_DIR", "")
-    if ug_base:
-        cand = os.path.join(ug_base, "MACH", "resource", "postprocessor", "template_post.dat")
-        if os.path.exists(cand) and cand not in found_files:
-            found_files.append(cand)
-
-    return found_files
-
-
-def load_available_postprocessors():
-    """
-    解析 template_post.dat，取得機台清單
-    支援常見的兩種格式：
-      - 3欄位: 機台名, TCL檔, DEF檔
-      - 4欄位: 機台名, 格式, TCL檔, DEF檔
-    回傳: list of dict [{"name": "Fanuc_2026", "desc": "Fanuc_2026", "tcl": ..., "def": ...}, ...]
-    """
-    dat_files = find_template_post_files()
-    postprocessors = []
-    seen_names = set()
-
-    for dat_file in dat_files:
-        post_dir = os.path.dirname(dat_file)
-        lines = []
-        for enc in ["cp950", "utf-8", "ansi"]:
-            try:
-                with open(dat_file, "r", encoding=enc) as f:
-                    lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
-                if lines:
-                    break
-            except Exception:
-                continue
-
-        for line in lines:
-            parts = [p.strip() for p in line.split(",")]
-            post_name = ""
-            tcl_raw = ""
-            def_raw = ""
-            
-            if len(parts) == 3:
-                post_name = parts[0]
-                tcl_raw = parts[1]
-                def_raw = parts[2]
-            elif len(parts) >= 4:
-                post_name = parts[0]
-                tcl_raw = parts[2]
-                def_raw = parts[3]
-            else:
-                continue
-
-            if not post_name or post_name in seen_names:
-                continue
-            
-            # 濾除佔位符或無效名稱
-            if "xxxxx" in post_name.lower() or "xxxxx" in tcl_raw.lower():
-                continue
-
-            # 解析變數替換
-            tcl_path = tcl_raw.replace("${UGII_CAM_POST_DIR}", post_dir + os.sep)
-            def_path = def_raw.replace("${UGII_CAM_POST_DIR}", post_dir + os.sep)
-            
-            # 若為具體檔案路徑且檔案不存在，則跳過
-            if os.path.isabs(tcl_path) and not os.path.exists(tcl_path):
-                # 容錯：檢查是否副檔名小寫或缺少
-                pass
-
-            seen_names.add(post_name)
-            postprocessors.append({
-                "name": post_name,
-                "desc": post_name,
-                "tcl": tcl_path,
-                "def": def_path,
-                "source_dat": dat_file
-            })
-
-    return postprocessors
+from machine_profile_manager import (
+    find_template_post_files,
+    load_available_postprocessors
+)
 
 
 class NcPostDialogApp:
@@ -161,15 +68,15 @@ class NcPostDialogApp:
         self.master.resizable(True, True)
         self.master.configure(bg="#F4F6F9")
 
-        # 視窗初始尺寸與置中 (容納機型規格與四動作按鈕)
-        win_w = 640
-        win_h = 600
+        # 視窗初始尺寸與置中 (容納機型規格與四動作按鈕，避免右側按鈕被裁切)
+        win_w = 700
+        win_h = 610
         screen_w = self.master.winfo_screenwidth()
         screen_h = self.master.winfo_screenheight()
         pos_x = max(20, (screen_w - win_w) // 2)
         pos_y = max(20, (screen_h - win_h) // 2)
         self.master.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-        self.master.minsize(600, 520)
+        self.master.minsize(680, 540)
 
         # 頂部提示標題欄
         top_frame = tk.Frame(self.master, bg="#004B87", padx=16, pady=12)
@@ -227,15 +134,8 @@ class NcPostDialogApp:
         self.task_listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
         scrollbar.config(command=self.task_listbox.yview)
 
-        # 填入任務
-        for idx, task in enumerate(self.nc_tasks, 1):
-            p_name = task.get("program_name", f"PROG_{idx}")
-            op_cnt = task.get("op_count", len(task.get("operations", [])))
-            ops_preview = ", ".join(task.get("op_names", [])[:3])
-            if op_cnt > 3:
-                ops_preview += "..."
-            item_text = f" [{idx:02d}] {p_name}.nc   ({op_cnt} 道工序: {ops_preview})"
-            self.task_listbox.insert(tk.END, item_text)
+        # 填入任務並依目前副檔名渲染預覽檔名
+        self.refresh_task_listbox()
 
         # 2. 機台後處理器設定區塊
         post_frame = tk.LabelFrame(
@@ -368,15 +268,8 @@ class NcPostDialogApp:
             anchor="w"
         ).pack(side=tk.LEFT)
 
-        self.dir_var = tk.StringVar(value=self.config.get("output_dir", os.getcwd()))
-        entry_dir = tk.Entry(
-            row_dir,
-            textvariable=self.dir_var,
-            font=("Microsoft JhengHei", 9),
-            bg="white"
-        )
-        entry_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
-
+        init_dir_raw = self.config.get("output_dir") or os.getcwd()
+        self.dir_var = tk.StringVar(value=self._normalize_dir_path(init_dir_raw) or os.getcwd())
         btn_browse_dir = tk.Button(
             row_dir,
             text="變更目錄...",
@@ -387,6 +280,14 @@ class NcPostDialogApp:
             cursor="hand2"
         )
         btn_browse_dir.pack(side=tk.RIGHT)
+
+        entry_dir = tk.Entry(
+            row_dir,
+            textvariable=self.dir_var,
+            font=("Microsoft JhengHei", 9),
+            bg="white"
+        )
+        entry_dir.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 8))
 
         # 副檔名列
         row_ext = tk.Frame(out_frame, bg="#F4F6F9")
@@ -401,7 +302,10 @@ class NcPostDialogApp:
             anchor="w"
         ).pack(side=tk.LEFT)
 
-        self.ext_var = tk.StringVar(value=".nc")
+        init_ext = str(self.config.get("extension") or ".nc").strip() or ".nc"
+        if not init_ext.startswith("."):
+            init_ext = "." + init_ext
+        self.ext_var = tk.StringVar(value=init_ext)
         combo_ext = ttk.Combobox(
             row_ext,
             textvariable=self.ext_var,
@@ -410,10 +314,12 @@ class NcPostDialogApp:
             width=10
         )
         combo_ext.pack(side=tk.LEFT)
+        self.ext_var.trace_add("write", lambda *_: self.refresh_task_listbox())
+        self.refresh_task_listbox()
 
-        # 底部動作按鈕列
+        # 底部動作按鈕列 (before=main_frame 確保高縮放比例下按鈕列不被壓縮裁切)
         btn_bar = tk.Frame(self.master, bg="#EAEEF3", padx=14, pady=10)
-        btn_bar.pack(fill=tk.X, side=tk.BOTTOM)
+        btn_bar.pack(fill=tk.X, side=tk.BOTTOM, before=main_frame)
 
         # 按鈕 1：轉出 NC 碼並匯出工單
         btn_post_export = tk.Button(
@@ -485,17 +391,61 @@ class NcPostDialogApp:
 
         self.master.protocol("WM_DELETE_WINDOW", self.on_cancel)
 
+    def _normalize_dir_path(self, raw_path):
+        """清洗使用者輸入或系統對話框回傳之路徑字串，統一為作業系統標準分隔符"""
+        cleaned = str(raw_path or "").strip().strip('"').strip("'").strip()
+        if not cleaned:
+            return ""
+        return os.path.normpath(cleaned)
+
+    def _resolve_initial_dir(self, raw_path):
+        """解析目前存在之起始目錄供 askdirectory 使用，避免無效路徑導致開啟位置錯誤"""
+        candidate = self._normalize_dir_path(raw_path)
+        while candidate:
+            if os.path.isdir(candidate):
+                return candidate
+            parent = os.path.dirname(candidate)
+            if not parent or parent == candidate:
+                break
+            candidate = parent
+        return os.getcwd()
+
+    def _open_native_dialog(self, dialog_fn, **kwargs):
+        """暫時解除置頂並指定 parent 開啟系統原生對話框，防止被 -topmost 視窗遮蔽或失去焦點"""
+        was_topmost = False
+        try:
+            was_topmost = str(self.master.attributes("-topmost")).lower() in ("1", "true")
+        except Exception:
+            was_topmost = False
+
+        kwargs.setdefault("parent", self.master)
+        try:
+            if was_topmost:
+                self.master.attributes("-topmost", False)
+            self.master.update_idletasks()
+            return dialog_fn(**kwargs)
+        finally:
+            try:
+                if was_topmost:
+                    self.master.attributes("-topmost", True)
+                self.master.lift()
+                self.master.focus_force()
+            except Exception:
+                pass
+
     def browse_custom_post(self):
         """瀏覽本機或自訂後處理器檔案 (.tcl 或 .def)"""
-        path = filedialog.askopenfilename(
+        path = self._open_native_dialog(
+            filedialog.askopenfilename,
             title="選擇 NX 後處理器檔案",
             filetypes=[("Postprocessor files", "*.tcl;*.def;*.pui"), ("All files", "*.*")]
         )
         if path:
-            post_base = os.path.splitext(os.path.basename(path))[0]
+            norm_path = self._normalize_dir_path(path)
+            post_base = os.path.splitext(os.path.basename(norm_path))[0]
             custom_label = f"[自訂] {post_base}"
             # 存入自訂路徑
-            self.result["custom_post_path"] = path
+            self.result["custom_post_path"] = norm_path
             vals = list(self.combo_post["values"])
             if custom_label not in vals:
                 vals.insert(0, custom_label)
@@ -516,52 +466,73 @@ class NcPostDialogApp:
 
     def browse_output_dir(self):
         """選擇 NC 檔案輸出目錄"""
-        dir_selected = filedialog.askdirectory(
+        init_dir = self._resolve_initial_dir(self.dir_var.get())
+        dir_selected = self._open_native_dialog(
+            filedialog.askdirectory,
             title="選擇 NC 程式碼輸出目錄",
-            initialdir=self.dir_var.get()
+            initialdir=init_dir
         )
         if dir_selected:
-            self.dir_var.set(dir_selected)
+            self.dir_var.set(self._normalize_dir_path(dir_selected))
+
+    def _normalize_extension(self):
+        """正規化副檔名字串，空值預設為 .nc 並確保前導點號"""
+        raw_ext = self.ext_var.get().strip() if hasattr(self, "ext_var") else str(self.config.get("extension") or ".nc").strip()
+        if not raw_ext:
+            return ".nc"
+        return raw_ext if raw_ext.startswith(".") else "." + raw_ext
+
+    def refresh_task_listbox(self):
+        """依目前設定的副檔名更新待轉出任務清單預覽"""
+        if not hasattr(self, "task_listbox"):
+            return
+        ext = self._normalize_extension()
+        self.task_listbox.delete(0, tk.END)
+        for idx, task in enumerate(self.nc_tasks, 1):
+            p_name = task.get("program_name", f"PROG_{idx}")
+            op_cnt = task.get("op_count", len(task.get("operations", [])))
+            ops_preview = ", ".join(task.get("op_names", [])[:3])
+            if op_cnt > 3:
+                ops_preview += "..."
+            item_text = f" [{idx:02d}] {p_name}{ext}   ({op_cnt} 道工序: {ops_preview})"
+            self.task_listbox.insert(tk.END, item_text)
+
+    def _sync_custom_post_path(self, selected_post):
+        """選用非自訂後處理器時清除殘留的自訂路徑，避免誤套用舊檔"""
+        if selected_post and not selected_post.startswith("[自訂]"):
+            self.result["custom_post_path"] = ""
+
+    def _submit_post_action(self, action_name):
+        """共用的後處理動作驗證、欄位組裝與設定保存流程"""
+        selected_post = self.post_var.get().strip()
+        if not selected_post:
+            messagebox.showwarning("提示", "請選擇或輸入後處理機台名稱！", parent=self.master)
+            return
+
+        output_dir = self._normalize_dir_path(self.dir_var.get())
+        if not output_dir:
+            messagebox.showwarning("提示", "請指定有效的 NC 輸出目錄！", parent=self.master)
+            return
+
+        prof_label = self.profile_var.get().strip()
+        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
+
+        self._sync_custom_post_path(selected_post)
+        self.result["action"] = action_name
+        self.result["postprocessor_name"] = selected_post
+        self.result["machine_profile"] = prof_id
+        self.result["output_dir"] = output_dir
+        self.result["extension"] = self._normalize_extension()
+        self._save_current_settings(prof_id, selected_post)
+        self.master.destroy()
 
     def on_post_and_export(self):
         """使用者確認轉出 NC 碼並匯出工單"""
-        selected_post = self.post_var.get().strip()
-        if not selected_post:
-            messagebox.showwarning("提示", "請選擇或輸入後處理機台名稱！", parent=self.master)
-            return
-
-        prof_label = self.profile_var.get().strip()
-        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
-
-        self.result["action"] = "post_and_export"
-        self.result["postprocessor_name"] = selected_post
-        self.result["machine_profile"] = prof_id
-        self.result["output_dir"] = self.dir_var.get().strip()
-        self.result["extension"] = self.ext_var.get().strip()
-        if not self.result["extension"].startswith("."):
-            self.result["extension"] = "." + self.result["extension"]
-        self._save_current_settings(prof_id, selected_post)
-        self.master.destroy()
+        self._submit_post_action("post_and_export")
 
     def on_post_only(self):
         """使用者選擇【⚡ 只轉 NC 碼 (不轉工單)】"""
-        selected_post = self.post_var.get().strip()
-        if not selected_post:
-            messagebox.showwarning("提示", "請選擇或輸入後處理機台名稱！", parent=self.master)
-            return
-
-        prof_label = self.profile_var.get().strip()
-        prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
-
-        self.result["action"] = "post_only"
-        self.result["postprocessor_name"] = selected_post
-        self.result["machine_profile"] = prof_id
-        self.result["output_dir"] = self.dir_var.get().strip()
-        self.result["extension"] = self.ext_var.get().strip()
-        if not self.result["extension"].startswith("."):
-            self.result["extension"] = "." + self.result["extension"]
-        self._save_current_settings(prof_id, selected_post)
-        self.master.destroy()
+        self._submit_post_action("post_only")
 
     def on_export_only(self):
         """使用者選擇僅匯出工單 (不轉 NC)"""
@@ -569,6 +540,7 @@ class NcPostDialogApp:
         prof_id = self.profile_display_map.get(prof_label, "FANUC_HORIZONTAL")
         selected_post = self.post_var.get().strip()
 
+        self._sync_custom_post_path(selected_post)
         self.result["action"] = "export_only"
         self.result["machine_profile"] = prof_id
         if selected_post:

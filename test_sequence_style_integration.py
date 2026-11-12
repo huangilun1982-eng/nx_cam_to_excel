@@ -407,5 +407,117 @@ class TestSequenceStyleIntegration(unittest.TestCase):
         finally:
             shutil.rmtree(temp_dir)
 
+    @patch("subprocess.run")
+    def test_stage_image_fallback_when_page_lacks_target_op(self, mock_subproc):
+        """
+        驗證高優先級修正 (項目 5)：
+        當頁面由 paginate_operations 產生（僅含 stage 與 show_image=True，無 target_op 欄位）時，
+        export_multipage_via_vbs 仍能以 page_stage 作為回退鍵值，100% 正確嵌入工段截圖。
+        """
+        from nx_cam_to_excel import paginate_operations
+        mock_subproc.return_value = MagicMock(returncode=0)
+        template_file = r"C:\NX_Standard\Template\ShopDoc_Template.xlsx"
+
+        chunks = [{
+            "group_name": "正面-OP10",
+            "parent_program": "OP10",
+            "stage": "正面",
+            "operations": [
+                {"op_name": "OP10", "clean_op_name": "OP10", "tool_number": "T01", "tool_spec_display": "D10", "time": "00:01:00"}
+            ]
+        }]
+        pages = paginate_operations(chunks)
+        self.assertNotIn("target_op", pages[0])
+
+        captured_vbs = []
+        orig_open = open
+        def fake_open(path, mode="r", *args, **kwargs):
+            if "w" in mode and path.endswith(".vbs"):
+                class FakeFile:
+                    def write(self, s):
+                        captured_vbs.append(s)
+                    def __enter__(self): return self
+                    def __exit__(self, *a): pass
+                return FakeFile()
+            return orig_open(path, mode, *args, **kwargs)
+
+        with patch("os.path.exists", return_value=True), patch("builtins.open", side_effect=fake_open):
+            export_multipage_via_vbs(
+                pages,
+                template_file,
+                r"C:\Test\out_stage_fallback.xlsx",
+                self.dummy_part,
+                self.header_info,
+                stage_images={"正面": r"C:\Test\stage_front.png"},
+                stage_origins={"正面": "加工原點【G54】：X=MID, Y=MID, Z=TOP"}
+            )
+
+        vbs_content = "".join(captured_vbs)
+        self.assertIn("stage_front.png", vbs_content)
+        self.assertIn("ws.Shapes.AddPicture", vbs_content)
+
+    def test_invoke_interactive_pagination_dialog_filters_merged_nx_ops_cpp_refs(self):
+        """
+        驗證致命阻斷修正 (項目 1 & 項目 7)：
+        當工步字典同時含有不可 JSON 序列化的 C++ 物件 (_nx_op_obj 與 _merged_nx_ops) 時，
+        invoke_interactive_pagination_dialog 能安全過濾並寫入 JSON，且於子進程返回後完整重新綁定參照與 editor_pages。
+        """
+        from nx_cam_to_excel import invoke_interactive_pagination_dialog, merge_consecutive_tools, paginate_operations
+        import json
+
+        class UnserializableNxOp:
+            def __init__(self, name):
+                self.Name = name
+
+        cpp_1 = UnserializableNxOp("OP_A")
+        cpp_2 = UnserializableNxOp("OP_B")
+        merged = merge_consecutive_tools([
+            {"tool_number": "1", "raw_tool_name": "D10", "tool_diameter": "10.0", "_nx_op_obj": cpp_1, "clean_op_name": "OP_A"},
+            {"tool_number": "1", "raw_tool_name": "D10", "tool_diameter": "10.0", "_nx_op_obj": cpp_2, "clean_op_name": "OP_B"},
+        ])
+        pages = paginate_operations([{
+            "group_name": "正面",
+            "parent_program": "PROG1",
+            "stage": "正面",
+            "operations": merged
+        }])
+
+        def fake_popen(cmd, *args, **kwargs):
+            cfg_idx = cmd.index("--cfg-file") + 1
+            res_idx = cmd.index("--res-file") + 1
+            cfg_path = cmd[cfg_idx]
+            res_path = cmd[res_idx]
+            with open(cfg_path, "r", encoding="utf-8") as cf:
+                cfg_data = json.load(cf)
+            self.assertEqual(cfg_data.get("initial_image_layout"), "last_page")
+
+            op_item = cfg_data["default_pages"][0]["operations"][0]
+            with open(res_path, "w", encoding="utf-8") as rf:
+                json.dump({
+                    "action": "ok",
+                    "sequence_style": "global_continuous",
+                    "image_layout_mode": "last_page",
+                    "pages": [{"stage": "正面", "rows": [{"type": "op", "data": op_item}], "show_image": False}],
+                    "editor_pages": [{"stage": "正面", "rows": [{"type": "op", "data": op_item}]}]
+                }, rf)
+            proc_mock = MagicMock()
+            proc_mock.poll.return_value = 0
+            proc_mock.wait.return_value = 0
+            return proc_mock
+
+        with patch("subprocess.Popen", side_effect=fake_popen):
+            res = invoke_interactive_pagination_dialog(
+                default_pages=pages,
+                stages=["正面"],
+                initial_sequence_style="per_page",
+                initial_image_layout="last_page"
+            )
+
+        self.assertEqual(res["action"], "ok")
+        self.assertEqual(res["image_layout_mode"], "last_page")
+        relinked_op = res["pages"][0]["rows"][0]["data"]
+        self.assertIs(relinked_op.get("_nx_op_obj"), cpp_1)
+        self.assertEqual(relinked_op.get("_merged_nx_ops"), [cpp_1, cpp_2])
+
 if __name__ == "__main__":
     unittest.main()

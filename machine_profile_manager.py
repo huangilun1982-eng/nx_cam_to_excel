@@ -182,3 +182,99 @@ def save_last_selected_profile_id(profile_id):
     保存本次工程師選取的機台 ID。
     """
     save_post_settings(profile_id=profile_id)
+
+
+def find_template_post_files():
+    """尋找本機 NX 安裝目錄中的 template_post.dat 檔案清單 (純 Python 無 GUI 依賴)"""
+    found_files = []
+
+    # 0. 優先加入本機已知實體路徑
+    known_paths = [
+        r"C:\Siemens\DesigncenterNX2512\MACH\resource\postprocessor\template_post.dat",
+        r"C:\Program Files\Siemens\NX2206\MACH\resource\postprocessor\template_post.dat",
+    ]
+    for kp in known_paths:
+        if os.path.exists(kp) and kp not in found_files:
+            found_files.append(kp)
+
+    # 1. 從環境變數取得
+    ug_cam_post = os.environ.get("UGII_CAM_POST_DIR", "")
+    if ug_cam_post:
+        cand = os.path.join(ug_cam_post, "template_post.dat")
+        if os.path.exists(cand) and cand not in found_files:
+            found_files.append(cand)
+
+    ug_base = os.environ.get("UGII_BASE_DIR", "")
+    if ug_base:
+        cand = os.path.join(ug_base, "MACH", "resource", "postprocessor", "template_post.dat")
+        if os.path.exists(cand) and cand not in found_files:
+            found_files.append(cand)
+
+    return found_files
+
+
+def load_available_postprocessors():
+    """
+    解析 template_post.dat，取得機台清單 (純 Python 無 GUI 依賴，支援 NX 內建進程與獨立 GUI 進程共用)
+    支援常見的兩種格式：
+      - 3欄位: 機台名, TCL檔, DEF檔
+      - 4欄位: 機台名, 格式, TCL檔, DEF檔
+    回傳: list of dict [{"name": "Fanuc_2026", "desc": "Fanuc_2026", "tcl": ..., "def": ...}, ...]
+    """
+    dat_files = find_template_post_files()
+    postprocessors = []
+    seen_names = set()
+
+    for dat_file in dat_files:
+        post_dir = os.path.dirname(dat_file)
+        lines = []
+        for enc in ["cp950", "utf-8", "ansi"]:
+            try:
+                with open(dat_file, "r", encoding=enc) as f:
+                    lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+                if lines:
+                    break
+            except Exception:
+                continue
+
+        for line in lines:
+            parts = [p.strip() for p in line.split(",")]
+            post_name = ""
+            tcl_raw = ""
+            def_raw = ""
+
+            if len(parts) == 3:
+                post_name = parts[0]
+                tcl_raw = parts[1]
+                def_raw = parts[2]
+            elif len(parts) >= 4:
+                post_name = parts[0]
+                tcl_raw = parts[2]
+                def_raw = parts[3]
+            else:
+                continue
+
+            if not post_name or post_name in seen_names:
+                continue
+
+            # 濾除佔位符或無效名稱
+            if "xxxxx" in post_name.lower() or "xxxxx" in tcl_raw.lower():
+                continue
+
+            # 解析變數替換
+            tcl_path = tcl_raw.replace("${UGII_CAM_POST_DIR}", post_dir + os.sep)
+            def_path = def_raw.replace("${UGII_CAM_POST_DIR}", post_dir + os.sep)
+
+            if os.path.isabs(tcl_path) and not os.path.exists(tcl_path):
+                pass
+
+            seen_names.add(post_name)
+            postprocessors.append({
+                "name": post_name,
+                "desc": post_name,
+                "tcl": tcl_path,
+                "def": def_path,
+                "source_dat": dat_file
+            })
+
+    return postprocessors
